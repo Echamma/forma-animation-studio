@@ -2,7 +2,7 @@
 
 This is the **Linux desktop branch**. The original browser app is preserved on `main`.
 
-Download the x86-64 AppImage or Debian package from [GitHub Releases](https://github.com/Echamma/forma-animation-studio/releases). For the AppImage, run `chmod +x Forma-Animation-Studio-1.0.0-x64.AppImage`, then `./Forma-Animation-Studio-1.0.0-x64.AppImage`. If FUSE is unavailable, use `./Forma-Animation-Studio-1.0.0-x64.AppImage --appimage-extract-and-run`. For Debian/Ubuntu, install with `sudo apt install ./Forma-Animation-Studio-1.0.0-x64.deb` and launch Forma from your application menu.
+Download the x86-64 AppImage or Debian package from [GitHub Releases](https://github.com/Echamma/forma-animation-studio/releases). For the AppImage, run `chmod +x Forma-Animation-Studio-1.0.0-x86_64.AppImage`, then `./Forma-Animation-Studio-1.0.0-x86_64.AppImage`. If FUSE is unavailable, use `./Forma-Animation-Studio-1.0.0-x86_64.AppImage --appimage-extract-and-run`. For Debian/Ubuntu, install with `sudo apt install ./Forma-Animation-Studio-1.0.0-amd64.deb` and launch Forma from your application menu.
 
 To develop on Linux, install Node.js 22, run `npm ci`, then `npm start`. `npm run build` creates AppImage and `.deb` packages. `npm test` checks editing, animation state, PNG/SVG output, and saving recovery data when closing. Headless test environments need Xvfb: `xvfb-run -a npm test`. GitHub builds and tests this branch on Ubuntu 22.04 and publishes packages with SHA-256 checksums after successful checks.
 
