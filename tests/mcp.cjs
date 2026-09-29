@@ -102,6 +102,10 @@ app.whenReady().then(async () => {
     assert.equal((await call('forma_get_scene')).project.shapes.length,4);
     const invalidFile = path.join(output, 'invalid.json'); await fs.writeFile(invalidFile,'{"version":1}');
     await rejected('forma_open_project', {file:invalidFile,replace:true}, 'INVALID_PROJECT');
+    const malformed = JSON.parse(await fs.readFile(path.join(output,'exports','scene.json'),'utf8'));
+    malformed.shapes[0].motions = {startTime:'bad'};
+    await fs.writeFile(invalidFile,JSON.stringify(malformed));
+    await rejected('forma_open_project', {file:invalidFile,replace:true}, 'INVALID_PROJECT');
     assert.equal((await call('forma_get_scene')).project.shapes.length,4);
     const recovery = JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8'));
     assert.equal(recovery.shapes.length,4);
@@ -118,9 +122,11 @@ app.whenReady().then(async () => {
     await client.connect(transport); assert.equal((await client.listTools()).tools.length,12);
     assert.equal((await call('forma_get_scene')).project.width,640);
     await client.close();
+    await win.webContents.executeJavaScript('(()=>{window.FormaSession.ready=new Promise(resolve=>setTimeout(()=>{scene.bg="#654321";resolve()},50));return true})()');
     const closed = new Promise(resolve => win.once('closed', resolve)); win.close(); await closed;
     await assert.rejects(fs.access(process.env.FORMA_BRIDGE_FILE));
     assert.equal(JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8')).shapes.length,4);
+    assert.equal(JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8')).bg,'#654321');
     if (errors.trim()) console.log('MCP stderr:', errors.trim());
     console.log('PASS: MCP stdio handshake, all 12 tools, live editing, linked text, PNG/SVG/WebM/project exports, file imports, validation, authentication, toggle, recovery, and bundled server.');
     clearTimeout(timeout); app.exit(0);

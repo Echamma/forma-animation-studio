@@ -23,8 +23,33 @@
     if (!layer) throw problem('LAYER_NOT_FOUND', 'No layer has ID ' + id + '. Inspect forma_get_scene for current IDs.');
     return layer;
   }
+  function usableProject(project) {
+    try {
+      if (!valid(project)) return false;
+      const number = value => Number.isFinite(value) && Math.abs(value) <= 10000;
+      const pose = value => value && props.every(key => number(value[key])) && value.w > 0 && value.h > 0 && value.o >= 0 && value.o <= 100;
+      return project.shapes.every(layer => {
+        if (layer.type === 'text') {
+          if (layer.textWidth <= 0 || layer.fontSize <= 0) return false;
+          if (layer.linkBase && (!number(layer.linkBase.w) || !number(layer.linkBase.h) || layer.linkBase.w <= 0 || layer.linkBase.h <= 0)) return false;
+          if (layer.rotationOffset !== undefined && !number(layer.rotationOffset)) return false;
+          if (layer.opacityFactor !== undefined && !Number.isFinite(layer.opacityFactor)) return false;
+        }
+        if (layer.motions === undefined) return true;
+        return Array.isArray(layer.motions) && layer.motions.length <= 1000 && layer.motions.every(motion =>
+          motion && typeof motion.id === 'string' && ['arrow', 'path'].includes(motion.type) &&
+          number(motion.startTime) && motion.startTime >= 0 && motion.startTime <= project.duration &&
+          number(motion.duration) && motion.duration > 0 && motion.duration <= 30 &&
+          number(motion.distance) && motion.distance >= 0 && motion.distance <= 500 && number(motion.spin) &&
+          typeof motion.face === 'boolean' && pose(motion.startPose) &&
+          Array.isArray(motion.sourcePoints) && motion.sourcePoints.length >= 1 && motion.sourcePoints.length <= 1000 &&
+          motion.sourcePoints.every(point => point && number(point.x) && number(point.y)) &&
+          (motion.baseKeys === undefined || Array.isArray(motion.baseKeys) && motion.baseKeys.length <= 1000 && motion.baseKeys.every(key => pose(key) && number(key.t) && key.t >= 0 && key.t <= project.duration)));
+      });
+    } catch {return false;}
+  }
   function install(project, selection = selected, resetTime = false) {
-    if (!valid(project)) throw problem('INVALID_PROJECT', 'The edit would create an invalid Forma scene. Check sizes, timestamps, colors, and layer limits.');
+    if (!usableProject(project)) throw problem('INVALID_PROJECT', 'The edit would create an invalid Forma scene. Check sizes, timestamps, colors, motion metadata, and layer limits.');
     stop(); assetCache.clear(); scene = project;
     selected = scene.shapes.some(layer => layer.id === selection) ? selection : scene.shapes[0]?.id;
     time = resetTime ? 0 : Math.min(time, scene.duration);
@@ -168,7 +193,7 @@
         case 'forma_open_project': {
           if (args.replace !== true) throw problem('CONFIRMATION_REQUIRED', 'replace=true is required.');
           const next = clone(args.project);
-          if (!valid(next)) throw problem('INVALID_PROJECT', 'This file is not a valid Forma project.');
+          if (!usableProject(next)) throw problem('INVALID_PROJECT', 'This file is not a valid Forma project.');
           for (const layer of next.shapes) {
             layer.keys.sort((a, b) => a.t - b.t);
             if (layer.type === 'svg') layer.svgSource = sanitizeSvg(layer.svgSource);

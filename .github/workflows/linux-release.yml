@@ -44,19 +44,11 @@ jobs:
             dist/forma-mcp.cjs
             dist/SHA256SUMS
           if-no-files-found: error
-      - name: Publish Linux release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version=$(node -p "require('./package.json').version")
-          tag="linux-v$version"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --target "$GITHUB_SHA" --title "Forma $version — Desktop and MCP" --notes-file RELEASE_NOTES.md || gh release view "$tag"
-          fi
-          gh release upload "$tag" dist/*.AppImage dist/*.deb dist/forma-mcp.cjs dist/SHA256SUMS --clobber
   windows:
     runs-on: windows-latest
     timeout-minutes: 25
+    env:
+      ELECTRON_BUILDER_COMPRESSION_LEVEL: '3'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -84,14 +76,24 @@ jobs:
             dist/*.exe
             dist/SHA256SUMS-Windows
           if-no-files-found: error
-      - name: Publish Windows desktop app
-        shell: bash
+  publish:
+    needs: [build, windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: forma-animation-studio-*
+          path: dist
+          merge-multiple: true
+      - name: Publish verified desktop apps and MCP bundle
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(node -p "require('./package.json').version")
           tag="linux-v$version"
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --target "$GITHUB_SHA" --title "Forma $version — Desktop and MCP" --notes-file RELEASE_NOTES.md || gh release view "$tag"
+            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "Forma $version — Desktop and MCP" --notes-file RELEASE_NOTES.md
           fi
-          gh release upload "$tag" dist/*.exe dist/SHA256SUMS-Windows --clobber
+          gh release upload "$tag" dist/* --clobber
+          gh release edit "$tag" --draft=false

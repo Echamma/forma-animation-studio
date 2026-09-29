@@ -22,7 +22,7 @@ if (smokeTest) {
 }
 const recoveryPath = () => path.join(app.getPath('userData'), 'last-session.json');
 async function checkpoint() {
-  const snapshot = await window.webContents.executeJavaScript('window.FormaSession ? window.FormaSession.snapshot() : null');
+  const snapshot = await window.webContents.executeJavaScript('(async()=>{if(!window.FormaSession)return null;await window.FormaSession.ready;return window.FormaSession.snapshot()})()');
   if (snapshot) {
     await fs.mkdir(app.getPath('userData'), {recursive: true});
     const temporary = recoveryPath() + '.' + crypto.randomUUID() + '.tmp';
