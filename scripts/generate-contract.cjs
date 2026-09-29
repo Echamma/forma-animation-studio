@@ -25,6 +25,6 @@ if (new Set(tools.map(t => t.name)).size !== tools.length) throw Error('Duplicat
 const content = JSON.stringify({server: 'forma', version: spec.info.version, tools}, null, 2) + '\n';
 const target = path.join(root, 'tool_manifest.json');
 if (process.argv.includes('--check')) {
-  if (fs.readFileSync(target, 'utf8') !== content) throw Error('Regenerate tool manifest with npm run mcp:contract');
+  if (fs.readFileSync(target, 'utf8').replace(/\r\n/g, '\n') !== content) throw Error('Regenerate tool manifest with npm run mcp:contract');
 } else fs.writeFileSync(target, content);
 console.log('Forma contract: ' + tools.length + ' tools');
