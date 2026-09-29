@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "forma": {
+      "command": "node",
+      "args": ["C:/Tools/Forma/forma-mcp.cjs"]
+    }
+  }
+}

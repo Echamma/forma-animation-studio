@@ -1,0 +1,4 @@
+[mcp_servers.forma]
+command = "node"
+args = ["C:/Tools/Forma/forma-mcp.cjs"]
+tool_timeout_sec = 90

@@ -2,7 +2,9 @@
 
 This is the **Linux desktop branch**. The original browser app is preserved on `main`.
 
-Download the x86-64 AppImage or Debian package from [GitHub Releases](https://github.com/Echamma/forma-animation-studio/releases). For the AppImage, run `chmod +x Forma-Animation-Studio-1.0.0-x86_64.AppImage`, then `./Forma-Animation-Studio-1.0.0-x86_64.AppImage`. If FUSE is unavailable, use `./Forma-Animation-Studio-1.0.0-x86_64.AppImage --appimage-extract-and-run`. For Debian/Ubuntu, install with `sudo apt install ./Forma-Animation-Studio-1.0.0-amd64.deb` and launch Forma from your application menu.
+**Forma 1.1.0 adds an MCP server for Codex and Claude.** It can edit the live scene, animate layers, inspect PNG frames, import artwork, and export projects, PNG/SVG, and WebM. Download the desktop app and the bundled `forma-mcp.cjs` from [the release](https://github.com/Echamma/forma-animation-studio/releases/tag/linux-v1.1.0). A Windows portable app is included alongside the Linux packages. Click **MCP off** in the desktop header to enable control. See [MCP setup and tool documentation](mcp/README.md) for installation and configuration.
+
+Download the x86-64 AppImage or Debian package from [GitHub Releases](https://github.com/Echamma/forma-animation-studio/releases). For the AppImage, run `chmod +x Forma-Animation-Studio-1.1.0-x86_64.AppImage`, then `./Forma-Animation-Studio-1.1.0-x86_64.AppImage`. If FUSE is unavailable, use `./Forma-Animation-Studio-1.1.0-x86_64.AppImage --appimage-extract-and-run`. For Debian/Ubuntu, install with `sudo apt install ./Forma-Animation-Studio-1.1.0-amd64.deb` and launch Forma from your application menu.
 
 To develop on Linux, install Node.js 22, run `npm ci`, then `npm start`. `npm run build` creates AppImage and `.deb` packages. `npm test` checks editing, animation state, PNG/SVG output, and saving recovery data when closing. Headless test environments need Xvfb: `xvfb-run -a npm test`. GitHub builds and tests this branch on Ubuntu 22.04 and publishes packages with SHA-256 checksums after successful checks.
 
@@ -20,7 +22,7 @@ Open `index.html` in a modern browser. No installation or build step is required
 8. Add a spin in degrees to rotate the layer while it moves. Enable **Rotate to face movement** to align it with the arrow or with each turn in a freehand path. These options can be combined.
 9. Press Play to review the animation. Video layers synchronize to the scene timeline. Playback clips everything outside the artboard. Click a timeline diamond to inspect a keyframe. Choose smooth, linear, or hold interpolation per layer.
 10. Export an animated SVG, video, or PNG of the current frame. Video export includes live frames from imported video layers. Animated SVG uses a poster frame for video layers because portable SVG viewers do not reliably support embedded video. Keep the browser tab visible while recording video. The format depends on browser support, usually WebM.
-11. Save the editable JSON project and use Open project to resume later. Saved projects include imported media, so their file size can be much larger. Save before closing or reloading; there is no automatic persistence.
+11. Save the editable JSON project and use Open project to resume later. Saved projects include imported media, so their file size can be much larger. The desktop app saves recovery data on close; the browser-only version needs a manual save before closing or reloading.
 
 Choose 960 × 600 landscape or 1080 × 1920 portrait (9:16) under Scene Settings. Changing formats scales existing shape positions and sizes. Scene duration supports 1–30 seconds. Animated SVG samples motion at 60 frames per second and loops indefinitely. Color is constant per shape; position, size, rotation, and opacity are animated.
 

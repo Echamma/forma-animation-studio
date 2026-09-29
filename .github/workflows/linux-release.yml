@@ -34,13 +34,14 @@ jobs:
       - name: Calculate package checksums
         run: |
           cd dist
-          sha256sum *.AppImage *.deb > SHA256SUMS
+          sha256sum *.AppImage *.deb forma-mcp.cjs > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: forma-animation-studio-linux-x64
           path: |
             dist/*.AppImage
             dist/*.deb
+            dist/forma-mcp.cjs
             dist/SHA256SUMS
           if-no-files-found: error
       - name: Publish Linux release
@@ -50,7 +51,47 @@ jobs:
           version=$(node -p "require('./package.json').version")
           tag="linux-v$version"
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --target "$GITHUB_SHA" --title "forma-animation-studio $version — Linux" --notes-file RELEASE_NOTES.md
+            gh release create "$tag" --target "$GITHUB_SHA" --title "Forma $version — Desktop and MCP" --notes-file RELEASE_NOTES.md
           fi
-          gh release upload "$tag" dist/*.AppImage dist/*.deb dist/SHA256SUMS --clobber
-
+          gh release upload "$tag" dist/*.AppImage dist/*.deb dist/forma-mcp.cjs dist/SHA256SUMS --clobber
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build:win
+      - name: Verify the packaged Windows editor
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath 'dist/win-unpacked/Forma Animation Studio.exe' -ArgumentList '--smoke-test' -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw 'Packaged editor smoke test failed' }
+      - name: Calculate Windows checksum
+        shell: pwsh
+        run: |
+          $file = Get-ChildItem dist/ -Filter '*.exe' | Select-Object -First 1
+          $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName
+          ($hash.Hash.ToLower() + '  ' + $file.Name) | Set-Content dist/SHA256SUMS-Windows -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forma-animation-studio-windows-x64
+          path: |
+            dist/*.exe
+            dist/SHA256SUMS-Windows
+          if-no-files-found: error
+      - name: Publish Windows desktop app
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="linux-v$version"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --title "Forma $version — Desktop and MCP" --notes-file RELEASE_NOTES.md || gh release view "$tag"
+          fi
+          gh release upload "$tag" dist/*.exe dist/SHA256SUMS-Windows --clobber

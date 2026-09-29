@@ -1,6 +1,6 @@
 {
   "name": "forma-animation-studio",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Desktop shape animation studio with keyframes, motion paths, linked text, media imports, and local exports",
   "author": "Echamma",
   "homepage": "https://github.com/Echamma/forma-animation-studio",
@@ -8,21 +8,57 @@
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
-    "test": "electron tests/desktop.cjs",
-    "build": "electron-builder --linux AppImage deb --x64 --publish never"
+    "test": "node scripts/generate-contract.cjs --check && electron tests/desktop.cjs && electron tests/mcp.cjs",
+    "build": "electron-builder --linux AppImage deb --x64 --publish never",
+    "start:mcp": "electron . --mcp",
+    "mcp": "node mcp/server.cjs",
+    "mcp:contract": "node scripts/generate-contract.cjs",
+    "mcp:build": "node scripts/bundle-mcp.cjs",
+    "build:win": "electron-builder --win portable --x64 --publish never",
+    "pretest": "node scripts/bundle-mcp.cjs"
   },
-  "devDependencies": { "electron": "44.3.0", "electron-builder": "26.15.3" },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.31.0",
+    "electron": "44.3.0",
+    "electron-builder": "26.15.3",
+    "esbuild": "0.25.12"
+  },
   "build": {
     "appId": "local.forma.animationstudio",
     "productName": "Forma Animation Studio",
-    "directories": { "output": "dist" },
-    "files": ["main.cjs", "preload.cjs", "app.js", "index.html", "style.css"],
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "app.js",
+      "automation.js",
+      "index.html",
+      "style.css",
+      "mcp/desktop-bridge.cjs",
+      "mcp/validation.cjs",
+      "mcp/tool_manifest.json"
+    ],
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "executableName": "forma-animation-studio",
       "category": "Graphics",
       "maintainer": "Echamma <Echamma@users.noreply.github.com>",
       "artifactName": "Forma-Animation-Studio-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "artifactName": "Forma-Animation-Studio-${version}-${arch}.${ext}",
+      "signAndEditExecutable": false
     }
+  },
+  "dependencies": {
+    "ajv": "8.18.0"
   }
 }

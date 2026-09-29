@@ -1,0 +1,90 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Forma local automation bridge", "version": "1.1.0"},
+  "security": [{"localToken": []}],
+  "components": {
+    "securitySchemes": {"localToken": {"type": "http", "scheme": "bearer"}},
+    "schemas": {
+      "id": {"type": "string", "minLength": 1, "maxLength": 100, "description": "Layer ID returned by Forma."},
+      "color": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$", "description": "Six digit hex color."},
+      "dimension": {"type": "integer", "minimum": 100, "maximum": 4000, "description": "Canvas dimension in pixels."},
+      "duration": {"type": "number", "minimum": 1, "maximum": 30, "description": "Scene length in seconds."},
+      "coordinate": {"type": "number", "minimum": -10000, "maximum": 10000, "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."},
+      "size": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000, "description": "Layer size in pixels."},
+      "rotation": {"type": "number", "minimum": -10000, "maximum": 10000, "description": "Rotation in degrees."},
+      "opacity": {"type": "number", "minimum": 0, "maximum": 100, "description": "Opacity percentage."},
+      "ease": {"type": "string", "enum": ["smooth", "linear", "hold"], "description": "Keyframe interpolation."},
+      "name": {"type": "string", "minLength": 1, "maxLength": 99, "description": "Display name of the layer."},
+      "text": {"type": "string", "maxLength": 120, "description": "Text displayed by a text layer."},
+      "file": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Absolute local file path on the computer running Forma."},
+      "time": {"type": "number", "minimum": 0, "maximum": 30, "description": "Time in seconds within the scene duration."},
+      "keyframe": {
+        "type": "object", "additionalProperties": false, "required": ["t", "x", "y", "w", "h", "r", "o"],
+        "properties": {"t": {"$ref": "#/components/schemas/time"}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}, "w": {"$ref": "#/components/schemas/size"}, "h": {"$ref": "#/components/schemas/size"}, "r": {"$ref": "#/components/schemas/rotation"}, "o": {"$ref": "#/components/schemas/opacity"}}
+      }
+    }
+  },
+  "paths": {
+    "/tools/forma_get_scene": {"post": {
+      "operationId": "forma_get_scene", "summary": "Inspect the open scene, layer IDs, keyframes, selection, playback, and sampled transforms. Asset data is omitted unless includeAssets is true.",
+      "x-read-only": true,
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"includeAssets": {"type": "boolean", "default": false, "description": "Include embedded image/video/SVG data. Usually unnecessary and potentially large."}}}}}},
+      "responses": {"200": {"description": "Scene snapshot"}}
+    }},
+    "/tools/forma_create_scene": {"post": {
+      "operationId": "forma_create_scene", "summary": "Replace the current project with an empty scene. Inspect or export the existing project first; replace must be true to confirm replacement.", "x-destructive": true,
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["replace"], "properties": {"replace": {"type": "boolean", "const": true, "description": "Explicitly confirm replacing the current scene."}, "width": {"$ref": "#/components/schemas/dimension"}, "height": {"$ref": "#/components/schemas/dimension"}, "duration": {"$ref": "#/components/schemas/duration"}, "bg": {"$ref": "#/components/schemas/color"}}}}}},
+      "responses": {"200": {"description": "Empty scene snapshot"}}
+    }},
+    "/tools/forma_update_scene": {"post": {
+      "operationId": "forma_update_scene", "summary": "Set scene dimensions, background, or duration. Dimensions change the canvas without scaling layers. Duration cannot truncate existing keyframes.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "minProperties": 1, "properties": {"width": {"$ref": "#/components/schemas/dimension"}, "height": {"$ref": "#/components/schemas/dimension"}, "duration": {"$ref": "#/components/schemas/duration"}, "bg": {"$ref": "#/components/schemas/color"}}}}}},
+      "responses": {"200": {"description": "Scene snapshot"}}
+    }},
+    "/tools/forma_add_shape": {"post": {
+      "operationId": "forma_add_shape", "summary": "Add a geometric or text layer and return its ID. Position refers to the layer center. New layers start with one keyframe at t=0; use forma_set_keyframes to animate.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "enum": ["circle", "rect", "triangle", "diamond", "arrow", "text"], "description": "Layer kind."}, "name": {"$ref": "#/components/schemas/name"}, "color": {"$ref": "#/components/schemas/color"}, "ease": {"$ref": "#/components/schemas/ease"}, "text": {"$ref": "#/components/schemas/text"}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}, "w": {"$ref": "#/components/schemas/size"}, "h": {"$ref": "#/components/schemas/size"}, "r": {"$ref": "#/components/schemas/rotation"}, "o": {"$ref": "#/components/schemas/opacity"}}}}}},
+      "responses": {"200": {"description": "Added layer"}}
+    }},
+    "/tools/forma_update_shape": {"post": {
+      "operationId": "forma_update_shape", "summary": "Update a layer name, fill, interpolation, or text. For animated transforms use forma_set_keyframes. Text can follow a non-text layer using linkId; use an empty linkId to detach.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["id"], "minProperties": 2, "properties": {"id": {"$ref": "#/components/schemas/id"}, "name": {"$ref": "#/components/schemas/name"}, "color": {"$ref": "#/components/schemas/color"}, "ease": {"$ref": "#/components/schemas/ease"}, "text": {"$ref": "#/components/schemas/text"}, "linkId": {"type": "string", "maxLength": 100, "description": "ID of a non-text layer to follow, or empty string to detach. Offset is derived from the text's current pose."}}}}}},
+      "responses": {"200": {"description": "Updated layer"}}
+    }},
+    "/tools/forma_set_keyframes": {"post": {
+      "operationId": "forma_set_keyframes", "summary": "Merge complete keyframes into a layer, replacing frames at matching times. Set replace=true to replace all its keyframes. Each frame needs t,x,y,w,h,r,o. Times must be unique and inside the scene duration.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["id", "keyframes"], "properties": {"id": {"$ref": "#/components/schemas/id"}, "replace": {"type": "boolean", "default": false, "description": "Replace the whole keyframe list instead of merging."}, "keyframes": {"type": "array", "minItems": 1, "maxItems": 1000, "description": "Complete poses in seconds and pixels.", "items": {"$ref": "#/components/schemas/keyframe"}}}}}}},
+      "responses": {"200": {"description": "Updated layer"}}
+    }},
+    "/tools/forma_delete_shape": {"post": {
+      "operationId": "forma_delete_shape", "summary": "Delete a layer after confirm=true. Linked text survives and is detached at its current pose.", "x-destructive": true,
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["id", "confirm"], "properties": {"id": {"$ref": "#/components/schemas/id"}, "confirm": {"type": "boolean", "const": true, "description": "Explicitly confirm deleting this layer."}}}}}},
+      "responses": {"200": {"description": "Deleted layer ID"}}
+    }},
+    "/tools/forma_set_playback": {"post": {
+      "operationId": "forma_set_playback", "summary": "Play, pause, or seek the timeline. Seek pauses playback and requires time. Changes are visible in the open desktop editor.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["action"], "properties": {"action": {"type": "string", "enum": ["play", "pause", "seek"], "description": "Playback action."}, "time": {"$ref": "#/components/schemas/time"}}}}}},
+      "responses": {"200": {"description": "Playback state"}}
+    }},
+    "/tools/forma_preview": {"post": {
+      "operationId": "forma_preview", "summary": "Render a PNG frame and return it as an MCP image for visual inspection. Does not change the playhead. Preview is scaled down to maxWidth and at most 1600 pixels in either dimension.", "x-read-only": true,
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"time": {"$ref": "#/components/schemas/time"}, "maxWidth": {"type": "integer", "minimum": 100, "maximum": 1600, "default": 960, "description": "Maximum preview width in pixels."}}}}}},
+      "responses": {"200": {"description": "Base64 PNG and frame metadata"}}
+    }},
+    "/tools/forma_export": {"post": {
+      "operationId": "forma_export", "summary": "Export PNG, static SVG, animated SVG, WebM video, or editable JSON project to Forma's MCP export folder. Returns its absolute path. Filename must be a simple basename with the matching extension; existing files require overwrite=true. WebM records one loop in real time.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["format", "filename"], "properties": {"format": {"type": "string", "enum": ["png", "svg", "animated_svg", "webm", "project"], "description": "Export format; project means editable JSON."}, "filename": {"type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[A-Za-z0-9][A-Za-z0-9._ -]*$", "description": "Simple output filename, for example orbit.svg or animation.webm."}, "time": {"$ref": "#/components/schemas/time"}, "overwrite": {"type": "boolean", "default": false, "description": "Explicitly allow replacing an existing export."}}}}}},
+      "responses": {"200": {"description": "Saved path and byte count"}}
+    }},
+    "/tools/forma_open_project": {"post": {
+      "operationId": "forma_open_project", "summary": "Open an editable Forma JSON file from an absolute local path (up to 64 MB). Replaces the current scene and requires replace=true. Invalid projects leave the scene intact.", "x-destructive": true,
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["file", "replace"], "properties": {"file": {"$ref": "#/components/schemas/file"}, "replace": {"type": "boolean", "const": true, "description": "Explicitly confirm replacing the current scene."}}}}}},
+      "responses": {"200": {"description": "Loaded scene snapshot"}}
+    }},
+    "/tools/forma_import_asset": {"post": {
+      "operationId": "forma_import_asset", "summary": "Import a PNG, JPEG, WebP, or SVG file (up to 30 MB) as an embedded layer. SVG is sanitized. Returns its ID for later keyframes. Video layers can be imported through the desktop UI.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["file"], "properties": {"file": {"$ref": "#/components/schemas/file"}, "name": {"$ref": "#/components/schemas/name"}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}, "w": {"$ref": "#/components/schemas/size"}, "h": {"$ref": "#/components/schemas/size"}}}}}},
+      "responses": {"200": {"description": "Imported layer"}}
+    }}
+  }
+}

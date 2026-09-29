@@ -1,0 +1,131 @@
+const {app, BrowserWindow} = require('electron');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+const {Client} = require('@modelcontextprotocol/sdk/client/index.js');
+const {StdioClientTransport} = require('@modelcontextprotocol/sdk/client/stdio.js');
+const output = path.join(__dirname, '..', 'test-output', 'mcp-' + process.pid);
+process.env.FORMA_TEST = '1';
+process.env.FORMA_BRIDGE_FILE = path.join(output, 'bridge.json');
+process.env.FORMA_EXPORT_DIR = path.join(output, 'exports');
+app.setPath('userData', path.join(output, 'profile'));
+require('../main.cjs');
+const timeout = setTimeout(() => {console.error('Forma MCP checks timed out'); app.exit(1);}, 60000);
+let client, transport, win;
+app.whenReady().then(async () => {
+  try {
+    app.removeAllListeners('window-all-closed');
+    await fs.mkdir(output, {recursive: true}); win = BrowserWindow.getAllWindows()[0];
+    if (win.webContents.isLoading()) await new Promise(resolve => win.webContents.once('did-finish-load', resolve));
+    await win.webContents.executeJavaScript('window.FormaSession.ready');
+    const env = Object.fromEntries(Object.entries(process.env).filter(([,value]) => typeof value === 'string'));
+    delete env.ELECTRON_RUN_AS_NODE;
+    const nodeCommand = process.env.npm_node_execpath || 'node';
+    transport = new StdioClientTransport({command: nodeCommand, args: [path.join(__dirname, '..', 'mcp', 'server.cjs')], env, stderr: 'pipe'});
+    let errors = ''; transport.stderr?.on('data', chunk => {errors += chunk.toString();});
+    client = new Client({name: 'forma-integration-tests', version: '1.0.0'}, {capabilities: {}});
+    await client.connect(transport);
+    const tools = (await client.listTools()).tools;
+    assert.equal(tools.length, 12); assert.equal(new Set(tools.map(tool => tool.name)).size, 12);
+    async function call(name, args = {}) {
+      const result = await client.callTool({name, arguments: args}, undefined, {timeout: 50000});
+      if (result.isError) throw Error(JSON.stringify(result.content));
+      return result.structuredContent || JSON.parse(result.content[0].text);
+    }
+    async function rejected(name, args, code) {
+      const result = await client.callTool({name, arguments: args});
+      assert.equal(result.isError, true, name + ' should fail');
+      assert.equal(JSON.parse(result.content[0].text).code, code);
+    }
+    await rejected('forma_get_scene', {}, 'APP_UNAVAILABLE');
+    await win.webContents.executeJavaScript('window.formaDesktop.mcpToggle(true)');
+    const discovery = JSON.parse(await fs.readFile(process.env.FORMA_BRIDGE_FILE, 'utf8'));
+    if (process.platform !== 'win32') assert.equal((await fs.stat(process.env.FORMA_BRIDGE_FILE)).mode & 0o777, 0o600);
+    const url = 'http://127.0.0.1:' + discovery.port + '/tools/forma_get_scene';
+    const unauthorized = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    assert.equal(unauthorized.status, 401);
+    const foreignOrigin = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json', Authorization: 'Bearer ' + discovery.token, Origin: 'https://example.com'}, body: '{}'});
+    assert.equal(foreignOrigin.status, 403);
+    assert.equal((await call('forma_get_scene')).project.shapes.length, 3);
+    await rejected('forma_create_scene', {replace: false}, 'INVALID_ARGUMENTS');
+    await rejected('forma_update_scene', {width: 500, unexpected: true}, 'INVALID_ARGUMENTS');
+    await call('forma_create_scene', {replace: true, width: 640, height: 360, duration: 1, bg: '#123456'});
+    const circle = (await call('forma_add_shape', {type: 'circle', name: 'MCP circle', x: 100, y: 180, w: 80, h: 80, color: '#ed795e', ease: 'linear'})).layer;
+    const frames = [{t:0,x:100,y:180,w:80,h:80,r:0,o:100}, {t:1,x:500,y:180,w:80,h:80,r:180,o:100}];
+    await call('forma_set_keyframes', {id: circle.id, keyframes: frames});
+    await rejected('forma_set_keyframes', {id: circle.id, keyframes: [{...frames[0], t:2}]}, 'INVALID_PROJECT');
+    await rejected('forma_set_keyframes', {id: circle.id, keyframes: [frames[0], frames[0]]}, 'DUPLICATE_TIME');
+    await rejected('forma_update_scene', {duration: 0}, 'INVALID_ARGUMENTS');
+    await rejected('forma_update_shape', {id: circle.id, text: 'invalid'}, 'INVALID_LAYER_TYPE');
+    await call('forma_set_playback', {action: 'seek', time: .5});
+    let live = await call('forma_get_scene');
+    assert.equal(live.transforms.find(layer => layer.id === circle.id).x, 300);
+    assert.equal(live.project.shapes[0].keys.length, 2);
+    const text = (await call('forma_add_shape', {type:'text', text:'Hello from MCP', x:300, y:120, w:220, h:28})).layer;
+    await call('forma_update_shape', {id:text.id, name:'Linked caption', linkId:circle.id});
+    await call('forma_set_playback', {action:'seek', time:1});
+    live = await call('forma_get_scene');
+    const caption = live.transforms.find(layer => layer.id === text.id);
+    assert.equal(caption.x, 560); assert.ok(Math.abs(caption.y - 180) < .001);
+    await rejected('forma_set_playback', {action:'seek', time:2}, 'INVALID_TIME');
+    await call('forma_set_playback', {action:'play'});
+    assert.equal((await call('forma_get_scene')).playing, true);
+    await call('forma_set_playback', {action:'pause'});
+    const preview = await client.callTool({name:'forma_preview', arguments:{time:.5,maxWidth:320}});
+    assert.ok(!preview.isError);
+    const png = Buffer.from(preview.content.find(content => content.type === 'image').data, 'base64');
+    assert.equal(png.readUInt32BE(16), 320); assert.equal(png.readUInt32BE(20), 180);
+    const imageFile = path.join(output, 'preview.png'); await fs.writeFile(imageFile, png);
+    const imageLayer = (await call('forma_import_asset', {file:imageFile,w:100,x:80,y:80})).layer;
+    const svgFile = path.join(output, 'asset.svg');
+    await fs.writeFile(svgFile, '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" onload="alert(1)"><script>alert(1)</script><style>@import url(https://example.com)</style><rect width="40" height="40" fill="#c3d77f"/></svg>');
+    const svgLayer = (await call('forma_import_asset', {file:svgFile,x:550,y:80,w:40,h:40})).layer;
+    assert.equal(svgLayer.type, 'svg');
+    live = await call('forma_get_scene', {includeAssets:true});
+    assert.ok(!live.project.shapes.find(layer => layer.id === svgLayer.id).svgSource.match(/script|onload|@import/));
+    assert.ok(!('assetData' in (await call('forma_get_scene')).project.shapes.find(layer => layer.id === imageLayer.id)));
+    for (const [format, filename] of [['png','frame.png'], ['svg','frame.svg'], ['animated_svg','animation.svg'], ['project','scene.json'], ['webm','animation.webm']]) {
+      const exported = await call('forma_export', {format,filename,time:.5});
+      const bytes = await fs.readFile(exported.path); assert.equal(exported.bytes, bytes.length); assert.ok(bytes.length > 100);
+      if (format === 'webm') assert.ok(bytes.subarray(0,4).equals(Buffer.from([0x1a,0x45,0xdf,0xa3])));
+      if (format === 'animated_svg') assert.ok(bytes.toString('utf8').includes('animateTransform'));
+      if (format === 'png') {assert.equal(bytes.readUInt32BE(16),640);assert.equal(bytes.readUInt32BE(20),360);}
+    }
+    await rejected('forma_export', {format:'png',filename:'frame.png'}, 'FILE_EXISTS');
+    await rejected('forma_export', {format:'png',filename:'../outside.png'}, 'INVALID_ARGUMENTS');
+    await rejected('forma_export', {format:'png',filename:'CON.png'}, 'INVALID_FILENAME');
+    await call('forma_export', {format:'png',filename:'frame.png',overwrite:true});
+    await call('forma_delete_shape', {id:circle.id,confirm:true});
+    live = await call('forma_get_scene');
+    assert.equal(live.project.shapes.find(layer => layer.id === text.id).linkId, '');
+    await call('forma_open_project', {file:path.join(output,'exports','scene.json'),replace:true});
+    assert.equal((await call('forma_get_scene')).project.shapes.length,4);
+    const invalidFile = path.join(output, 'invalid.json'); await fs.writeFile(invalidFile,'{"version":1}');
+    await rejected('forma_open_project', {file:invalidFile,replace:true}, 'INVALID_PROJECT');
+    assert.equal((await call('forma_get_scene')).project.shapes.length,4);
+    const recovery = JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8'));
+    assert.equal(recovery.shapes.length,4);
+    await win.webContents.executeJavaScript('window.formaDesktop.mcpToggle(false)');
+    await rejected('forma_get_scene', {}, 'APP_UNAVAILABLE');
+    await assert.rejects(fs.access(process.env.FORMA_BRIDGE_FILE));
+    await win.webContents.executeJavaScript('window.formaDesktop.mcpToggle(true)');
+    assert.notEqual(JSON.parse(await fs.readFile(process.env.FORMA_BRIDGE_FILE,'utf8')).token,discovery.token);
+    await client.close();
+    // Verify the single-file release entry point uses the same contract and live bridge.
+    const bundled = path.join(__dirname, '..', 'dist', 'forma-mcp.cjs');
+    transport = new StdioClientTransport({command: nodeCommand, args: [bundled], env, stderr:'pipe'});
+    client = new Client({name:'forma-bundle-test',version:'1.0.0'});
+    await client.connect(transport); assert.equal((await client.listTools()).tools.length,12);
+    assert.equal((await call('forma_get_scene')).project.width,640);
+    await client.close();
+    const closed = new Promise(resolve => win.once('closed', resolve)); win.close(); await closed;
+    await assert.rejects(fs.access(process.env.FORMA_BRIDGE_FILE));
+    assert.equal(JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8')).shapes.length,4);
+    if (errors.trim()) console.log('MCP stderr:', errors.trim());
+    console.log('PASS: MCP stdio handshake, all 12 tools, live editing, linked text, PNG/SVG/WebM/project exports, file imports, validation, authentication, toggle, recovery, and bundled server.');
+    clearTimeout(timeout); app.exit(0);
+  } catch (error) {
+    console.error(error); try {await client?.close();} catch {}
+    clearTimeout(timeout); app.exit(1);
+  }
+});

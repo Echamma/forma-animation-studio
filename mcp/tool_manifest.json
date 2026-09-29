@@ -1,0 +1,621 @@
+{
+  "server": "forma",
+  "version": "1.1.0",
+  "tools": [
+    {
+      "name": "forma_get_scene",
+      "description": "Inspect the open scene, layer IDs, keyframes, selection, playback, and sampled transforms. Asset data is omitted unless includeAssets is true.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "includeAssets": {
+            "type": "boolean",
+            "default": false,
+            "description": "Include embedded image/video/SVG data. Usually unnecessary and potentially large."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_get_scene",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_create_scene",
+      "description": "Replace the current project with an empty scene. Inspect or export the existing project first; replace must be true to confirm replacement.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "replace"
+        ],
+        "properties": {
+          "replace": {
+            "type": "boolean",
+            "const": true,
+            "description": "Explicitly confirm replacing the current scene."
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 4000,
+            "description": "Canvas dimension in pixels."
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 4000,
+            "description": "Canvas dimension in pixels."
+          },
+          "duration": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 30,
+            "description": "Scene length in seconds."
+          },
+          "bg": {
+            "type": "string",
+            "pattern": "^#[0-9a-fA-F]{6}$",
+            "description": "Six digit hex color."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_create_scene",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_update_scene",
+      "description": "Set scene dimensions, background, or duration. Dimensions change the canvas without scaling layers. Duration cannot truncate existing keyframes.",
+      "inputSchema": {
+        "type": "object",
+        "minProperties": 1,
+        "properties": {
+          "width": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 4000,
+            "description": "Canvas dimension in pixels."
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 4000,
+            "description": "Canvas dimension in pixels."
+          },
+          "duration": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 30,
+            "description": "Scene length in seconds."
+          },
+          "bg": {
+            "type": "string",
+            "pattern": "^#[0-9a-fA-F]{6}$",
+            "description": "Six digit hex color."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_update_scene",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_add_shape",
+      "description": "Add a geometric or text layer and return its ID. Position refers to the layer center. New layers start with one keyframe at t=0; use forma_set_keyframes to animate.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "circle",
+              "rect",
+              "triangle",
+              "diamond",
+              "arrow",
+              "text"
+            ],
+            "description": "Layer kind."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 99,
+            "description": "Display name of the layer."
+          },
+          "color": {
+            "type": "string",
+            "pattern": "^#[0-9a-fA-F]{6}$",
+            "description": "Six digit hex color."
+          },
+          "ease": {
+            "type": "string",
+            "enum": [
+              "smooth",
+              "linear",
+              "hold"
+            ],
+            "description": "Keyframe interpolation."
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "Text displayed by a text layer."
+          },
+          "x": {
+            "type": "number",
+            "minimum": -10000,
+            "maximum": 10000,
+            "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."
+          },
+          "y": {
+            "type": "number",
+            "minimum": -10000,
+            "maximum": 10000,
+            "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."
+          },
+          "w": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 10000,
+            "description": "Layer size in pixels."
+          },
+          "h": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 10000,
+            "description": "Layer size in pixels."
+          },
+          "r": {
+            "type": "number",
+            "minimum": -10000,
+            "maximum": 10000,
+            "description": "Rotation in degrees."
+          },
+          "o": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Opacity percentage."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_add_shape",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_update_shape",
+      "description": "Update a layer name, fill, interpolation, or text. For animated transforms use forma_set_keyframes. Text can follow a non-text layer using linkId; use an empty linkId to detach.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "minProperties": 2,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Layer ID returned by Forma."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 99,
+            "description": "Display name of the layer."
+          },
+          "color": {
+            "type": "string",
+            "pattern": "^#[0-9a-fA-F]{6}$",
+            "description": "Six digit hex color."
+          },
+          "ease": {
+            "type": "string",
+            "enum": [
+              "smooth",
+              "linear",
+              "hold"
+            ],
+            "description": "Keyframe interpolation."
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "Text displayed by a text layer."
+          },
+          "linkId": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "ID of a non-text layer to follow, or empty string to detach. Offset is derived from the text's current pose."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_update_shape",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_set_keyframes",
+      "description": "Merge complete keyframes into a layer, replacing frames at matching times. Set replace=true to replace all its keyframes. Each frame needs t,x,y,w,h,r,o. Times must be unique and inside the scene duration.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "id",
+          "keyframes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Layer ID returned by Forma."
+          },
+          "replace": {
+            "type": "boolean",
+            "default": false,
+            "description": "Replace the whole keyframe list instead of merging."
+          },
+          "keyframes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "description": "Complete poses in seconds and pixels.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "t",
+                "x",
+                "y",
+                "w",
+                "h",
+                "r",
+                "o"
+              ],
+              "properties": {
+                "t": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 30,
+                  "description": "Time in seconds within the scene duration."
+                },
+                "x": {
+                  "type": "number",
+                  "minimum": -10000,
+                  "maximum": 10000,
+                  "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."
+                },
+                "y": {
+                  "type": "number",
+                  "minimum": -10000,
+                  "maximum": 10000,
+                  "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."
+                },
+                "w": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 10000,
+                  "description": "Layer size in pixels."
+                },
+                "h": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 10000,
+                  "description": "Layer size in pixels."
+                },
+                "r": {
+                  "type": "number",
+                  "minimum": -10000,
+                  "maximum": 10000,
+                  "description": "Rotation in degrees."
+                },
+                "o": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 100,
+                  "description": "Opacity percentage."
+                }
+              }
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_set_keyframes",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_delete_shape",
+      "description": "Delete a layer after confirm=true. Linked text survives and is detached at its current pose.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "id",
+          "confirm"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Layer ID returned by Forma."
+          },
+          "confirm": {
+            "type": "boolean",
+            "const": true,
+            "description": "Explicitly confirm deleting this layer."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_delete_shape",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_set_playback",
+      "description": "Play, pause, or seek the timeline. Seek pauses playback and requires time. Changes are visible in the open desktop editor.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "play",
+              "pause",
+              "seek"
+            ],
+            "description": "Playback action."
+          },
+          "time": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 30,
+            "description": "Time in seconds within the scene duration."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_set_playback",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_preview",
+      "description": "Render a PNG frame and return it as an MCP image for visual inspection. Does not change the playhead. Preview is scaled down to maxWidth and at most 1600 pixels in either dimension.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "time": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 30,
+            "description": "Time in seconds within the scene duration."
+          },
+          "maxWidth": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 1600,
+            "default": 960,
+            "description": "Maximum preview width in pixels."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_preview",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_export",
+      "description": "Export PNG, static SVG, animated SVG, WebM video, or editable JSON project to Forma's MCP export folder. Returns its absolute path. Filename must be a simple basename with the matching extension; existing files require overwrite=true. WebM records one loop in real time.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "format",
+          "filename"
+        ],
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "png",
+              "svg",
+              "animated_svg",
+              "webm",
+              "project"
+            ],
+            "description": "Export format; project means editable JSON."
+          },
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._ -]*$",
+            "description": "Simple output filename, for example orbit.svg or animation.webm."
+          },
+          "time": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 30,
+            "description": "Time in seconds within the scene duration."
+          },
+          "overwrite": {
+            "type": "boolean",
+            "default": false,
+            "description": "Explicitly allow replacing an existing export."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_export",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_open_project",
+      "description": "Open an editable Forma JSON file from an absolute local path (up to 64 MB). Replaces the current scene and requires replace=true. Invalid projects leave the scene intact.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "file",
+          "replace"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "description": "Absolute local file path on the computer running Forma."
+          },
+          "replace": {
+            "type": "boolean",
+            "const": true,
+            "description": "Explicitly confirm replacing the current scene."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_open_project",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_import_asset",
+      "description": "Import a PNG, JPEG, WebP, or SVG file (up to 30 MB) as an embedded layer. SVG is sanitized. Returns its ID for later keyframes. Video layers can be imported through the desktop UI.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "description": "Absolute local file path on the computer running Forma."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 99,
+            "description": "Display name of the layer."
+          },
+          "x": {
+            "type": "number",
+            "minimum": -10000,
+            "maximum": 10000,
+            "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."
+          },
+          "y": {
+            "type": "number",
+            "minimum": -10000,
+            "maximum": 10000,
+            "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."
+          },
+          "w": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 10000,
+            "description": "Layer size in pixels."
+          },
+          "h": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 10000,
+            "description": "Layer size in pixels."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_import_asset",
+        "method": "post"
+      }
+    }
+  ]
+}

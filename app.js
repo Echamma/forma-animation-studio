@@ -18,11 +18,11 @@ function assetHref(s){return s.type==='svg'?svgData(s.svgSource):s.type==='video
 function sanitizeSvg(source){
   const doc=new DOMParser().parseFromString(source,'image/svg+xml'),root=doc.documentElement;
   if(!root||root.localName!=='svg'||doc.querySelector('parsererror'))throw Error('Invalid SVG markup');
-  root.querySelectorAll('script,foreignObject,iframe,object,embed,audio,video').forEach(e=>e.remove());
-  root.querySelectorAll('*').forEach(e=>{for(const a of [...e.attributes]){const n=a.name.toLowerCase(),v=a.value.trim();if(n.startsWith('on')||n==='srcdoc'||((n==='href'||n.endsWith(':href'))&&!v.startsWith('#')&&!v.startsWith('data:image/'))||(/url\s*\(/i.test(v)&&!/url\s*\(\s*#/i.test(v))||/javascript:|@import|expression\s*\(/i.test(v))e.removeAttribute(a.name)}});
+  root.querySelectorAll('script,style,foreignObject,iframe,object,embed,audio,video').forEach(e=>e.remove());
+  [root,...root.querySelectorAll('*')].forEach(e=>{for(const a of [...e.attributes]){const n=a.name.toLowerCase(),v=a.value.trim();if(n.startsWith('on')||n==='srcdoc'||((n==='href'||n.endsWith(':href'))&&!v.startsWith('#')&&!v.startsWith('data:image/'))||(/url\s*\(/i.test(v)&&/url\s*\(/i.test(v.replace(/url\s*\(\s*#[a-z0-9_-]+\s*\)/gi,'')))||/javascript:|@import|expression\s*\(/i.test(v))e.removeAttribute(a.name)}});
   root.setAttribute('xmlns',NS);return new XMLSerializer().serializeToString(root)
 }
-function recolorSvg(source,color){const doc=new DOMParser().parseFromString(source,'image/svg+xml'),root=doc.documentElement;if(!root||root.localName!=='svg'||doc.querySelector('parsererror'))throw Error('Invalid SVG markup');root.setAttribute('fill',color);root.querySelectorAll('*').forEach(e=>{for(const attr of ['fill','stroke']){const value=e.getAttribute(attr);if(value&&value!=='none'&&!value.startsWith('url('))e.setAttribute(attr,color)}const style=e.getAttribute('style');if(style)e.setAttribute('style',style.replace(/(fill|stroke)\s*:\s*(?!none|url\()[^;]+/gi,`$1:${color}`))});return sanitizeSvg(new XMLSerializer().serializeToString(root))}
+function recolorSvg(source,color){const doc=new DOMParser().parseFromString(source,'image/svg+xml'),root=doc.documentElement;if(!root||root.localName!=='svg'||doc.querySelector('parsererror'))throw Error('Invalid SVG markup');root.setAttribute('fill',color);[root,...root.querySelectorAll('*')].forEach(e=>{for(const attr of ['fill','stroke']){const value=e.getAttribute(attr);if(value&&value!=='none'&&!value.startsWith('url('))e.setAttribute(attr,color)}const style=e.getAttribute('style');if(style)e.setAttribute('style',style.replace(/(fill|stroke)\s*:\s*(?!none|url\()[^;]+/gi,`$1:${color}`))});return sanitizeSvg(new XMLSerializer().serializeToString(root))}
 function mediaElement(s){
   const source=s.type==='video'?s.assetData:assetHref(s);if(assetCache.has(source))return assetCache.get(source);
   if(s.type==='video'){const v=document.createElement('video');v.src=source;v.muted=true;v.loop=true;v.playsInline=true;v.preload='auto';v.style.cssText='width:100%;height:100%;object-fit:fill;display:block;pointer-events:none';assetCache.set(source,v);return v}
@@ -124,4 +124,4 @@ example();requestAnimationFrame(tick);
 
 
 window.FormaSession={snapshot:()=>JSON.parse(JSON.stringify(scene))};
-if(window.formaDesktop)window.formaDesktop.loadRecovery().then(saved=>{if(!saved)return;if(Array.isArray(saved.shapes))for(const shape of saved.shapes)if(shape.type==='svg')shape.svgSource=sanitizeSvg(shape.svgSource);if(!valid(saved))return;stop();assetCache.clear();scene=saved;selected=scene.shapes[0]?.id;time=0;refresh();toast('Previous animation restored');}).catch(()=>toast('Could not restore the previous session'));
+window.FormaSession.ready=window.formaDesktop?window.formaDesktop.loadRecovery().then(saved=>{if(!saved)return;if(Array.isArray(saved.shapes))for(const shape of saved.shapes)if(shape.type==='svg')shape.svgSource=sanitizeSvg(shape.svgSource);if(!valid(saved))return;stop();assetCache.clear();scene=saved;selected=scene.shapes[0]?.id;time=0;refresh();toast('Previous animation restored');}).catch(()=>toast('Could not restore the previous session')):Promise.resolve();

@@ -14,6 +14,7 @@ app.whenReady().then(async () => {
     const win = BrowserWindow.getAllWindows()[0];
     if (win.webContents.isLoading()) await new Promise(resolve => win.webContents.once('did-finish-load', resolve));
     const result = await win.webContents.executeJavaScript(`(async()=>{
+      await window.FormaSession.ready;
       const checks=[]; const assert=(ok,message)=>{if(!ok)throw new Error(message);checks.push(message);};
       assert(valid(scene),'Default project validates'); assert(scene.shapes.length===3,'Three animated example layers load');
       assert(state(scene.shapes[0],0).x!==state(scene.shapes[0],2).x,'Keyframes change shape positions');
