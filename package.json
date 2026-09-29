@@ -1,0 +1,28 @@
+{
+  "name": "forma-animation-studio",
+  "version": "1.0.0",
+  "description": "Desktop shape animation studio with keyframes, motion paths, linked text, media imports, and local exports",
+  "author": "Echamma",
+  "homepage": "https://github.com/Echamma/forma-animation-studio",
+  "license": "UNLICENSED",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "electron tests/desktop.cjs",
+    "build": "electron-builder --linux AppImage deb --x64"
+  },
+  "devDependencies": { "electron": "44.3.0", "electron-builder": "26.15.3" },
+  "build": {
+    "appId": "local.forma.animationstudio",
+    "productName": "Forma Animation Studio",
+    "directories": { "output": "dist" },
+    "files": ["main.cjs", "preload.cjs", "app.js", "index.html", "style.css"],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "executableName": "forma-animation-studio",
+      "category": "Graphics",
+      "maintainer": "Echamma <Echamma@users.noreply.github.com>",
+      "artifactName": "Forma-Animation-Studio-${version}-${arch}.${ext}"
+    }
+  }
+}

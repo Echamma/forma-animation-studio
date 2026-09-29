@@ -122,3 +122,6 @@ example();requestAnimationFrame(tick);
 
 
 
+
+window.FormaSession={snapshot:()=>JSON.parse(JSON.stringify(scene))};
+if(window.formaDesktop)window.formaDesktop.loadRecovery().then(saved=>{if(!saved)return;if(Array.isArray(saved.shapes))for(const shape of saved.shapes)if(shape.type==='svg')shape.svgSource=sanitizeSvg(shape.svgSource);if(!valid(saved))return;stop();assetCache.clear();scene=saved;selected=scene.shapes[0]?.id;time=0;refresh();toast('Previous animation restored');}).catch(()=>toast('Could not restore the previous session'));
