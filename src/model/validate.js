@@ -1,5 +1,18 @@
 import {props} from './animation.js';
 
+export const MAX_LAYERS = 500;
+
+// Clip timing and track fields are optional so projects saved before clips existed stay valid.
+function clipTimesOk(x, duration) {
+  const time = value => Number.isFinite(value) && value >= 0 && value <= duration + 0.001;
+  return (
+    (x.inTime === undefined || time(x.inTime)) &&
+    (x.outTime === undefined || (time(x.outTime) && x.outTime > (x.inTime ?? 0))) &&
+    (x.trackId === undefined || (typeof x.trackId === 'string' && x.trackId.length > 0 && x.trackId.length <= 64)) &&
+    (x.mediaStart === undefined || (Number.isFinite(x.mediaStart) && x.mediaStart >= 0))
+  );
+}
+
 export function valid(s) {
   return (
     s &&
@@ -14,7 +27,7 @@ export function valid(s) {
     s.duration >= 1 &&
     /^#[0-9a-f]{6}$/i.test(s.bg) &&
     Array.isArray(s.shapes) &&
-    s.shapes.length <= 100 &&
+    s.shapes.length <= MAX_LAYERS &&
     new Set(s.shapes.map(x => x.id)).size === s.shapes.length &&
     s.shapes.every(x => {
       const assetOk =
@@ -47,6 +60,7 @@ export function valid(s) {
         textOk &&
         (x.blur === undefined || (Number.isFinite(x.blur) && x.blur >= 0 && x.blur <= 100)) &&
         (x.baseRotation === undefined || (Number.isFinite(x.baseRotation) && Math.abs(x.baseRotation) <= 10000)) &&
+        clipTimesOk(x, s.duration) &&
         (x.disappear === undefined ||
           (x.disappear &&
             Number.isFinite(x.disappear.startTime) &&

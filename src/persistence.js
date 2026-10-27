@@ -19,7 +19,8 @@ let saveRevision = 0;
 let lastInputSource = '';
 let lastInputAt = 0;
 let lastGestureScan = 0;
-const assetVersions = new Map();
+// Media strings are stored once per distinct content, so clips that share a picture share one saved asset.
+const tokenByValue = new Map();
 const assetRegistry = new Map();
 const savedAssetTokens = new Set();
 const assetFields = ['assetData', 'posterData', 'svgSource'];
@@ -29,16 +30,13 @@ function packScene() {
     for (const field of assetFields) {
       const value = shape[field];
       if (typeof value !== 'string') continue;
-      const slot = shape.id + ':' + field,
-        versions = assetVersions.get(slot) || [];
-      let entry = versions.find(version => version.value === value);
-      if (!entry) {
-        entry = {token: crypto.randomUUID(), value};
-        versions.push(entry);
-        assetVersions.set(slot, versions);
-        assetRegistry.set(entry.token, value);
+      let token = tokenByValue.get(value);
+      if (!token) {
+        token = crypto.randomUUID();
+        tokenByValue.set(value, token);
+        assetRegistry.set(token, value);
       }
-      copy[field + 'Ref'] = entry.token;
+      copy[field + 'Ref'] = token;
       delete copy[field];
     }
     return copy;
@@ -152,11 +150,11 @@ export function restoreProject(saved) {
       if (shape.type === 'svg') shape.svgSource = sanitizeSvg(shape.svgSource);
       for (const {field, token, value} of refs)
         if (token && shape[field] === value) {
-          const slot = shape.id + ':' + field,
-            versions = assetVersions.get(slot) || [];
-          if (!versions.some(entry => entry.token === token)) versions.push({token, value});
-          assetVersions.set(slot, versions);
-          assetRegistry.set(token, value);
+          const known = assetRegistry.get(token);
+          if (known === undefined) {
+            assetRegistry.set(token, value);
+            if (!tokenByValue.has(value)) tokenByValue.set(value, token);
+          } else shape[field] = known;
           savedAssetTokens.add(token);
         }
     }

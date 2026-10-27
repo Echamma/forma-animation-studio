@@ -1,4 +1,5 @@
 import {$, toast} from '../dom.js';
+import {MAX_LAYERS} from '../model/validate.js';
 import {recordSceneChange} from '../persistence.js';
 import {stop} from '../playback.js';
 import {editor} from '../state.js';
@@ -78,7 +79,7 @@ export async function importMediaFiles(files) {
   stop();
   for (const file of items) {
     try {
-      if (editor.scene.shapes.length >= 100) throw Error('Scene is full (100 layers)');
+      if (editor.scene.shapes.length >= MAX_LAYERS) throw Error(`Scene is full (${MAX_LAYERS} layers)`);
       const id = crypto.randomUUID(),
         name = file.name.replace(/\.[^.]+$/, '').slice(0, 70) || 'Media';
       let shape;

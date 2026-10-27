@@ -316,3 +316,32 @@ main.drawer-open #tool-drawer{transform:translateX(0);pointer-events:auto}
 @media(max-width:1020px){main{display:grid;grid-template-columns:minmax(0,1fr)}.workspace{grid-column:1;grid-row:1}.right{grid-column:1;grid-row:2}.canvas-actions .canvas-size{display:none}#tool-drawer{top:0;bottom:0}#drawer-scrim:not([hidden]){inset:0;height:100vh}}
 @media(max-width:640px){main{display:flex;flex-direction:column}.workspace{order:1}.right{order:2}.canvas-actions{gap:5px}.canvas-actions button{min-height:36px;padding:6px 9px;font-size:11px}#tool-drawer{width:min(326px,calc(100vw - 28px))}.shape-tools{grid-template-columns:1fr 1fr}.shape-tools .arrow-tool,.linked-text-tool{grid-column:1/-1}}
 @media(prefers-reduced-motion:reduce){button,#tool-drawer{transition:none}}
+
+/* Timeline buttons are small markers; the global 40 px button height made key diamonds into tall slashes. */
+.key-dot,.motion-bar,.clip-bar{min-height:0}
+.key-dot{z-index:2}
+/* Clip bars: the span in which each layer is visible, with trim edges. Clips sharing a track are blue. */
+.clip-bar{position:absolute;top:2px;bottom:2px;z-index:1;display:flex;align-items:stretch;min-width:6px;padding:0;border:1px solid #a9c9a0;border-radius:4px;background:#dcecd6;color:#2b4a33;font-size:9px;font-weight:600;cursor:grab;touch-action:none;overflow:hidden;transition:none}
+.clip-bar:hover{background:#d0e6c8;border-color:#7fae73}
+.clip-bar:active{cursor:grabbing;transform:none}
+.clip-bar.selected{background:#c2e2b4;border-color:#3f7f4b;box-shadow:inset 0 0 0 1px #3f7f4b}
+.clip-track .clip-bar{background:#d9e6f5;border-color:#94b3d6;color:#20354d}
+.clip-track .clip-bar:hover{background:#cadcf1;border-color:#6f95c3}
+.clip-track .clip-bar.selected{background:#b4cdee;border-color:#2f5f96;box-shadow:inset 0 0 0 1px #2f5f96}
+.clip-label{flex:1;align-self:center;overflow:hidden;padding:0 3px;text-overflow:ellipsis;white-space:nowrap;text-align:left;pointer-events:none}
+.clip-edge{flex:none;width:6px;cursor:ew-resize}
+.clip-bar:hover .clip-edge,.clip-bar.selected .clip-edge{background:#3f7f4b40}
+.clip-track .clip-bar:hover .clip-edge,.clip-track .clip-bar.selected .clip-edge{background:#2f5f9640}
+.clip-tools{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+.clip-tools .wide{grid-column:1/-1}
+.clip-tools button{min-height:36px;font-size:12px}
+.toolbar-check{display:flex;gap:5px;align-items:center;margin-right:10px;color:var(--text);font-size:12px;white-space:nowrap}
+.timeline-toolbar>div{display:flex;align-items:center}
+#clip-menu:not([hidden]){position:fixed;z-index:1000;display:flex;flex-direction:column;gap:6px;width:230px;padding:12px;border:1px solid #9cbb9a;border-radius:8px;background:#fffefa;box-shadow:0 14px 40px #1d392a3d;color:var(--text);font-size:11px}
+#clip-menu strong{overflow:hidden;font-size:12px;text-overflow:ellipsis;white-space:nowrap}
+#clip-menu button{min-height:0;padding:7px;text-align:left;border:1px solid #b6d1b1;border-radius:4px;background:#e8f3e4;color:var(--text);font-size:12px;cursor:pointer}
+#clip-menu button:hover{background:#d8edd4}
+#clip-menu button.danger{background:#fff0ef;color:var(--danger);border-color:#e6b8b6}
+#clip-menu button:disabled{opacity:.45;cursor:default}
+.onion-skin{pointer-events:none}
+#tracks{max-height:clamp(85px,18vh,220px)}

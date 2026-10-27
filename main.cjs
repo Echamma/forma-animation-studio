@@ -28,12 +28,13 @@ const projectsDirectory = () => path.join(app.getPath('userData'), 'projects');
 const assetFields = ['assetData', 'posterData', 'svgSource'];
 async function readProject(file) {
   try {
-    const project = JSON.parse(await fs.readFile(file, 'utf8'));
+    const project = JSON.parse(await fs.readFile(file, 'utf8')), media = new Map();
     for (const shape of project.shapes || []) for (const field of assetFields) {
       const token = shape[field + 'Ref'];
       if (!token) continue;
       if (!/^[0-9a-f-]{36}$/i.test(token)) throw Error('Invalid media reference.');
-      shape[field] = await fs.readFile(path.join(assetDirectory(), token), 'utf8');
+      if (!media.has(token)) media.set(token, await fs.readFile(path.join(assetDirectory(), token), 'utf8'));
+      shape[field] = media.get(token);
     }
     return project;
   } catch {return null;}

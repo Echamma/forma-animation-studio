@@ -6,6 +6,7 @@ import {setupDisappear} from './animate/disappear.js';
 import {setupWorkspace} from './ui/workspace.js';
 import {setupPlayback, tick} from './playback.js';
 import {setupInspector} from './ui/inspector.js';
+import {setupClips} from './ui/clips.js';
 import {setupSceneSettings} from './ui/scene-settings.js';
 import {setupLayers} from './ui/layers.js';
 import {setupImport} from './ui/import.js';
@@ -33,6 +34,9 @@ import * as project from './project.js';
 import * as persistence from './persistence.js';
 import * as playback from './playback.js';
 import * as refresh from './ui/refresh.js';
+import * as clips from './model/clips.js';
+import * as clipControls from './ui/clips.js';
+import * as tracks from './timeline/tracks.js';
 
 setupTabs();
 setupKeyframeMenu();
@@ -40,6 +44,7 @@ setupDisappear();
 setupWorkspace();
 setupPlayback();
 setupInspector();
+setupClips();
 setupSceneSettings();
 setupLayers();
 setupImport();
@@ -73,7 +78,10 @@ if (window.formaDesktop?.testMode) {
     project,
     persistence,
     playback,
-    refresh
+    refresh,
+    clips,
+    clipControls,
+    tracks
   );
   for (const key of Object.keys(editor))
     Object.defineProperty(handle, key, {get: () => editor[key], set: value => (editor[key] = value), enumerable: true});

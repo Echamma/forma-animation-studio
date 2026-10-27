@@ -15,5 +15,6 @@ export const editor = {
   workspaceZoom: 1,
   workspacePanX: 0,
   workspacePanY: 0,
-  workspacePan: null
+  workspacePan: null,
+  onionSkin: true
 };

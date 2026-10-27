@@ -58,7 +58,18 @@ export function reappearAt(s) {
           target?.rotationClips?.find(item => item.id === d.triggerClipId);
   return clip ? Math.max(d.startTime + d.duration, clip.startTime + clip.duration) : Infinity;
 }
+// A layer is a clip visible from inTime up to, but not including, outTime. Without outTime it lasts to the scene end,
+// and a clip that ends exactly at the scene end stays visible on the final frame.
+const CLIP_EPSILON = 1e-6;
+export const clipStart = s => s.inTime ?? 0;
+export const clipEnd = s => s.outTime ?? editor.scene.duration;
+export function inClip(s, t) {
+  if (s.inTime !== undefined && t < s.inTime - CLIP_EPSILON) return false;
+  if (s.outTime === undefined || t < s.outTime - CLIP_EPSILON) return true;
+  return s.outTime >= editor.scene.duration - CLIP_EPSILON && t >= editor.scene.duration - CLIP_EPSILON;
+}
 export function visibilityAt(s, t) {
+  if (!inClip(s, t)) return 0;
   const d = s.disappear;
   if (!d || t < d.startTime) return 1;
   const end = d.startTime + d.duration,

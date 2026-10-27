@@ -2,16 +2,32 @@ import {editMotion, selectMotion} from '../animate/motion.js';
 import {editRotation, selectRotation} from '../animate/rotation.js';
 import {$} from '../dom.js';
 import {assetHref, isAsset} from '../media.js';
-import {reappearAt} from '../model/animation.js';
+import {clipEnd, clipStart, inClip, reappearAt} from '../model/animation.js';
+import {earliestShift, MIN_CLIP, shiftLayer, trimClip} from '../model/clips.js';
+import {recordSceneChange} from '../persistence.js';
 import {stop} from '../playback.js';
 import {editor} from '../state.js';
+import {openClipMenu} from '../ui/clips.js';
 import {openKeyframeMenu} from '../ui/keyframe-menu.js';
 import {refresh} from '../ui/refresh.js';
 import {closeDrawer, showInspectorTab} from '../ui/tabs.js';
 
+const percent = t => `${(t / editor.scene.duration) * 100}%`;
+
+export function selectClip(s) {
+  stop();
+  editor.selected = s.id;
+  editor.selectedMotionId = editor.selectedRotationId = null;
+  editor.motionGuide = null;
+  if (!inClip(s, editor.time)) editor.time = clipStart(s);
+  refresh();
+}
+
 export function lists() {
   $('layers').replaceChildren();
   $('tracks').replaceChildren();
+  // One timeline row per layer, except that clips sharing a trackId sit side by side on one row.
+  const rows = new Map();
   for (const s of editor.scene.shapes) {
     const b = document.createElement('button');
     b.className = 'layer' + (editor.selected === s.id ? ' active' : '');
@@ -26,26 +42,42 @@ export function lists() {
     end.textContent = s.type === 'svg' ? '✎' : s.type === 'video' ? '▶' : '◇';
     b.append(sw, name, end);
     b.onclick = () => {
-      editor.selected = s.id;
-      editor.selectedMotionId = editor.selectedRotationId = null;
-      editor.motionGuide = null;
       closeDrawer();
-      refresh();
+      selectClip(s);
     };
     $('layers').append(b);
-    const row = document.createElement('div');
-    row.className =
-      'track' + (editor.selected === s.id && !editor.selectedMotionId && !editor.selectedRotationId ? ' active' : '');
-    const label = document.createElement('span');
-    label.className = 'track-name';
-    label.textContent = s.name;
-    const line = document.createElement('div');
-    line.className = 'track-line';
+    const rowKey = s.trackId || s.id;
+    let entry = rows.get(rowKey);
+    if (!entry) {
+      const row = document.createElement('div');
+      row.className = 'track' + (s.trackId ? ' clip-track' : '');
+      row.dataset.trackKey = rowKey;
+      const label = document.createElement('span');
+      label.className = 'track-name';
+      label.textContent = s.trackId ? s.name.replace(/ \d+$/, '') : s.name;
+      label.title = label.textContent;
+      const line = document.createElement('div');
+      line.className = 'track-line';
+      row.append(label, line);
+      $('tracks').append(row);
+      entry = {row, line, clips: [], last: row};
+      row.onclick = () =>
+        selectClip(
+          entry.clips.find(c => c.id === editor.selected) || entry.clips.find(c => inClip(c, editor.time)) || entry.clips[0]
+        );
+      rows.set(rowKey, entry);
+    }
+    entry.clips.push(s);
+    const {row, line} = entry;
+    if (editor.selected === s.id && !editor.selectedMotionId && !editor.selectedRotationId) row.classList.add('active');
+    line.append(clipBar(s, line));
     for (const k of s.keys) {
+      if (k.t < clipStart(s) - 1e-6 || k.t > clipEnd(s) + 1e-6) continue;
       const d = document.createElement('button');
       d.className = 'key-dot';
       d.dataset.keyTime = k.t;
-      d.style.left = `${(k.t / editor.scene.duration) * 100}%`;
+      d.dataset.layerId = s.id;
+      d.style.left = percent(k.t);
       d.title = `${s.name} at ${k.t.toFixed(2)} seconds — right-click to move or delete`;
       d.onclick = e => {
         e.stopPropagation();
@@ -59,14 +91,12 @@ export function lists() {
       d.oncontextmenu = e => openKeyframeMenu(e, s, k);
       line.append(d);
     }
-    row.append(label, line);
-    row.onclick = () => {
-      editor.selected = s.id;
-      editor.selectedMotionId = editor.selectedRotationId = null;
-      editor.motionGuide = null;
-      refresh();
+    // Animation rows sit under their layer; on a clip track only the selected clip shows them.
+    if (s.trackId && editor.selected !== s.id) continue;
+    const place = subRow => {
+      entry.last.after(subRow);
+      entry.last = subRow;
     };
-    $('tracks').append(row);
     if (s.disappear) {
       const d = s.disappear,
         visibilityRow = document.createElement('div'),
@@ -79,7 +109,7 @@ export function lists() {
       visibilityLabel.textContent = '↳ Disappear';
       visibilityLine.className = 'track-line';
       bar.className = 'motion-bar disappear-bar';
-      bar.style.left = `${(d.startTime / editor.scene.duration) * 100}%`;
+      bar.style.left = percent(d.startTime);
       bar.style.width = `${Math.max(1.5, ((Math.min(end, editor.scene.duration) - d.startTime) / editor.scene.duration) * 100)}%`;
       bar.title = `Fade out ${d.startTime.toFixed(2)}–${(d.startTime + d.duration).toFixed(2)} s${Number.isFinite(end) ? `; reappear ${end.toFixed(2)} s` : '; stay hidden'}`;
       bar.textContent = '◌ Hidden';
@@ -95,7 +125,7 @@ export function lists() {
       visibilityLine.append(bar);
       visibilityRow.append(visibilityLabel, visibilityLine);
       visibilityRow.onclick = bar.onclick;
-      $('tracks').append(visibilityRow);
+      place(visibilityRow);
     }
     for (const [i, m] of (s.motions || []).entries()) {
       const motionRow = document.createElement('div');
@@ -108,8 +138,8 @@ export function lists() {
       motionLine.className = 'track-line';
       const clip = document.createElement('button');
       clip.className = 'motion-bar';
-      clip.style.left = `${(m.startTime / editor.scene.duration) * 100}%`;
-      clip.style.width = `${(m.duration / editor.scene.duration) * 100}%`;
+      clip.style.left = percent(m.startTime);
+      clip.style.width = percent(m.duration);
       clip.title = `${s.name}: ${m.startTime.toFixed(2)}–${(m.startTime + m.duration).toFixed(2)} s`;
       const clipText = document.createElement('span');
       clipText.textContent = m.type === 'path' ? 'Mouse path' : 'Arrow move';
@@ -126,7 +156,7 @@ export function lists() {
       motionLine.append(clip);
       motionRow.append(motionLabel, motionLine);
       motionRow.onclick = () => selectMotion(s, m);
-      $('tracks').append(motionRow);
+      place(motionRow);
     }
     for (const [i, clip] of (s.rotationClips || []).entries()) {
       const rotationRow = document.createElement('div');
@@ -140,8 +170,8 @@ export function lists() {
       rotationLine.className = 'track-line';
       const bar = document.createElement('button');
       bar.className = 'motion-bar rotation-bar';
-      bar.style.left = `${(clip.startTime / editor.scene.duration) * 100}%`;
-      bar.style.width = `${(clip.duration / editor.scene.duration) * 100}%`;
+      bar.style.left = percent(clip.startTime);
+      bar.style.width = percent(clip.duration);
       bar.title = `Rotation ${clip.degrees}° · ${clip.startTime.toFixed(2)}–${(clip.startTime + clip.duration).toFixed(2)} s`;
       const text = document.createElement('span');
       text.textContent = `↻ ${clip.degrees}°`;
@@ -157,13 +187,115 @@ export function lists() {
       rotationLine.append(bar);
       rotationRow.append(rotationLabel, rotationLine);
       rotationRow.onclick = () => selectRotation(s, clip);
-      $('tracks').append(rotationRow);
+      place(rotationRow);
     }
   }
   $('count').textContent = editor.scene.shapes.length;
   $('key-count').textContent =
     `${editor.scene.shapes.length} layers · ${editor.scene.shapes.reduce((n, s) => n + s.keys.length, 0)} keyframes · ${editor.scene.shapes.reduce((n, s) => n + (s.motions?.length || 0) + (s.rotationClips?.length || 0) + (s.disappear ? 1 : 0), 0)} animations`;
 }
+
+// The bar that shows when a layer is visible. Drag it to move the clip with its animation, or drag an edge to trim.
+function clipBar(s, line) {
+  const start = clipStart(s),
+    end = Math.min(clipEnd(s), editor.scene.duration),
+    bar = document.createElement('button');
+  bar.className = 'clip-bar' + (s.id === editor.selected ? ' selected' : '');
+  bar.dataset.layerId = s.id;
+  bar.style.left = percent(start);
+  bar.style.width = percent(end - start);
+  bar.title = `${s.name}: visible ${start.toFixed(2)}–${end.toFixed(2)} s. Drag to move, drag an edge to trim, right-click for more.`;
+  const label = document.createElement('span');
+  label.className = 'clip-label';
+  label.textContent = s.trackId ? s.name : '';
+  for (const edge of ['start', 'end']) {
+    const handle = document.createElement('span');
+    handle.className = 'clip-edge';
+    handle.dataset.edge = edge;
+    handle.title = edge === 'start' ? 'Drag to change when this layer appears' : 'Drag to change when this layer ends';
+    bar.append(handle);
+  }
+  bar.insertBefore(label, bar.lastChild);
+  bar.onpointerdown = e => beginClipDrag(e, s, bar, line);
+  bar.onclick = e => {
+    e.stopPropagation();
+    if (bar.dataset.ignoreClick === 'yes') delete bar.dataset.ignoreClick;
+    else selectClip(s);
+  };
+  bar.oncontextmenu = e => openClipMenu(e, s);
+  return bar;
+}
+
+// Snap to the playhead, the scene edges, and other clips' edges within 8 px; otherwise to 0.1 s steps.
+function snapper(s, line) {
+  const targets = [0, editor.time, editor.scene.duration];
+  for (const other of editor.scene.shapes)
+    if (other !== s) targets.push(clipStart(other), ...(other.outTime === undefined ? [] : [other.outTime]));
+  const tolerance = (8 / line.getBoundingClientRect().width) * editor.scene.duration;
+  return (t, free) => {
+    if (free) return {value: Math.round(t * 100) / 100, target: false};
+    const nearest = targets.reduce((best, x) => (Math.abs(x - t) < Math.abs(best - t) ? x : best), Infinity);
+    return Math.abs(nearest - t) <= tolerance
+      ? {value: nearest, target: true}
+      : {value: Math.round(t * 10) / 10, target: false};
+  };
+}
+
+export function beginClipDrag(e, s, bar, line) {
+  if (e.button !== 0) return;
+  e.stopPropagation();
+  const mode = e.target.closest('.clip-edge')?.dataset.edge || 'move',
+    start0 = clipStart(s),
+    end0 = clipEnd(s),
+    x0 = e.clientX,
+    snap = snapper(s, line),
+    label = bar.querySelector('.clip-label'),
+    minShift = earliestShift(s);
+  let moved = false,
+    start = start0,
+    end = end0;
+  try {
+    bar.setPointerCapture(e.pointerId);
+  } catch {
+    // Capture is only a convenience; synthetic or already released pointers cannot be captured.
+  }
+  bar.onpointermove = move => {
+    if (!moved && Math.abs(move.clientX - x0) < 3) return;
+    moved = true;
+    const delta = ((move.clientX - x0) / line.getBoundingClientRect().width) * editor.scene.duration,
+      free = move.altKey;
+    if (mode === 'start') start = Math.max(0, Math.min(end0 - MIN_CLIP, snap(start0 + delta, free).value));
+    else if (mode === 'end') end = Math.max(start0 + MIN_CLIP, snap(end0 + delta, free).value);
+    else {
+      const a = snap(start0 + delta, free),
+        b = snap(end0 + delta, free),
+        useEnd = b.target && (!a.target || Math.abs(b.value - end0 - delta) < Math.abs(a.value - start0 - delta)),
+        shift = Math.max(minShift, useEnd ? b.value - end0 : a.value - start0);
+      start = start0 + shift;
+      end = end0 + shift;
+    }
+    bar.style.left = percent(Math.min(start, editor.scene.duration));
+    bar.style.width = percent(Math.max(0, Math.min(end, editor.scene.duration) - start));
+    label.textContent = `${start.toFixed(2)}–${end.toFixed(2)} s`;
+  };
+  const finish = commit => {
+    bar.onpointermove = bar.onpointerup = bar.onpointercancel = null;
+    if (!moved) return;
+    bar.dataset.ignoreClick = 'yes';
+    if (commit) {
+      stop();
+      if (mode === 'move') shiftLayer(s, start - start0);
+      else trimClip(s, start, mode === 'end' || s.outTime !== undefined ? end : undefined);
+      editor.selected = s.id;
+      if (!inClip(s, editor.time)) editor.time = clipStart(s);
+      recordSceneChange('clip timing');
+    }
+    refresh();
+  };
+  bar.onpointerup = () => finish(true);
+  bar.onpointercancel = () => finish(false);
+}
+
 function beginMotionClipDrag(e, s, m, clip, line) {
   if (e.button !== 0) return;
   e.stopPropagation();

@@ -1,5 +1,5 @@
 import {$, toast} from '../dom.js';
-import {assetCache, assetHref, isAsset, mediaElement} from '../media.js';
+import {assetCache, isAsset, mediaElement, mediaKey} from '../media.js';
 import {editableState, props, rawState, rotationAt, state} from '../model/animation.js';
 import {key} from '../model/keyframes.js';
 import {stop} from '../playback.js';
@@ -8,6 +8,7 @@ import {editor} from '../state.js';
 import {lists} from '../timeline/tracks.js';
 import {removeKeyframe} from './keyframe-menu.js';
 import {refresh} from './refresh.js';
+import {clipFields} from './clips.js';
 
 export function fields() {
   const s = editor.scene.shapes.find(s => s.id === editor.selected),
@@ -32,6 +33,7 @@ export function fields() {
   $('fill-control').classList.toggle('disabled', asset);
   $('edit-svg').hidden = s?.type !== 'svg';
   $('text-panel').hidden = !isText;
+  clipFields(s);
   document.querySelectorAll('[data-outside]').forEach(b => (b.disabled = !s));
   if (s) {
     $('color').value = asset ? '#888888' : s.color;
@@ -160,7 +162,7 @@ export function setupInspector() {
       delete linked.linkBase;
     }
     if (s.type === 'video') mediaElement(s).pause();
-    if (isAsset(s)) assetCache.delete(s.type === 'video' ? s.assetData : assetHref(s));
+    if (isAsset(s)) assetCache.delete(mediaKey(s));
     editor.scene.shapes = editor.scene.shapes.filter(x => x.id !== editor.selected);
     editor.selected = editor.scene.shapes.at(-1)?.id;
     editor.selectedMotionId = editor.selectedRotationId = null;

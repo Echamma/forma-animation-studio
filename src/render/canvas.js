@@ -1,6 +1,6 @@
 import {$, element} from '../dom.js';
 import {assetHref, isAsset, mediaElement, syncVideo} from '../media.js';
-import {state} from '../model/animation.js';
+import {clipEnd, clipStart, inClip, state} from '../model/animation.js';
 import {resizeCursor, resizeDirections} from '../model/geometry.js';
 import {editor} from '../state.js';
 
@@ -71,6 +71,19 @@ export function pasteboard() {
   const m = Math.round(Math.max(editor.scene.width, editor.scene.height) * 0.55);
   return {m, x: -m, y: -m, w: editor.scene.width + m * 2, h: editor.scene.height + m * 2};
 }
+// A faint copy of the previous clip on the selected layer's track, to line up the next pose in a stop-motion sequence.
+function onionSkin() {
+  const s = editor.scene.shapes.find(shape => shape.id === editor.selected);
+  if (!s?.trackId || !inClip(s, editor.time)) return null;
+  const previous = editor.scene.shapes
+    .filter(x => x !== s && x.trackId === s.trackId && clipEnd(x) <= clipStart(s) + 1e-6)
+    .sort((a, b) => clipEnd(b) - clipEnd(a))[0];
+  if (!previous) return null;
+  const p = state({...previous, inTime: undefined, outTime: undefined}, Math.max(clipStart(previous), clipEnd(previous) - 0.001));
+  const g = element('g', {transform: `translate(${p.x} ${p.y}) rotate(${p.r})`, fill: previous.color, opacity: 0.3, class: 'onion-skin', 'pointer-events': 'none'});
+  g.append(geometry(previous, p, true));
+  return g;
+}
 export function render() {
   const svg = $('canvas'),
     v = pasteboard();
@@ -102,8 +115,14 @@ export function render() {
       class: 'artboard'
     })
   );
+  const ghost = !editor.playing && !editor.recording && editor.onionSkin && onionSkin();
+  if (ghost) svg.append(ghost);
   const objects = element('g', editor.playing || editor.recording ? {'clip-path': 'url(#frame-clip)'} : {});
   for (const s of editor.scene.shapes) {
+    if (!inClip(s, editor.time)) {
+      if (s.type === 'video') mediaElement(s).pause();
+      continue;
+    }
     const p = state(s);
     if (editor.motionDraft?.shapeId === s.id && editor.motionDraft.type === 'path') {
       const lastPoint = editor.motionDraft.points.at(-1);
@@ -128,7 +147,7 @@ export function render() {
   svg.append(objects);
   if (editor.selected && !editor.playing && !editor.recording) {
     const s = editor.scene.shapes.find(shape => shape.id === editor.selected);
-    if (s) {
+    if (s && inClip(s, editor.time)) {
       const p = state(s),
         scale = Math.max(0.1, Math.min(svg.clientWidth / v.w || 1, svg.clientHeight / v.h || 1)),
         smallestSide = Math.min(p.w, p.h) * scale,
