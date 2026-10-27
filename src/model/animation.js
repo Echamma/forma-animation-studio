@@ -58,7 +58,7 @@ export function reappearAt(s) {
           target?.rotationClips?.find(item => item.id === d.triggerClipId);
   return clip ? Math.max(d.startTime + d.duration, clip.startTime + clip.duration) : Infinity;
 }
-function visibilityAt(s, t) {
+export function visibilityAt(s, t) {
   const d = s.disappear;
   if (!d || t < d.startTime) return 1;
   const end = d.startTime + d.duration,

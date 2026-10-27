@@ -6,10 +6,11 @@
   "homepage": "https://github.com/Echamma/forma-animation-studio",
   "license": "UNLICENSED",
   "main": "main.cjs",
+  "type": "module",
   "scripts": {
     "start": "electron .",
     "prestart": "node scripts/bundle-renderer.cjs",
-    "test": "node scripts/generate-contract.cjs --check && electron tests/desktop.cjs && electron tests/mcp.cjs",
+    "test": "node --test \"tests/unit/*.test.js\" && node scripts/generate-contract.cjs --check && electron tests/desktop.cjs && electron tests/mcp.cjs",
     "pretest": "node scripts/bundle-mcp.cjs && node scripts/bundle-renderer.cjs",
     "bundle": "node scripts/bundle-renderer.cjs",
     "build": "electron-builder --linux AppImage deb --x64 --publish never",
@@ -20,7 +21,8 @@
     "prestart:mcp": "node scripts/bundle-renderer.cjs",
     "mcp": "node mcp/server.cjs",
     "mcp:contract": "node scripts/generate-contract.cjs",
-    "mcp:build": "node scripts/bundle-mcp.cjs"
+    "mcp:build": "node scripts/bundle-mcp.cjs",
+    "test:unit": "node --test \"tests/unit/*.test.js\""
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "1.31.0",
