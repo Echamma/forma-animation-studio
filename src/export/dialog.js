@@ -1,15 +1,15 @@
 import {$, download} from '../dom.js';
 import {svgText} from './svg.js';
 import {packProjectFile} from './project-file.js';
+import {renderVideo} from './video.js';
 import {inlineMedia} from '../media-library.js';
-import {mediaElement, prepareAssets} from '../media.js';
+import {prepareAssets} from '../media.js';
 import {stop} from '../playback.js';
 import {render} from '../render/canvas.js';
 import {ensureFonts, paint} from '../render/paint.js';
 import {editor} from '../state.js';
 
-const audioSourceCache = new WeakMap();
-let sharedAudioContext;
+let videoExport = null;
 
 export function setupDialog() {
   $('export').onclick = () => {
@@ -49,91 +49,36 @@ export function setupDialog() {
     }
   };
   $('video-export').onclick = async () => {
-    if (editor.recording) return;
-    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) {
-      $('export-status').textContent = 'Video recording is unavailable in this browser.';
-      return;
-    }
+    if (videoExport || editor.recording) return;
     stop();
-    editor.recording = true;
-    const c = document.createElement('canvas');
-    c.width = editor.scene.width;
-    c.height = editor.scene.height;
-    const ctx = c.getContext('2d');
-    let stream, audioContext, audioDestination, recorder;
-    const audioSources = [];
-    const finish = () => {
-      stream?.getTracks().forEach(track => track.stop());
-      for (const s of editor.scene.shapes) if (s.type === 'video') mediaElement(s).pause();
-      for (const source of audioSources) {
-        source.disconnect(audioDestination);
-        source.connect(audioContext.destination);
-      }
-      editor.recording = false;
-      render();
-    };
+    const format = $('video-format').value,
+      progress = $('video-progress');
+    videoExport = new AbortController();
+    progress.value = 0;
+    progress.hidden = $('video-cancel').hidden = false;
+    $('video-export').disabled = true;
     try {
-      await ensureFonts();
-      await prepareAssets(0);
-      paint(ctx, 0);
-      stream = c.captureStream(60);
-      const videos = editor.scene.shapes.filter(s => s.type === 'video');
-      if (videos.length) {
-        audioContext = sharedAudioContext ??= new AudioContext();
-        audioDestination = audioContext.createMediaStreamDestination();
-        for (const s of videos) {
-          const video = mediaElement(s);
-          let source = audioSourceCache.get(video);
-          if (!source) {
-            source = audioContext.createMediaElementSource(video);
-            audioSourceCache.set(video, source);
-          }
-          source.disconnect();
-          source.connect(audioDestination);
-          audioSources.push(source);
+      const {blob, audioCodec} = await renderVideo({
+        format,
+        fps: Number($('video-fps').value),
+        scale: Number($('video-scale').value),
+        signal: videoExport.signal,
+        onProgress: done => {
+          progress.value = done;
+          $('export-status').textContent = `Rendering frames… ${Math.round(done * 100)}%`;
         }
-        for (const track of audioDestination.stream.getAudioTracks()) stream.addTrack(track);
-        await audioContext.resume();
-      }
-      const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'].find(t =>
-        MediaRecorder.isTypeSupported(t)
-      );
-      recorder = new MediaRecorder(stream, mime ? {mimeType: mime} : {});
-      const chunks = [];
-      recorder.ondataavailable = e => {
-        if (e.data.size) chunks.push(e.data);
-      };
-      recorder.onstop = () => {
-        finish();
-        download(
-          new Blob(chunks, {type: recorder.mimeType}),
-          'forma-animation.' + (recorder.mimeType.includes('mp4') ? 'mp4' : 'webm')
-        );
-        $('export-status').textContent = editor.scene.shapes.some(s => s.type === 'video')
-          ? 'Video exported with imported audio.'
-          : 'Video exported.';
-      };
-      recorder.onerror = () => {
-        $('export-status').textContent = 'Could not record the video.';
-        finish();
-      };
-      recorder.start();
-      await Promise.all(videos.map(s => mediaElement(s).play()));
-      const start = performance.now();
-      function frame(now) {
-        if (!editor.recording) return;
-        const t = Math.min((now - start) / 1000, editor.scene.duration);
-        paint(ctx, t);
-        $('export-status').textContent =
-          `Recording ${t.toFixed(1)} / ${editor.scene.duration} s — keep this tab visible`;
-        if (t < editor.scene.duration) requestAnimationFrame(frame);
-        else recorder.stop();
-      }
-      requestAnimationFrame(frame);
+      });
+      download(blob, `forma-animation.${format}`);
+      $('export-status').textContent = audioCodec ? 'Video exported with sound from your video layers.' : 'Video exported.';
     } catch (error) {
-      finish();
       $('export-status').textContent =
-        'Could not record video with audio. Check that the imported video plays in Forma.';
+        error.name === 'AbortError' ? 'Video export cancelled.' : 'Could not export the video: ' + error.message;
+    } finally {
+      videoExport = null;
+      progress.hidden = $('video-cancel').hidden = true;
+      $('video-export').disabled = false;
+      render();
     }
   };
+  $('video-cancel').onclick = () => videoExport?.abort();
 }

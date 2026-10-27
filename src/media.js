@@ -72,14 +72,15 @@ function waitForMedia(media) {
     media.addEventListener('error', fail, {once: true});
   });
 }
-export async function prepareAssets(at = editor.time, playVideos = false) {
+// Loads every media layer and seeks videos to time `at`. Video export passes a tight tolerance so each frame is exact.
+export async function prepareAssets(at = editor.time, playVideos = false, tolerance = 0.04) {
   for (const s of editor.scene.shapes)
     if (isAsset(s)) {
       const media = mediaElement(s);
       await waitForMedia(media);
       if (s.type === 'video' && Number.isFinite(media.duration)) {
         const target = mediaTime(s, at, media.duration);
-        if (Math.abs(media.currentTime - target) > 0.04)
+        if (Math.abs(media.currentTime - target) > tolerance)
           await new Promise(resolve => {
             media.addEventListener('seeked', resolve, {once: true});
             media.currentTime = target;

@@ -212,7 +212,7 @@ app.whenReady().then(async () => {
       assert(!animatedShape.keys.includes(generatedKey),'Converted keyframe can be deleted from the menu');
       assert(valid(JSON.parse(JSON.stringify(scene))),'Edited keyframes survive project roundtrip');
 
-      assert(window.MediaRecorder && HTMLCanvasElement.prototype.captureStream,'Video export APIs are available');
+      assert(window.VideoEncoder && window.AudioEncoder && window.OfflineAudioContext,'Frame-by-frame video export APIs are available');
       const canvas=document.createElement('canvas');canvas.width=scene.width;canvas.height=scene.height;paint(canvas.getContext('2d'),2);
       const png=canvas.toDataURL('image/png'); assert(png.startsWith('data:image/png;base64,'),'PNG renders');
       const originalShapes=scene.shapes,originalBg=scene.bg,blurRect={id:crypto.randomUUID(),name:'Blur export test',type:'rect',color:'#ff0000',ease:'smooth',keys:[{t:0,x:100,y:100,w:80,h:80,r:0,o:100}]};
@@ -398,6 +398,30 @@ app.whenReady().then(async () => {
     const systemOpen = await win.webContents.executeJavaScript(`with(window.__forma){(async()=>{for(let i=0;i<50&&scene.projectName!=='Opened from the system';i++)await new Promise(resolve=>setTimeout(resolve,50));return scene.projectName})()}`);
     assert.equal(systemOpen, 'Opened from the system');
     result.checks.push('A .forma file opened from the system loads in the editor');
+    const videoChecks = await win.webContents.executeJavaScript(`with(window.__forma){(async()=>{
+      const checks=[];const assert=(ok,message)=>{if(!ok)throw new Error(message);checks.push(message);};
+      await document.getElementById('new-project').onclick();
+      for(const s of scene.shapes)s.keys=s.keys.filter(k=>k.t<=2);scene.duration=2;refresh();
+      const picture=document.createElement('canvas');picture.width=160;picture.height=90;const pctx=picture.getContext('2d'),sound=new AudioContext(),tone=sound.createOscillator(),wire=sound.createMediaStreamDestination();
+      tone.connect(wire);tone.start();const stream=picture.captureStream(30);stream.addTrack(wire.stream.getAudioTracks()[0]);
+      const recorder=new MediaRecorder(stream,{mimeType:'video/webm;codecs=vp8,opus'}),chunks=[];recorder.ondataavailable=e=>chunks.push(e.data);recorder.start();
+      for(let i=0;i<18;i++){pctx.fillStyle=i%2?'#ff00ff':'#00ffff';pctx.fillRect(0,0,160,90);await new Promise(resolve=>setTimeout(resolve,40));}
+      await new Promise(resolve=>{recorder.onstop=resolve;recorder.stop()});tone.stop();await sound.close();
+      const imported=await importMediaFiles([new File(chunks,'tone.webm',{type:'video/webm'})]);
+      assert(imported.added===1,'A video with sound imports: '+JSON.stringify(imported.errors));
+      scene.shapes.at(-1).inTime=0.5;refresh();
+      const mp4=await renderVideo({format:'mp4',fps:30}),mp4Info=await probeVideo(mp4.blob);
+      assert(mp4Info.frames===60&&Math.abs(mp4Info.duration-2)<0.05,'MP4 export renders all 60 frames of a 2 s scene: '+JSON.stringify(mp4Info));
+      assert(mp4Info.audioCodec,'MP4 export includes the sound of video layers: '+JSON.stringify(mp4Info));
+      const webm=await renderVideo({format:'webm',fps:24,scale:2}),webmInfo=await probeVideo(webm.blob);
+      assert(webmInfo.frames===48&&Math.abs(webmInfo.duration-2)<0.05&&webmInfo.audioCodec==='opus','WebM export renders 48 frames at 24 fps with sound: '+JSON.stringify(webmInfo));
+      const cancelled=new AbortController();cancelled.abort();
+      const outcome=await renderVideo({format:'webm',signal:cancelled.signal}).then(()=>'finished',error=>error.name);
+      assert(outcome==='AbortError'&&!recording,'Video export can be cancelled');
+      return {checks,codecs:[mp4.videoCodec,mp4.audioCodec,webm.videoCodec,webm.audioCodec]};
+    })()}`);
+    result.checks.push(...videoChecks.checks);
+    console.log('Video codecs (mp4 video, mp4 audio, webm video, webm audio):', videoChecks.codecs.join(', '));
     const defaultProject = await win.webContents.executeJavaScript('window.FormaSession.snapshot()');
     defaultProject.bg='#abcdef';
     await fs.writeFile(path.join(app.getPath('userData'),'default-project.json'),JSON.stringify(defaultProject));

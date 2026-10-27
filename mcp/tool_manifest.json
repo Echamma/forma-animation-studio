@@ -599,7 +599,7 @@
     },
     {
       "name": "forma_export",
-      "description": "Export PNG, static SVG, animated SVG, WebM video, or editable JSON project to Forma's MCP export folder. Returns its absolute path. Filename must be a simple basename with the matching extension; existing files require overwrite=true. WebM records one loop in real time.",
+      "description": "Export PNG, static SVG, animated SVG, MP4 or WebM video, or editable JSON project to Forma's MCP export folder. Returns its absolute path. Filename must be a simple basename with the matching extension; existing files require overwrite=true. Video renders every frame exactly (faster than real time) and includes sound from video layers.",
       "inputSchema": {
         "type": "object",
         "required": [
@@ -613,17 +613,31 @@
               "png",
               "svg",
               "animated_svg",
+              "mp4",
               "webm",
               "project"
             ],
-            "description": "Export format; project means editable JSON."
+            "description": "Export format; project means editable JSON with media embedded."
           },
           "filename": {
             "type": "string",
             "minLength": 1,
             "maxLength": 160,
             "pattern": "^[A-Za-z0-9][A-Za-z0-9._ -]*$",
-            "description": "Simple output filename, for example orbit.svg or animation.webm."
+            "description": "Simple output filename, for example orbit.svg or animation.mp4."
+          },
+          "fps": {
+            "type": "integer",
+            "enum": [
+              12,
+              24,
+              25,
+              30,
+              50,
+              60
+            ],
+            "default": 30,
+            "description": "Frames per second for mp4 and webm."
           },
           "time": {
             "type": "number",

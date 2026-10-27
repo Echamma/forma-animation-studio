@@ -44,7 +44,7 @@ function createBridge({discoveryFile, exportDirectory, dispatch, checkpoint, sto
     }
     let destination;
     if (name === 'forma_export') {
-      const extension = {png: '.png', svg: '.svg', animated_svg: '.svg', webm: '.webm', project: '.json'}[args.format];
+      const extension = {png: '.png', svg: '.svg', animated_svg: '.svg', mp4: '.mp4', webm: '.webm', project: '.json'}[args.format];
       if (path.basename(args.filename) !== args.filename || args.filename.endsWith(' ') || args.filename.endsWith('.') || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(args.filename) || path.extname(args.filename).toLowerCase() !== extension) {
         throw fail('INVALID_FILENAME', 'Use a simple filename ending in ' + extension + '.');
       }

@@ -360,3 +360,12 @@ main.drawer-open #tool-drawer{transform:translateX(0);pointer-events:auto}
 .arrange-tools .wide{grid-column:span 3}
 #arrange-panel{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)}
 .group-box{fill:none;stroke:#2f6fb0;stroke-width:1.5;stroke-dasharray:6 4;vector-effect:non-scaling-stroke;pointer-events:none}
+/* Video export options */
+.video-export{margin-bottom:8px}
+.video-export .export-option{margin-bottom:6px}
+.video-options{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:0 2px 8px}
+.video-options label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)}
+.video-options select{padding:6px;border:1px solid #c6d4c4;border-radius:6px;background:#fff;color:var(--text)}
+.video-progress{display:flex;gap:8px;align-items:center}
+.video-progress progress{flex:1;height:10px;accent-color:var(--accent)}
+.video-progress button{min-height:30px;padding:4px 10px;font-size:12px}

@@ -1,13 +1,14 @@
 // Fixed, typed editor commands for the MCP bridge. No arbitrary code or browser automation endpoint.
 import {$, toast} from './dom.js';
 import {svgText} from './export/svg.js';
-import {assetCache, assetHref, mediaElement, prepareAssets} from './media.js';
+import {assetCache, assetHref, prepareAssets} from './media.js';
 import {inlineMedia} from './media-library.js';
 import {state} from './model/animation.js';
 import {continueAfter, duplicateLayer} from './model/clips.js';
 import {usableProject} from './model/validate.js';
 import {recordSceneChange, scheduleMediaMigration} from './persistence.js';
 import {stop} from './playback.js';
+import {renderVideo} from './export/video.js';
 import {ensureFonts, paint} from './render/paint.js';
 import {editor} from './state.js';
 import {sanitizeSvg} from './svg/sanitize.js';
@@ -149,56 +150,16 @@ export function setupAutomation() {
     if (!blob) throw problem('EXPORT_FAILED', 'PNG rendering failed.');
     return {data: await base64(blob), mimeType: 'image/png', width: canvas.width, height: canvas.height, time: at};
   }
-  async function video() {
-    const mimeType = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find(type =>
-      MediaRecorder.isTypeSupported(type)
-    );
-    if (!mimeType) throw problem('UNSUPPORTED_EXPORT', 'WebM recording is unavailable in this runtime.');
+  async function video(format, fps) {
     const originalTime = editor.time;
     const wasPlaying = editor.playing;
     stop();
-    editor.recording = true;
-    let stream, recorder, deadline, frameTimer;
     try {
-      await ensureFonts();
-      await prepareAssets(0, true);
-      const canvas = document.createElement('canvas');
-      canvas.width = editor.scene.width;
-      canvas.height = editor.scene.height;
-      const context = canvas.getContext('2d');
-      paint(context, 0);
-      stream = canvas.captureStream(30);
-      recorder = new MediaRecorder(stream, {mimeType, videoBitsPerSecond: 8000000});
-      const blob = await new Promise((resolve, reject) => {
-        const chunks = [];
-        recorder.ondataavailable = event => {
-          if (event.data.size) chunks.push(event.data);
-        };
-        recorder.onstop = () => resolve(new Blob(chunks, {type: 'video/webm'}));
-        recorder.onerror = () => reject(problem('EXPORT_FAILED', 'Video recording failed.'));
-        deadline = setTimeout(
-          () => reject(problem('EXPORT_FAILED', 'Video recording timed out.')),
-          (editor.scene.duration + 15) * 1000
-        );
-        recorder.start();
-        const start = performance.now();
-        const draw = () => {
-          const at = Math.min((performance.now() - start) / 1000, editor.scene.duration);
-          paint(context, at);
-          if (at < editor.scene.duration) frameTimer = setTimeout(draw, 1000 / 30);
-          else recorder.stop();
-        };
-        draw();
-      });
-      if (!blob.size) throw problem('EXPORT_FAILED', 'The recorded video was empty.');
-      return {data: await base64(blob), mimeType: 'video/webm'};
+      const {blob} = await renderVideo({format, fps});
+      return {data: await base64(blob), mimeType: blob.type};
+    } catch (error) {
+      throw problem(error.code || 'EXPORT_FAILED', error.message);
     } finally {
-      clearTimeout(deadline);
-      clearTimeout(frameTimer);
-      if (recorder?.state === 'recording') recorder.stop();
-      stream?.getTracks().forEach(track => track.stop());
-      for (const layer of editor.scene.shapes) if (layer.type === 'video') mediaElement(layer).pause();
-      editor.recording = false;
       editor.time = originalTime;
       refresh();
       if (wasPlaying) $('play').click();
@@ -357,7 +318,7 @@ export function setupAutomation() {
         case 'forma_export': {
           const at = checkedTime(args.time);
           if (args.format === 'png') return await frame(at);
-          if (args.format === 'webm') return await video();
+          if (args.format === 'mp4' || args.format === 'webm') return await video(args.format, args.fps ?? 30);
           // Exported projects and SVG embed their media so they open anywhere, not only in this app's library.
           if (args.format === 'project')
             return {
