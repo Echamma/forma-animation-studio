@@ -40,6 +40,8 @@ import * as clipControls from './ui/clips.js';
 import * as tracks from './timeline/tracks.js';
 import * as selection from './ui/selection.js';
 import * as arrange from './model/arrange.js';
+import * as mediaLibrary from './media-library.js';
+import * as projectFile from './export/project-file.js';
 
 setupTabs();
 setupKeyframeMenu();
@@ -87,7 +89,9 @@ if (window.formaDesktop?.testMode) {
     clipControls,
     tracks,
     selection,
-    arrange
+    arrange,
+    mediaLibrary,
+    projectFile
   );
   for (const key of Object.keys(editor))
     Object.defineProperty(handle, key, {get: () => editor[key], set: value => (editor[key] = value), enumerable: true});

@@ -3,6 +3,16 @@ import {EASES, validCurve} from './easing.js';
 
 export const MAX_LAYERS = 500;
 
+// Media is either embedded as a data URL (browser preview, older projects) or stored in the desktop media library.
+export const LIBRARY_URL = /^forma-asset:\/\/media\/[0-9a-f]{64}\.(png|jpg|webp|mp4|webm|ogv)$/;
+const isImage = value =>
+  typeof value === 'string' &&
+  (/^data:image\/(png|jpeg|webp);/i.test(value) || (LIBRARY_URL.test(value) && /\.(png|jpg|webp)$/.test(value)));
+const isVideo = value =>
+  typeof value === 'string' &&
+  (/^data:video\/(mp4|webm|ogg);/i.test(value) || (LIBRARY_URL.test(value) && /\.(mp4|webm|ogv)$/.test(value)));
+const isPoster = value => typeof value === 'string' && (value.startsWith('data:image/') || isImage(value));
+
 // Clip timing and track fields are optional so projects saved before clips existed stay valid.
 function clipTimesOk(x, duration) {
   const time = value => Number.isFinite(value) && value >= 0 && value <= duration + 0.001;
@@ -44,15 +54,11 @@ export function valid(s) {
     s.shapes.every(x => {
       const assetOk =
           x.type === 'image'
-            ? typeof x.assetData === 'string' && /^data:image\/(png|jpeg|webp);/i.test(x.assetData)
+            ? isImage(x.assetData)
             : x.type === 'svg'
               ? typeof x.svgSource === 'string'
               : x.type === 'video'
-                ? typeof x.assetData === 'string' &&
-                  /^data:video\/(mp4|webm|ogg);/i.test(x.assetData) &&
-                  typeof x.posterData === 'string' &&
-                  x.posterData.startsWith('data:image/') &&
-                  Number.isFinite(x.mediaDuration)
+                ? isVideo(x.assetData) && isPoster(x.posterData) && Number.isFinite(x.mediaDuration)
                 : true,
         textOk =
           x.type !== 'text' ||

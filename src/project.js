@@ -1,7 +1,8 @@
 import {$, toast} from './dom.js';
 import {assetCache} from './media.js';
 import {valid} from './model/validate.js';
-import {recordSceneChange, restoreProject} from './persistence.js';
+import {unpackProjectFile} from './export/project-file.js';
+import {recordSceneChange, restoreProject, scheduleMediaMigration} from './persistence.js';
 import {stop} from './playback.js';
 import {editor} from './state.js';
 import {sanitizeSvg} from './svg/sanitize.js';
@@ -144,38 +145,14 @@ export function setupProject() {
     }
   };
   $('file').onchange = async e => {
-    try {
-      const f = e.target.files[0];
-      if (!f) return;
-      const s = JSON.parse(await f.text());
-      s.width ??= 960;
-      s.height ??= 600;
-      if (Array.isArray(s.shapes))
-        for (const shape of s.shapes) if (shape.type === 'svg') shape.svgSource = sanitizeSvg(shape.svgSource);
-      if (!valid(s)) throw Error();
-      s.shapes.forEach(x => x.keys.sort((a, b) => a.t - b.t));
-      await window.FormaSession.flushAutosave();
-      stop();
-      assetCache.clear();
-      editor.scene = s;
-      editor.scene.projectId = crypto.randomUUID();
-      editor.scene.projectName =
-        typeof s.projectName === 'string' && s.projectName.trim()
-          ? s.projectName.trim()
-          : f.name.replace(/\.[^.]+$/, '');
-      syncProjectName();
-      editor.selected = s.shapes[0]?.id;
-      editor.selectedMotionId = editor.selectedRotationId = null;
-      editor.motionGuide = null;
-      editor.time = 0;
-      refresh();
-      recordSceneChange('open project');
-      toast('Project opened');
-    } catch {
-      toast('This file is not a valid Forma project');
-    }
+    const f = e.target.files[0];
     e.target.value = '';
+    if (f) await openProjectFile(f.name, () => f.arrayBuffer());
   };
+  window.formaDesktop?.onOpenFile(async ({name, bytes}) => {
+    await window.FormaSession.ready;
+    await openProjectFile(name, async () => bytes);
+  });
   $('reset').onclick = async () => {
     try {
       const saved = await window.formaDesktop?.loadDefault();
@@ -194,4 +171,38 @@ export function setupProject() {
     syncProjectName();
     recordSceneChange('load example');
   };
+}
+
+// Opens a .forma archive or a JSON project picked in the app or opened from the system as a new local project.
+export async function openProjectFile(name, read) {
+  try {
+    const bytes = new Uint8Array(await read());
+    const s = /\.forma$/i.test(name) ? await unpackProjectFile(bytes) : JSON.parse(new TextDecoder().decode(bytes));
+    s.width ??= 960;
+    s.height ??= 600;
+    if (Array.isArray(s.shapes))
+      for (const shape of s.shapes) if (shape.type === 'svg') shape.svgSource = sanitizeSvg(shape.svgSource);
+    if (!valid(s)) throw Error();
+    s.shapes.forEach(x => x.keys.sort((a, b) => a.t - b.t));
+    await window.FormaSession.flushAutosave();
+    stop();
+    assetCache.clear();
+    editor.scene = s;
+    editor.scene.projectId = crypto.randomUUID();
+    editor.scene.projectName =
+      typeof s.projectName === 'string' && s.projectName.trim() ? s.projectName.trim() : name.replace(/\.[^.]+$/, '');
+    syncProjectName();
+    editor.selected = s.shapes[0]?.id;
+    editor.selectedMotionId = editor.selectedRotationId = null;
+    editor.motionGuide = null;
+    editor.time = 0;
+    refresh();
+    recordSceneChange('open project');
+    scheduleMediaMigration();
+    toast('Project opened');
+    return true;
+  } catch {
+    toast('This file is not a valid Forma project');
+    return false;
+  }
 }

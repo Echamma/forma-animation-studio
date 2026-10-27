@@ -1,4 +1,5 @@
 import {$, toast} from '../dom.js';
+import {mediaBlob, storeMedia} from '../media-library.js';
 import {MAX_LAYERS} from '../model/validate.js';
 import {recordSceneChange} from '../persistence.js';
 import {stop} from '../playback.js';
@@ -7,17 +8,10 @@ import {sanitizeSvg} from '../svg/sanitize.js';
 import {refresh} from './refresh.js';
 import {closeDrawer} from './tabs.js';
 
-function readDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(file);
-  });
-}
 function imageInfo(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
+    img.crossOrigin = 'anonymous';
     img.onload = () => resolve({width: img.naturalWidth, height: img.naturalHeight});
     img.onerror = reject;
     img.src = src;
@@ -26,10 +20,22 @@ function imageInfo(src) {
 function videoInfo(src) {
   return new Promise((resolve, reject) => {
     const v = document.createElement('video');
+    v.crossOrigin = 'anonymous';
     v.muted = true;
     v.preload = 'auto';
     v.src = src;
-    v.onloadedmetadata = () => {
+    v.onloadedmetadata = async () => {
+      // Recordings made by browsers often omit their length; seeking far past the end makes the decoder find it.
+      if (!Number.isFinite(v.duration)) {
+        await new Promise(resolve => {
+          const done = () => Number.isFinite(v.duration) && resolve();
+          v.ondurationchange = done;
+          setTimeout(resolve, 3000);
+          v.currentTime = 1e9;
+        });
+        v.ondurationchange = null;
+        if (!Number.isFinite(v.duration)) return reject(Error('The video length could not be read'));
+      }
       const capture = () => {
         try {
           const max = 720,
@@ -97,15 +103,16 @@ export async function importMediaFiles(files) {
           keys: [{t: 0, x: editor.scene.width / 2, y: editor.scene.height / 2, w: size.w, h: size.h, r: 0, o: 100}]
         };
       } else if (['video/mp4', 'video/webm', 'video/ogg'].includes(file.type) || /\.(mp4|webm|ogv)$/i.test(file.name)) {
-        const data = await readDataUrl(file),
+        const data = await storeMedia(file),
           info = await videoInfo(data),
-          size = fittedAssetSize(info.width, info.height);
+          size = fittedAssetSize(info.width, info.height),
+          poster = await mediaBlob(info.poster);
         shape = {
           id,
           name,
           type: 'video',
           assetData: data,
-          posterData: info.poster,
+          posterData: await storeMedia(new File([poster], 'poster.jpg', {type: 'image/jpeg'})),
           mediaDuration: info.duration,
           color: '#888888',
           ease: 'smooth',
@@ -115,7 +122,7 @@ export async function importMediaFiles(files) {
         ['image/png', 'image/jpeg', 'image/webp'].includes(file.type) ||
         /\.(png|jpe?g|webp)$/i.test(file.name)
       ) {
-        const data = await readDataUrl(file),
+        const data = await storeMedia(file),
           info = await imageInfo(data),
           size = fittedAssetSize(info.width, info.height);
         shape = {

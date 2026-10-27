@@ -20,6 +20,8 @@ export function mediaElement(s) {
   if (assetCache.has(key)) return assetCache.get(key);
   if (s.type === 'video') {
     const v = document.createElement('video');
+    // Library media is served with CORS headers, so painting it keeps export canvases readable.
+    v.crossOrigin = 'anonymous';
     v.src = source;
     v.muted = false;
     v.loop = true;
@@ -30,6 +32,7 @@ export function mediaElement(s) {
     return v;
   }
   const img = new Image();
+  img.crossOrigin = 'anonymous';
   img.src = source;
   assetCache.set(key, img);
   return img;

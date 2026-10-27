@@ -55,6 +55,7 @@ jobs:
             dist/*.deb
             dist/forma-mcp.cjs
             dist/SHA256SUMS
+            dist/latest-linux.yml
           if-no-files-found: error
   windows:
     needs: version
@@ -76,17 +77,19 @@ jobs:
         run: |
           $process = Start-Process -FilePath 'dist/win-unpacked/Forma Animation Studio.exe' -ArgumentList '--smoke-test' -Wait -PassThru -WindowStyle Hidden
           if ($process.ExitCode -ne 0) { throw 'Packaged editor smoke test failed' }
-      - name: Calculate Windows checksum
+      - name: Calculate Windows checksums
         shell: pwsh
         run: |
-          $file = Get-ChildItem dist/ -Filter '*.exe' | Select-Object -First 1
-          $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName
-          ($hash.Hash.ToLower() + '  ' + $file.Name) | Set-Content dist/SHA256SUMS-Windows -Encoding ascii
+          Get-ChildItem dist/ -Filter '*.exe' | ForEach-Object {
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLower() + '  ' + $_.Name
+          } | Set-Content dist/SHA256SUMS-Windows -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
           name: forma-animation-studio-windows-x64
           path: |
             dist/*.exe
+            dist/*.exe.blockmap
+            dist/latest.yml
             dist/SHA256SUMS-Windows
           if-no-files-found: error
   publish:

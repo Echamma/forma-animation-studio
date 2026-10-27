@@ -15,7 +15,7 @@
     "bundle": "node scripts/bundle-renderer.cjs",
     "build": "electron-builder --linux AppImage deb --x64 --publish never",
     "prebuild": "node scripts/bundle-renderer.cjs",
-    "build:win": "electron-builder --win portable --x64 --publish never",
+    "build:win": "electron-builder --win nsis portable --x64 --publish never",
     "prebuild:win": "node scripts/bundle-renderer.cjs",
     "start:mcp": "electron . --mcp",
     "prestart:mcp": "node scripts/bundle-renderer.cjs",
@@ -28,7 +28,8 @@
     "@modelcontextprotocol/sdk": "1.31.0",
     "electron": "44.3.0",
     "electron-builder": "26.15.3",
-    "esbuild": "0.25.12"
+    "esbuild": "0.25.12",
+    "fflate": "0.8.3"
   },
   "build": {
     "appId": "local.forma.animationstudio",
@@ -39,6 +40,7 @@
     "files": [
       "main.cjs",
       "preload.cjs",
+      "media-store.cjs",
       "build/renderer.js",
       "index.html",
       "style.css",
@@ -59,13 +61,39 @@
     },
     "win": {
       "target": [
+        "nsis",
         "portable"
       ],
-      "artifactName": "Forma-Animation-Studio-${version}-${arch}.${ext}",
       "signAndEditExecutable": false
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Echamma",
+        "repo": "forma-animation-studio"
+      }
+    ],
+    "fileAssociations": [
+      {
+        "ext": "forma",
+        "name": "Forma project",
+        "description": "Forma animation project",
+        "mimeType": "application/x-forma-project",
+        "role": "Editor"
+      }
+    ],
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "Forma-Animation-Studio-Setup-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "Forma-Animation-Studio-${version}-${arch}-portable.${ext}"
     }
   },
   "dependencies": {
-    "ajv": "8.18.0"
+    "ajv": "8.18.0",
+    "electron-updater": "6.8.10"
   }
 }

@@ -89,12 +89,14 @@ app.whenReady().then(async () => {
     live = await call('forma_get_scene', {includeAssets:true});
     assert.ok(!live.project.shapes.find(layer => layer.id === svgLayer.id).svgSource.match(/script|onload|@import/));
     assert.ok(!('assetData' in (await call('forma_get_scene')).project.shapes.find(layer => layer.id === imageLayer.id)));
+    assert.match(live.project.shapes.find(layer => layer.id === imageLayer.id).assetData, /^forma-asset:\/\/media\/[0-9a-f]{64}\.png$/);
     for (const [format, filename] of [['png','frame.png'], ['svg','frame.svg'], ['animated_svg','animation.svg'], ['project','scene.json'], ['webm','animation.webm']]) {
       const exported = await call('forma_export', {format,filename,time:.5});
       const bytes = await fs.readFile(exported.path); assert.equal(exported.bytes, bytes.length); assert.ok(bytes.length > 100);
       if (format === 'webm') assert.ok(bytes.subarray(0,4).equals(Buffer.from([0x1a,0x45,0xdf,0xa3])));
       if (format === 'animated_svg') assert.ok(bytes.toString('utf8').includes('animateTransform'));
       if (format === 'png') {assert.equal(bytes.readUInt32BE(16),640);assert.equal(bytes.readUInt32BE(20),360);}
+      if (['animated_svg', 'project'].includes(format)) assert.ok(!bytes.toString('utf8').includes('forma-asset:') && bytes.toString('utf8').includes('data:image/png'), format + ' embeds library media');
     }
     await rejected('forma_export', {format:'png',filename:'frame.png'}, 'FILE_EXISTS');
     await rejected('forma_export', {format:'png',filename:'../outside.png'}, 'INVALID_ARGUMENTS');

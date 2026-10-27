@@ -1,5 +1,6 @@
 import {$, toast} from './dom.js';
 import {assetCache} from './media.js';
+import {migrateMedia} from './media-library.js';
 import {valid} from './model/validate.js';
 import {stop} from './playback.js';
 import {ensureProjectIdentity, syncProjectName} from './project.js';
@@ -30,7 +31,8 @@ function packScene() {
     const copy = {...shape};
     for (const field of assetFields) {
       const value = shape[field];
-      if (typeof value !== 'string') continue;
+      // Library URLs are short and stay inline; embedded data and SVG markup are saved once as separate assets.
+      if (typeof value !== 'string' || value.startsWith('forma-asset:')) continue;
       let token = tokenByValue.get(value);
       if (!token) {
         token = crypto.randomUUID();
@@ -182,7 +184,32 @@ export function restoreProject(saved) {
   editor.motionGuide = null;
   editor.time = 0;
   refresh();
+  scheduleMediaMigration();
   return true;
+}
+
+// After a project loads, move any embedded media into the desktop library in the background.
+let migrating = null;
+export function scheduleMediaMigration() {
+  if (!window.formaDesktop?.storeMedia) return Promise.resolve(0);
+  migrating ??= (async () => {
+    const scene = editor.scene;
+    try {
+      const changed = await migrateMedia(scene);
+      if (changed && scene === editor.scene) {
+        assetCache.clear();
+        refresh();
+        recordSceneChange('media library', false);
+      }
+      return changed;
+    } catch (error) {
+      console.warn('Forma media library:', error.message);
+      return 0;
+    } finally {
+      migrating = null;
+    }
+  })();
+  return migrating;
 }
 
 export function setupPersistence() {

@@ -4,7 +4,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const {manifest, validate, fail} = require('./validation.cjs');
 
-function createBridge({discoveryFile, exportDirectory, dispatch, checkpoint}) {
+function createBridge({discoveryFile, exportDirectory, dispatch, checkpoint, storeMedia}) {
   let server, token, generation = 0, queue = Promise.resolve();
   const exportRoot = path.resolve(exportDirectory);
   const status = () => ({enabled: !!server?.listening, exportDirectory: exportRoot});
@@ -39,7 +39,7 @@ function createBridge({discoveryFile, exportDirectory, dispatch, checkpoint}) {
         const webp = bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP';
         if (!(ext === '.png' ? png : ext === '.webp' ? webp : jpeg)) throw fail('INVALID_ASSET', 'File content does not match its image extension.');
         const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
-        payload.assetData = 'data:' + mime + ';base64,' + bytes.toString('base64');
+        payload.assetData = storeMedia ? await storeMedia(bytes, mime) : 'data:' + mime + ';base64,' + bytes.toString('base64');
       }
     }
     let destination;

@@ -1,5 +1,7 @@
 import {$, download} from '../dom.js';
 import {svgText} from './svg.js';
+import {packProjectFile} from './project-file.js';
+import {inlineMedia} from '../media-library.js';
 import {mediaElement, prepareAssets} from '../media.js';
 import {stop} from '../playback.js';
 import {render} from '../render/canvas.js';
@@ -14,11 +16,21 @@ export function setupDialog() {
     $('export-status').textContent = '';
     $('export-dialog').showModal();
   };
-  $('svg-export').onclick = () => {
-    download(new Blob([svgText(true)], {type: 'image/svg+xml'}), 'forma-animation.svg');
+  $('svg-export').onclick = async () => {
+    download(new Blob([await inlineMedia(svgText(true))], {type: 'image/svg+xml'}), 'forma-animation.svg');
     $('export-status').textContent = editor.scene.shapes.some(s => s.type === 'video')
       ? 'Animated SVG exported with poster frames for video layers.'
       : 'Animated SVG exported.';
+  };
+  $('project-export').onclick = async () => {
+    try {
+      $('export-status').textContent = 'Packing the project and its media…';
+      const name = (editor.scene.projectName || 'Forma project').replace(/[\\/:*?"<>|]+/g, ' ').trim();
+      download(await packProjectFile(), `${name || 'Forma project'}.forma`);
+      $('export-status').textContent = 'Project file exported. Open it in Forma on any computer.';
+    } catch (error) {
+      $('export-status').textContent = 'Could not pack the project: ' + error.message;
+    }
   };
   $('png-export').onclick = async () => {
     try {

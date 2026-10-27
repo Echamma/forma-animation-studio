@@ -1,8 +1,10 @@
-const {app, BrowserWindow, ipcMain, dialog} = require('electron');
+const {app, BrowserWindow, ipcMain, dialog, protocol} = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const {createBridge} = require('./mcp/desktop-bridge.cjs');
+const {createMediaStore} = require('./media-store.cjs');
+protocol.registerSchemesAsPrivileged([{scheme: 'forma-asset', privileges: {standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true}}]);
 let window, bridge, closing = false, allowClose = false;
 const pending = new Map();
 const smokeTest = process.argv.includes('--smoke-test');
@@ -14,16 +16,34 @@ if (smokeTest) {
   if (!app.requestSingleInstanceLock()) {app.quit(); return;}
   app.on('second-instance', async (_, argv) => {
     if (window) {if (window.isMinimized()) window.restore(); window.show(); window.focus();}
+    openProjectFile(projectArgument(argv));
     if (argv.includes('--mcp') && bridge) {
       try {await bridge.enable(); window.webContents.send('forma:mcp-status', bridge.status());}
       catch (error) {console.error('Forma MCP:', error.message);}
     }
   });
+  app.on('open-file', (event, file) => {event.preventDefault(); openProjectFile(file);});
+}
+// A .forma or .json project opened from the file manager arrives as a command-line path (or open-file on macOS).
+let queuedProjectFile = null;
+function projectArgument(argv) {return argv.slice(1).find(arg => !arg.startsWith('-') && /\.(forma|json)$/i.test(arg));}
+async function openProjectFile(file) {
+  if (!file) return;
+  if (!window || window.webContents.isLoading()) {queuedProjectFile = file; return;}
+  try {window.webContents.send('forma:open-file', {name: path.basename(file), bytes: await fs.readFile(file)});}
+  catch (error) {console.error('Forma could not open ' + file + ':', error.message);}
+}
+// Installed builds update themselves from GitHub Releases; the portable .exe and the .deb package are updated by hand.
+function checkForUpdates() {
+  if (!app.isPackaged || process.env.FORMA_TEST === '1' || process.env.PORTABLE_EXECUTABLE_DIR || (process.platform === 'linux' && !process.env.APPIMAGE)) return;
+  try {require('electron-updater').autoUpdater.checkForUpdatesAndNotify().catch(error => console.error('Forma update:', error.message));}
+  catch (error) {console.error('Forma update:', error.message);}
 }
 const recoveryPath = () => path.join(app.getPath('userData'), 'last-session.json');
 const previousRecoveryPath = () => path.join(app.getPath('userData'), 'last-session.previous.json');
 const defaultProjectPath = () => path.join(app.getPath('userData'), 'default-project.json');
 const assetDirectory = () => path.join(app.getPath('userData'), 'assets');
+const media = createMediaStore(() => path.join(app.getPath('userData'), 'media'));
 const projectsDirectory = () => path.join(app.getPath('userData'), 'projects');
 const assetFields = ['assetData', 'posterData', 'svgSource'];
 async function readProject(file) {
@@ -135,6 +155,14 @@ ipcMain.handle('forma:open-local-project', async (event,id) => {
   await saveQueue;
   return readProject(path.join(projectsDirectory(), id + '.json'));
 });
+ipcMain.handle('forma:store-media-file', (event, source, type) => {
+  if (event.sender !== window?.webContents || typeof source !== 'string' || !path.isAbsolute(source)) throw Error('Invalid media file.');
+  return media.storeFile(source, type);
+});
+ipcMain.handle('forma:store-media', (event, bytes, type) => {
+  if (event.sender !== window?.webContents || !(bytes instanceof ArrayBuffer || ArrayBuffer.isView(bytes))) throw Error('Invalid media data.');
+  return media.storeBytes(bytes, type);
+});
 ipcMain.handle('forma:autosave', (event, payload) => {
   if (event.sender !== window?.webContents) throw Error('Unknown editor window.');
   return saveSnapshot(payload);
@@ -147,8 +175,10 @@ app.whenReady().then(() => {
       additionalArguments: process.env.FORMA_TEST === '1' ? ['--forma-test'] : []}});
   bridge = createBridge({
     discoveryFile: process.env.FORMA_BRIDGE_FILE || path.join(app.getPath('userData'), 'mcp-bridge.json'),
-    exportDirectory: process.env.FORMA_EXPORT_DIR || path.join(app.getPath('documents'), 'Forma Exports'), dispatch, checkpoint
+    exportDirectory: process.env.FORMA_EXPORT_DIR || path.join(app.getPath('documents'), 'Forma Exports'), dispatch, checkpoint,
+    storeMedia: media.storeBytes
   });
+  protocol.handle('forma-asset', request => media.respond(request));
   window.webContents.setWindowOpenHandler(() => ({action: 'deny'}));
   window.webContents.on('will-navigate', event => event.preventDefault());
   window.webContents.session.on('will-download', (_, item) => {
@@ -177,11 +207,15 @@ app.whenReady().then(() => {
       try {await bridge.enable(); window.webContents.send('forma:mcp-status', bridge.status());}
       catch (error) {console.error('Forma MCP:', error.message);}
     }
+    openProjectFile(queuedProjectFile || projectArgument(process.argv));
+    queuedProjectFile = null;
+    checkForUpdates();
     if (smokeTest) {
       try {
-        const ok = await window.webContents.executeJavaScript('(async()=>{await window.FormaSession.ready;const snapshot=window.FormaSession.snapshot();return !!(snapshot&&snapshot.shapes.length>0&&typeof window.FormaSession.dispatch==="function"&&document.getElementById("mcp-control"))})()');
-        if (!ok) throw Error('Packaged editor or MCP integration did not initialize');
-        console.log('PASS: Packaged Forma desktop app starts and loads its editor and MCP controls');
+        const pixel = await media.storeBytes(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg==', 'base64'), 'image/png');
+        const ok = await window.webContents.executeJavaScript('(async()=>{await window.FormaSession.ready;const snapshot=window.FormaSession.snapshot();const media=await fetch(' + JSON.stringify(pixel) + ');return !!(snapshot&&snapshot.shapes.length>0&&typeof window.FormaSession.dispatch==="function"&&document.getElementById("mcp-control")&&media.ok)})()');
+        if (!ok) throw Error('Packaged editor, media library, or MCP integration did not initialize');
+        console.log('PASS: Packaged Forma desktop app starts and loads its editor, media library, and MCP controls');
         clearTimeout(smokeTimeout); app.exit(0);
       } catch (error) {console.error(error); clearTimeout(smokeTimeout); app.exit(1);}
     }

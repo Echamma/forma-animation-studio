@@ -2,10 +2,11 @@
 import {$, toast} from './dom.js';
 import {svgText} from './export/svg.js';
 import {assetCache, assetHref, mediaElement, prepareAssets} from './media.js';
+import {inlineMedia} from './media-library.js';
 import {state} from './model/animation.js';
 import {continueAfter, duplicateLayer} from './model/clips.js';
 import {usableProject} from './model/validate.js';
-import {recordSceneChange} from './persistence.js';
+import {recordSceneChange, scheduleMediaMigration} from './persistence.js';
 import {stop} from './playback.js';
 import {ensureFonts, paint} from './render/paint.js';
 import {editor} from './state.js';
@@ -74,6 +75,7 @@ export function setupAutomation() {
     $('stage').classList.remove('motion-mode');
     refresh();
     recordSceneChange('automation');
+    scheduleMediaMigration();
   }
   // inTime/outTime trim a clip without moving its keyframes, and the scene grows to fit. A null outTime lasts to the end.
   function applyClipTiming(project, layer, args) {
@@ -356,9 +358,12 @@ export function setupAutomation() {
           const at = checkedTime(args.time);
           if (args.format === 'png') return await frame(at);
           if (args.format === 'webm') return await video();
+          // Exported projects and SVG embed their media so they open anywhere, not only in this app's library.
           if (args.format === 'project')
             return {
-              data: await base64(new Blob([JSON.stringify(editor.scene, null, 2)], {type: 'application/json'})),
+              data: await base64(
+                new Blob([await inlineMedia(JSON.stringify(editor.scene, null, 2))], {type: 'application/json'})
+              ),
               mimeType: 'application/json'
             };
           const originalTime = editor.time;
@@ -369,7 +374,7 @@ export function setupAutomation() {
           } finally {
             editor.time = originalTime;
           }
-          return {data: await base64(new Blob([markup], {type: 'image/svg+xml'})), mimeType: 'image/svg+xml'};
+          return {data: await base64(new Blob([await inlineMedia(markup)], {type: 'image/svg+xml'})), mimeType: 'image/svg+xml'};
         }
         case 'forma_open_project': {
           if (args.replace !== true) throw problem('CONFIRMATION_REQUIRED', 'replace=true is required.');
