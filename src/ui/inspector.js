@@ -31,6 +31,7 @@ export function fields() {
   $('color').disabled = !s || asset;
   $('fill-control').classList.toggle('disabled', asset);
   $('edit-svg').hidden = s?.type !== 'svg';
+  $('text-panel').hidden = !isText;
   document.querySelectorAll('[data-outside]').forEach(b => (b.disabled = !s));
   if (s) {
     $('color').value = asset ? '#888888' : s.color;
@@ -47,6 +48,7 @@ export function fields() {
     $('text-content').value = s.text || '';
     const link = $('text-link');
     link.replaceChildren();
+    if (!s.linkId) link.append(new Option('Not linked', '', true, true));
     for (const target of editor.scene.shapes.filter(x => x.id !== s.id && x.type !== 'text')) {
       const option = document.createElement('option');
       option.value = target.id;

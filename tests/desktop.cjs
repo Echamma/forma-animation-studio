@@ -64,7 +64,7 @@ app.whenReady().then(async () => {
       assert(!scene.shapes[0].blur,'Ctrl+Z restores the prior blur setting');
       assert(state(scene.shapes[0],0).x!==state(scene.shapes[0],2).x,'Keyframes change shape positions');
       document.querySelector('[data-add="arrow"]').click(); assert(scene.shapes.some(s=>s.type==='arrow'),'Arrow can be added');
-      document.getElementById('add-linked-text').click(); assert(scene.shapes.some(s=>s.type==='text'),'Linked text can be added');
+      document.getElementById('add-linked-text').click(); assert(scene.shapes.some(s=>s.type==='text'),'Linked text can be added');assert(!document.getElementById('text-panel').hidden&&document.getElementById('text-content').value==='Your text','Selecting linked text shows its text controls');
       assert(valid(JSON.parse(JSON.stringify(scene))),'Edited project survives JSON roundtrip');
       const animated=svgText(true); assert(animated.includes('animateTransform'),'Animated SVG contains motion'); assert(!animated.includes('NaN'),'Export has finite coordinates');
       assert(pasteboard().m > scene.width / 2,'Expanded pasteboard has room for media outside the artboard');
