@@ -422,6 +422,22 @@ app.whenReady().then(async () => {
     })()}`);
     result.checks.push(...videoChecks.checks);
     console.log('Video codecs (mp4 video, mp4 audio, webm video, webm audio):', videoChecks.codecs.join(', '));
+    const svgChecks = await win.webContents.executeJavaScript(`with(window.__forma){(async()=>{
+      const checks=[];const assert=(ok,message)=>{if(!ok)throw new Error(message);checks.push(message);};
+      await document.getElementById('new-project').onclick();
+      const first={id:'pose-1',name:'Pose',type:'rect',color:'#ff0000',ease:'linear',keys:[{t:0,x:100,y:300,w:40,h:40,r:0,o:100}],outTime:0.5};
+      scene.shapes=[first];let clip=first;for(const x of [250,400,550]){clip=continueAfter(clip);clip.keys[0].x=x;}refresh();
+      const markup=svgText(true);
+      assert(markup.length<6000,'A stop-motion animated SVG stays small: '+markup.length+' bytes');
+      const holder=document.createElement('div');holder.innerHTML=markup;document.body.append(holder);
+      const root=holder.querySelector('svg');root.pauseAnimations();
+      const shown=t=>{root.setCurrentTime(t);return [...root.children].filter(g=>g.tagName==='g').filter(g=>Number(getComputedStyle(g.querySelector(':scope > g > g')).opacity)>0.5).map(g=>Math.round(root.getScreenCTM().inverse().multiply(g.getScreenCTM()).e)).join('|')};
+      const seen=[0.25,0.75,1.25,1.75].map(shown);holder.remove();
+      assert(seen.join()==='100,250,400,550','The animated SVG plays the poses in order: '+seen.join());
+      await document.getElementById('new-project').onclick();
+      return checks;
+    })()}`);
+    result.checks.push(...svgChecks);
     const defaultProject = await win.webContents.executeJavaScript('window.FormaSession.snapshot()');
     defaultProject.bg='#abcdef';
     await fs.writeFile(path.join(app.getPath('userData'),'default-project.json'),JSON.stringify(defaultProject));

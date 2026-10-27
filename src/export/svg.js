@@ -1,6 +1,7 @@
 import {NS, element} from '../dom.js';
 import {colorAt, state} from '../model/animation.js';
 import {addBlurFilter, geometry} from '../render/canvas.js';
+import {sampleLayer} from '../model/sampling.js';
 import {editor} from '../state.js';
 
 export function svgText(animated = false) {
@@ -31,41 +32,33 @@ export function svgText(animated = false) {
     rot.append(scale);
     g.append(rot);
     if (animated) {
-      const steps = Math.max(1, Math.min(12000, Math.ceil(editor.scene.duration * 60))),
-        values = [];
-      for (let i = 0; i <= steps; i++) values.push(state(s, (i / steps) * editor.scene.duration));
+      // Every animation of a layer shares one list of key times, so steps and curves stay in sync.
+      const samples = sampleLayer(s),
+        timing = {
+          dur: `${editor.scene.duration}s`,
+          repeatCount: 'indefinite',
+          calcMode: 'linear',
+          keyTimes: samples.map(({t}) => +(t / editor.scene.duration).toFixed(6)).join(';')
+        },
+        number = value => +value.toFixed(3);
       for (const [parent, type, fn] of [
-        [g, 'translate', p => `${p.x} ${p.y}`],
-        [rot, 'rotate', p => `${p.r}`],
-        [scale, 'scale', p => `${p.w} ${p.h}`]
+        [g, 'translate', p => `${number(p.x)} ${number(p.y)}`],
+        [rot, 'rotate', p => `${number(p.r)}`],
+        [scale, 'scale', p => `${number(p.w)} ${number(p.h)}`]
       ])
         parent.append(
           element('animateTransform', {
             attributeName: 'transform',
             type,
-            dur: `${editor.scene.duration}s`,
-            repeatCount: 'indefinite',
-            values: values.map(fn).join(';'),
-            calcMode: 'linear'
+            ...timing,
+            values: samples.map(({pose}) => fn(pose)).join(';')
           })
         );
       scale.append(
-        element('animate', {
-          attributeName: 'opacity',
-          dur: `${editor.scene.duration}s`,
-          repeatCount: 'indefinite',
-          values: values.map(p => p.o / 100).join(';')
-        })
+        element('animate', {attributeName: 'opacity', ...timing, values: samples.map(({pose}) => number(pose.o / 100)).join(';')})
       );
       if (s.colorKeys?.length)
-        g.append(
-          element('animate', {
-            attributeName: 'fill',
-            dur: `${editor.scene.duration}s`,
-            repeatCount: 'indefinite',
-            values: values.map((_, i) => colorAt(s, (i / steps) * editor.scene.duration)).join(';')
-          })
-        );
+        g.append(element('animate', {attributeName: 'fill', ...timing, values: samples.map(({color}) => color).join(';')}));
     }
     svg.append(g);
   }

@@ -43,6 +43,7 @@ import * as arrange from './model/arrange.js';
 import * as mediaLibrary from './media-library.js';
 import * as projectFile from './export/project-file.js';
 import * as videoExport from './export/video.js';
+import * as sampling from './model/sampling.js';
 
 setupTabs();
 setupKeyframeMenu();
@@ -93,7 +94,8 @@ if (window.formaDesktop?.testMode) {
     arrange,
     mediaLibrary,
     projectFile,
-    videoExport
+    videoExport,
+    sampling
   );
   for (const key of Object.keys(editor))
     Object.defineProperty(handle, key, {get: () => editor[key], set: value => (editor[key] = value), enumerable: true});
