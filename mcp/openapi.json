@@ -18,6 +18,9 @@
       "text": {"type": "string", "maxLength": 120, "description": "Text displayed by a text layer."},
       "file": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Absolute local file path on the computer running Forma."},
       "time": {"type": "number", "minimum": 0, "description": "Time in seconds within the scene duration."},
+      "inTime": {"type": "number", "minimum": 0, "description": "When the layer appears, in seconds. It is hidden before this. Changing it trims the clip without moving keyframes."},
+      "outTime": {"type": "number", "minimum": 0, "description": "When the layer disappears, in seconds. Omit it to keep the layer until the scene ends; the scene grows to fit."},
+      "trackId": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Clips with the same trackId share one timeline row, like clips on a video editor track."},
       "keyframe": {
         "type": "object", "additionalProperties": false, "required": ["t", "x", "y", "w", "h", "r", "o"],
         "properties": {"t": {"$ref": "#/components/schemas/time"}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}, "w": {"$ref": "#/components/schemas/size"}, "h": {"$ref": "#/components/schemas/size"}, "r": {"$ref": "#/components/schemas/rotation"}, "o": {"$ref": "#/components/schemas/opacity"}}
@@ -43,12 +46,12 @@
     }},
     "/tools/forma_add_shape": {"post": {
       "operationId": "forma_add_shape", "summary": "Add a geometric or text layer and return its ID. Position refers to the layer center. New layers start with one keyframe at t=0; use forma_set_keyframes to animate.",
-      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "enum": ["circle", "rect", "triangle", "diamond", "arrow", "text"], "description": "Layer kind."}, "name": {"$ref": "#/components/schemas/name"}, "color": {"$ref": "#/components/schemas/color"}, "ease": {"$ref": "#/components/schemas/ease"}, "text": {"$ref": "#/components/schemas/text"}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}, "w": {"$ref": "#/components/schemas/size"}, "h": {"$ref": "#/components/schemas/size"}, "r": {"$ref": "#/components/schemas/rotation"}, "o": {"$ref": "#/components/schemas/opacity"}}}}}},
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "enum": ["circle", "rect", "triangle", "diamond", "arrow", "text"], "description": "Layer kind."}, "name": {"$ref": "#/components/schemas/name"}, "color": {"$ref": "#/components/schemas/color"}, "ease": {"$ref": "#/components/schemas/ease"}, "text": {"$ref": "#/components/schemas/text"}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}, "w": {"$ref": "#/components/schemas/size"}, "h": {"$ref": "#/components/schemas/size"}, "r": {"$ref": "#/components/schemas/rotation"}, "o": {"$ref": "#/components/schemas/opacity"}, "inTime": {"$ref": "#/components/schemas/inTime"}, "outTime": {"$ref": "#/components/schemas/outTime"}, "trackId": {"$ref": "#/components/schemas/trackId"}}}}}},
       "responses": {"200": {"description": "Added layer"}}
     }},
     "/tools/forma_update_shape": {"post": {
-      "operationId": "forma_update_shape", "summary": "Update a layer name, fill, interpolation, or text. For animated transforms use forma_set_keyframes. Text can follow a non-text layer using linkId; use an empty linkId to detach.",
-      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["id"], "minProperties": 2, "properties": {"id": {"$ref": "#/components/schemas/id"}, "name": {"$ref": "#/components/schemas/name"}, "color": {"$ref": "#/components/schemas/color"}, "ease": {"$ref": "#/components/schemas/ease"}, "text": {"$ref": "#/components/schemas/text"}, "linkId": {"type": "string", "maxLength": 100, "description": "ID of a non-text layer to follow, or empty string to detach. Offset is derived from the text's current pose."}}}}}},
+      "operationId": "forma_update_shape", "summary": "Update a layer name, fill, interpolation, text, or clip timing (inTime/outTime set when it is visible). For animated transforms use forma_set_keyframes. Text can follow a non-text layer using linkId; use an empty linkId to detach.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["id"], "minProperties": 2, "properties": {"id": {"$ref": "#/components/schemas/id"}, "name": {"$ref": "#/components/schemas/name"}, "color": {"$ref": "#/components/schemas/color"}, "ease": {"$ref": "#/components/schemas/ease"}, "text": {"$ref": "#/components/schemas/text"}, "linkId": {"type": "string", "maxLength": 100, "description": "ID of a non-text layer to follow, or empty string to detach. Offset is derived from the text's current pose."}, "inTime": {"$ref": "#/components/schemas/inTime"}, "outTime": {"type": "number", "minimum": 0, "nullable": true, "description": "When the layer disappears, in seconds, or null to keep it until the scene ends. Trims without moving keyframes; the scene grows to fit."}, "trackId": {"type": "string", "maxLength": 64, "description": "Put the layer on a timeline track shared with other clips, or empty string to give it its own row."}}}}}},
       "responses": {"200": {"description": "Updated layer"}}
     }},
     "/tools/forma_set_keyframes": {"post": {
@@ -60,6 +63,11 @@
       "operationId": "forma_delete_shape", "summary": "Delete a layer after confirm=true. Linked text survives and is detached at its current pose.", "x-destructive": true,
       "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["id", "confirm"], "properties": {"id": {"$ref": "#/components/schemas/id"}, "confirm": {"type": "boolean", "const": true, "description": "Explicitly confirm deleting this layer."}}}}}},
       "responses": {"200": {"description": "Deleted layer ID"}}
+    }},
+    "/tools/forma_duplicate_shape": {"post": {
+      "operationId": "forma_duplicate_shape", "summary": "Copy a layer. placement=after puts a still copy right after the layer's clip on the same track, pushing later clips right; give it x/y to make the picture jump there, which builds stop-motion sequences. placement=same_time makes an independent copy nudged 20 px, or placed at x/y.",
+      "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["id"], "properties": {"id": {"$ref": "#/components/schemas/id"}, "placement": {"type": "string", "enum": ["after", "same_time"], "default": "after", "description": "Where the copy goes on the timeline."}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}}}}}},
+      "responses": {"200": {"description": "The new layer"}}
     }},
     "/tools/forma_set_playback": {"post": {
       "operationId": "forma_set_playback", "summary": "Play, pause, or seek the timeline. Seek pauses playback and requires time. Changes are visible in the open desktop editor.",

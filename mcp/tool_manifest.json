@@ -198,6 +198,22 @@
             "minimum": 0,
             "maximum": 100,
             "description": "Opacity percentage."
+          },
+          "inTime": {
+            "type": "number",
+            "minimum": 0,
+            "description": "When the layer appears, in seconds. It is hidden before this. Changing it trims the clip without moving keyframes."
+          },
+          "outTime": {
+            "type": "number",
+            "minimum": 0,
+            "description": "When the layer disappears, in seconds. Omit it to keep the layer until the scene ends; the scene grows to fit."
+          },
+          "trackId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Clips with the same trackId share one timeline row, like clips on a video editor track."
           }
         },
         "additionalProperties": false
@@ -214,7 +230,7 @@
     },
     {
       "name": "forma_update_shape",
-      "description": "Update a layer name, fill, interpolation, or text. For animated transforms use forma_set_keyframes. Text can follow a non-text layer using linkId; use an empty linkId to detach.",
+      "description": "Update a layer name, fill, interpolation, text, or clip timing (inTime/outTime set when it is visible). For animated transforms use forma_set_keyframes. Text can follow a non-text layer using linkId; use an empty linkId to detach.",
       "inputSchema": {
         "type": "object",
         "required": [
@@ -257,6 +273,22 @@
             "type": "string",
             "maxLength": 100,
             "description": "ID of a non-text layer to follow, or empty string to detach. Offset is derived from the text's current pose."
+          },
+          "inTime": {
+            "type": "number",
+            "minimum": 0,
+            "description": "When the layer appears, in seconds. It is hidden before this. Changing it trims the clip without moving keyframes."
+          },
+          "outTime": {
+            "type": "number",
+            "minimum": 0,
+            "nullable": true,
+            "description": "When the layer disappears, in seconds, or null to keep it until the scene ends. Trims without moving keyframes; the scene grows to fit."
+          },
+          "trackId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Put the layer on a timeline track shared with other clips, or empty string to give it its own row."
           }
         },
         "additionalProperties": false
@@ -398,6 +430,55 @@
       },
       "x-openapi": {
         "path": "/tools/forma_delete_shape",
+        "method": "post"
+      }
+    },
+    {
+      "name": "forma_duplicate_shape",
+      "description": "Copy a layer. placement=after puts a still copy right after the layer's clip on the same track, pushing later clips right; give it x/y to make the picture jump there, which builds stop-motion sequences. placement=same_time makes an independent copy nudged 20 px, or placed at x/y.",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Layer ID returned by Forma."
+          },
+          "placement": {
+            "type": "string",
+            "enum": [
+              "after",
+              "same_time"
+            ],
+            "default": "after",
+            "description": "Where the copy goes on the timeline."
+          },
+          "x": {
+            "type": "number",
+            "minimum": -10000,
+            "maximum": 10000,
+            "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."
+          },
+          "y": {
+            "type": "number",
+            "minimum": -10000,
+            "maximum": 10000,
+            "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "x-openapi": {
+        "path": "/tools/forma_duplicate_shape",
         "method": "post"
       }
     },

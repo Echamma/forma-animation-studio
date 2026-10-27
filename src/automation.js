@@ -3,6 +3,7 @@ import {$, toast} from './dom.js';
 import {svgText} from './export/svg.js';
 import {assetCache, assetHref, mediaElement, prepareAssets} from './media.js';
 import {state} from './model/animation.js';
+import {continueAfter, duplicateLayer} from './model/clips.js';
 import {usableProject} from './model/validate.js';
 import {recordSceneChange} from './persistence.js';
 import {stop} from './playback.js';
@@ -73,6 +74,17 @@ export function setupAutomation() {
     $('stage').classList.remove('motion-mode');
     refresh();
     recordSceneChange('automation');
+  }
+  // inTime/outTime trim a clip without moving its keyframes, and the scene grows to fit. A null outTime lasts to the end.
+  function applyClipTiming(project, layer, args) {
+    if (args.inTime !== undefined) layer.inTime = args.inTime;
+    if (args.outTime === null) delete layer.outTime;
+    else if (args.outTime !== undefined) layer.outTime = args.outTime;
+    if (args.trackId === '') delete layer.trackId;
+    else if (args.trackId !== undefined) layer.trackId = args.trackId;
+    if (layer.outTime !== undefined && layer.outTime <= (layer.inTime ?? 0))
+      throw problem('INVALID_TIMING', 'outTime must be later than inTime.');
+    project.duration = Math.max(project.duration, layer.inTime ?? 0, layer.outTime ?? 0);
   }
   function newLayer(args, type = args.type) {
     const width = args.w ?? (type === 'text' ? 240 : 160);
@@ -214,14 +226,20 @@ export function setupAutomation() {
           return snapshot();
         case 'forma_update_scene': {
           const next = {...clone(editor.scene), ...args};
-          if (next.shapes.some(layer => layer.keys.some(key => key.t > next.duration)))
-            throw problem('KEYFRAMES_OUT_OF_RANGE', 'Remove or retime later keyframes before shortening the scene.');
+          if (next.shapes.some(
+              layer =>
+                layer.keys.some(key => key.t > next.duration) ||
+                (layer.inTime ?? 0) > next.duration ||
+                (layer.outTime ?? 0) > next.duration
+            ))
+            throw problem('KEYFRAMES_OUT_OF_RANGE', 'Remove or retime later keyframes and clips before shortening the scene.');
           install(next);
           return snapshot();
         }
         case 'forma_add_shape': {
           const next = clone(editor.scene),
             layer = newLayer(args);
+          applyClipTiming(next, layer, args);
           next.shapes.push(layer);
           install(next, layer.id);
           return summarized(layer);
@@ -257,8 +275,38 @@ export function setupAutomation() {
           }
           for (const field of ['name', 'color', 'ease', 'text'])
             if (args[field] !== undefined) layer[field] = args[field];
+          applyClipTiming(next, layer, args);
           install(next, layer.id);
           return summarized(layer);
+        }
+        case 'forma_duplicate_shape': {
+          const next = clone(editor.scene),
+            source = find(next, args.id),
+            live = editor.scene;
+          let copy;
+          editor.scene = next;
+          try {
+            copy = (args.placement ?? 'after') === 'after' ? continueAfter(source) : duplicateLayer(source);
+          } catch (error) {
+            throw problem('INVALID_CLIP', error.message);
+          } finally {
+            editor.scene = live;
+          }
+          const first = copy.keys[0],
+            dx = (args.x ?? first.x) - first.x,
+            dy = (args.y ?? first.y) - first.y;
+          const move = p => {
+            p.x += dx;
+            p.y += dy;
+          };
+          copy.keys.forEach(move);
+          for (const m of copy.motions || []) {
+            move(m.startPose);
+            m.sourcePoints.forEach(move);
+            (m.baseKeys || []).forEach(move);
+          }
+          install(next, copy.id);
+          return summarized(copy);
         }
         case 'forma_set_keyframes': {
           const next = clone(editor.scene),

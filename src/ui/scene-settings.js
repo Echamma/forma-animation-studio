@@ -30,6 +30,8 @@ export function setupSceneSettings() {
       0,
       ...editor.scene.shapes.flatMap(s => [
         ...s.keys.map(k => k.t),
+        s.inTime ?? 0,
+        s.outTime ?? 0,
         ...(s.motions || []).map(m => m.startTime + m.duration),
         ...(s.rotationClips || []).map(c => c.startTime + c.duration),
         ...(s.disappear

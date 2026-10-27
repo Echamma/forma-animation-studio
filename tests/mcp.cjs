@@ -26,7 +26,7 @@ app.whenReady().then(async () => {
     client = new Client({name: 'forma-integration-tests', version: '1.0.0'}, {capabilities: {}});
     await client.connect(transport);
     const tools = (await client.listTools()).tools;
-    assert.equal(tools.length, 12); assert.equal(new Set(tools.map(tool => tool.name)).size, 12);
+    assert.equal(tools.length, 13); assert.equal(new Set(tools.map(tool => tool.name)).size, 13);
     async function call(name, args = {}) {
       const result = await client.callTool({name, arguments: args}, undefined, {timeout: 50000});
       if (result.isError) throw Error(JSON.stringify(result.content));
@@ -103,6 +103,17 @@ app.whenReady().then(async () => {
     await call('forma_delete_shape', {id:circle.id,confirm:true});
     live = await call('forma_get_scene');
     assert.equal(live.project.shapes.find(layer => layer.id === text.id).linkId, '');
+    const pose = (await call('forma_add_shape', {type:'rect', name:'Pose', x:100, y:300, w:40, h:40, outTime:.25})).layer;
+    const nextPose = (await call('forma_duplicate_shape', {id:pose.id, x:250})).layer;
+    assert.deepEqual([nextPose.inTime, nextPose.outTime, nextPose.keys[0].x, nextPose.keys[0].y], [.25, .5, 250, 300]);
+    await call('forma_set_playback', {action:'seek', time:.3});
+    live = await call('forma_get_scene');
+    assert.equal(live.project.shapes.filter(layer => layer.trackId && layer.trackId === nextPose.trackId).length, 2);
+    assert.equal(live.transforms.find(layer => layer.id === pose.id).o, 0);
+    assert.equal(live.transforms.find(layer => layer.id === nextPose.id).x, 250);
+    await rejected('forma_update_shape', {id:nextPose.id, inTime:.5, outTime:.4}, 'INVALID_TIMING');
+    assert.equal((await call('forma_update_shape', {id:nextPose.id, outTime:null, trackId:''})).layer.outTime, undefined);
+    assert.equal((await call('forma_duplicate_shape', {id:pose.id, placement:'same_time'})).layer.keys[0].x, 120);
     await call('forma_open_project', {file:path.join(output,'exports','scene.json'),replace:true});
     assert.equal((await call('forma_get_scene')).project.shapes.length,4);
     const invalidFile = path.join(output, 'invalid.json'); await fs.writeFile(invalidFile,'{"version":1}');
@@ -124,7 +135,7 @@ app.whenReady().then(async () => {
     const bundled = path.join(__dirname, '..', 'dist', 'forma-mcp.cjs');
     transport = new StdioClientTransport({command: nodeCommand, args: [bundled], env, stderr:'pipe'});
     client = new Client({name:'forma-bundle-test',version:'1.0.0'});
-    await client.connect(transport); assert.equal((await client.listTools()).tools.length,12);
+    await client.connect(transport); assert.equal((await client.listTools()).tools.length,13);
     assert.equal((await call('forma_get_scene')).project.width,640);
     await client.close();
     await win.webContents.executeJavaScript('(()=>{window.FormaSession.ready=new Promise(resolve=>setTimeout(()=>{window.__forma.scene.bg="#654321";resolve()},50));return true})()');
@@ -133,7 +144,7 @@ app.whenReady().then(async () => {
     assert.equal(JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8')).shapes.length,4);
     assert.equal(JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8')).bg,'#654321');
     if (errors.trim()) console.log('MCP stderr:', errors.trim());
-    console.log('PASS: MCP stdio handshake, all 12 tools, live editing, linked text, PNG/SVG/WebM/project exports, file imports, validation, authentication, toggle, recovery, and bundled server.');
+    console.log('PASS: MCP stdio handshake, all 13 tools, live editing, linked text, PNG/SVG/WebM/project exports, file imports, validation, authentication, toggle, recovery, and bundled server.');
     clearTimeout(timeout); app.exit(0);
   } catch (error) {
     console.error(error); try {await client?.close();} catch {}
