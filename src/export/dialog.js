@@ -3,7 +3,7 @@ import {svgText} from './svg.js';
 import {mediaElement, prepareAssets} from '../media.js';
 import {stop} from '../playback.js';
 import {render} from '../render/canvas.js';
-import {paint} from '../render/paint.js';
+import {ensureFonts, paint} from '../render/paint.js';
 import {editor} from '../state.js';
 
 const audioSourceCache = new WeakMap();
@@ -22,6 +22,7 @@ export function setupDialog() {
   };
   $('png-export').onclick = async () => {
     try {
+      await ensureFonts();
       await prepareAssets(editor.time);
       const c = document.createElement('canvas');
       c.width = editor.scene.width;
@@ -60,6 +61,7 @@ export function setupDialog() {
       render();
     };
     try {
+      await ensureFonts();
       await prepareAssets(0);
       paint(ctx, 0);
       stream = c.captureStream(60);

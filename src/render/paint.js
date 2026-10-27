@@ -3,6 +3,12 @@ import {state} from '../model/animation.js';
 import {layerBlur} from './canvas.js';
 import {editor} from '../state.js';
 
+// Canvas text does not trigger web font loading, so anything that paints frames for export requests the font first.
+export async function ensureFonts() {
+  await document.fonts.load('600 16px "DM Sans"');
+  await document.fonts.ready;
+}
+
 export function paint(ctx, t) {
   ctx.fillStyle = editor.scene.bg;
   ctx.fillRect(0, 0, editor.scene.width, editor.scene.height);

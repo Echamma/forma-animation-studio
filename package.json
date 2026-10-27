@@ -42,6 +42,7 @@
       "build/renderer.js",
       "index.html",
       "style.css",
+      "assets/fonts/**",
       "mcp/desktop-bridge.cjs",
       "mcp/validation.cjs",
       "mcp/tool_manifest.json"

@@ -6,7 +6,7 @@ import {state} from './model/animation.js';
 import {usableProject} from './model/validate.js';
 import {recordSceneChange} from './persistence.js';
 import {stop} from './playback.js';
-import {paint} from './render/paint.js';
+import {ensureFonts, paint} from './render/paint.js';
 import {editor} from './state.js';
 import {sanitizeSvg} from './svg/sanitize.js';
 import {refresh} from './ui/refresh.js';
@@ -120,7 +120,7 @@ export function setupAutomation() {
     });
   }
   async function frame(at, maxWidth) {
-    await document.fonts.ready;
+    await ensureFonts();
     await prepareAssets(at);
     const ratio = maxWidth ? Math.min(1, maxWidth / editor.scene.width, 1600 / editor.scene.height) : 1;
     const canvas = document.createElement('canvas');
@@ -144,7 +144,7 @@ export function setupAutomation() {
     editor.recording = true;
     let stream, recorder, deadline, frameTimer;
     try {
-      await document.fonts.ready;
+      await ensureFonts();
       await prepareAssets(0, true);
       const canvas = document.createElement('canvas');
       canvas.width = editor.scene.width;
