@@ -127,7 +127,7 @@ app.whenReady().then(async () => {
     await client.connect(transport); assert.equal((await client.listTools()).tools.length,12);
     assert.equal((await call('forma_get_scene')).project.width,640);
     await client.close();
-    await win.webContents.executeJavaScript('(()=>{window.FormaSession.ready=new Promise(resolve=>setTimeout(()=>{scene.bg="#654321";resolve()},50));return true})()');
+    await win.webContents.executeJavaScript('(()=>{window.FormaSession.ready=new Promise(resolve=>setTimeout(()=>{window.__forma.scene.bg="#654321";resolve()},50));return true})()');
     const closed = new Promise(resolve => win.once('closed', resolve)); win.close(); await closed;
     await assert.rejects(fs.access(process.env.FORMA_BRIDGE_FILE));
     assert.equal(JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8')).shapes.length,4);

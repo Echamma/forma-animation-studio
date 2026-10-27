@@ -8,14 +8,19 @@
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
+    "prestart": "node scripts/bundle-renderer.cjs",
     "test": "node scripts/generate-contract.cjs --check && electron tests/desktop.cjs && electron tests/mcp.cjs",
+    "pretest": "node scripts/bundle-mcp.cjs && node scripts/bundle-renderer.cjs",
+    "bundle": "node scripts/bundle-renderer.cjs",
     "build": "electron-builder --linux AppImage deb --x64 --publish never",
+    "prebuild": "node scripts/bundle-renderer.cjs",
+    "build:win": "electron-builder --win portable --x64 --publish never",
+    "prebuild:win": "node scripts/bundle-renderer.cjs",
     "start:mcp": "electron . --mcp",
+    "prestart:mcp": "node scripts/bundle-renderer.cjs",
     "mcp": "node mcp/server.cjs",
     "mcp:contract": "node scripts/generate-contract.cjs",
-    "mcp:build": "node scripts/bundle-mcp.cjs",
-    "build:win": "electron-builder --win portable --x64 --publish never",
-    "pretest": "node scripts/bundle-mcp.cjs"
+    "mcp:build": "node scripts/bundle-mcp.cjs"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "1.31.0",
@@ -32,8 +37,7 @@
     "files": [
       "main.cjs",
       "preload.cjs",
-      "app.js",
-      "automation.js",
+      "build/renderer.js",
       "index.html",
       "style.css",
       "mcp/desktop-bridge.cjs",

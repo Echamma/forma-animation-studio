@@ -142,7 +142,8 @@ app.whenReady().then(() => {
   window = new BrowserWindow({width: 1500, height: 980, minWidth: 1050, minHeight: 760,
     show: process.env.FORMA_TEST !== '1', backgroundColor: '#1b1e1f', autoHideMenuBar: true,
     title: 'Forma — Animation Studio',
-    webPreferences: {preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false}});
+    webPreferences: {preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false,
+      additionalArguments: process.env.FORMA_TEST === '1' ? ['--forma-test'] : []}});
   bridge = createBridge({
     discoveryFile: process.env.FORMA_BRIDGE_FILE || path.join(app.getPath('userData'), 'mcp-bridge.json'),
     exportDirectory: process.env.FORMA_EXPORT_DIR || path.join(app.getPath('documents'), 'Forma Exports'), dispatch, checkpoint

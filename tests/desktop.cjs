@@ -13,7 +13,7 @@ app.whenReady().then(async () => {
     await fs.mkdir(output, { recursive: true });
     const win = BrowserWindow.getAllWindows()[0];
     if (win.webContents.isLoading()) await new Promise(resolve => win.webContents.once('did-finish-load', resolve));
-    const result = await win.webContents.executeJavaScript(`(async()=>{
+    const result = await win.webContents.executeJavaScript(`with(window.__forma){(async()=>{
       await window.FormaSession.ready;
       const checks=[]; const assert=(ok,message)=>{if(!ok)throw new Error(message);checks.push(message);};
       assert(valid(scene),'Default project validates'); assert(scene.shapes.length===3,'Three animated example layers load');
@@ -223,12 +223,12 @@ app.whenReady().then(async () => {
       const svgBlurCanvas=document.createElement('canvas');svgBlurCanvas.width=200;svgBlurCanvas.height=200;const svgBlurContext=svgBlurCanvas.getContext('2d');svgBlurContext.drawImage(svgPreview,0,0);
       assert(svgBlurContext.getImageData(54,100,1,1).data[1]<255,'SVG export visibly blurs layer edges');scene.shapes=originalShapes;scene.bg=originalBg;
       scene.bg='#123456';refresh(); return {checks,animated,png};
-    })()`);
+    })()}`);
     await fs.writeFile(path.join(output, 'animation.svg'), result.animated);
     const png = Buffer.from(result.png.split(',')[1], 'base64');
     assert.equal(png.readUInt32BE(16),960); assert.equal(png.readUInt32BE(20),600);
     await fs.writeFile(path.join(output,'frame.png'),png);
-    const projectChecks = await win.webContents.executeJavaScript(`(async()=>{
+    const projectChecks = await win.webContents.executeJavaScript(`with(window.__forma){(async()=>{
       const svg='<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="#ff0000"/></svg>';
       const before=scene.shapes.length;
       const batch=await importMediaFiles([new File([svg],'one.svg',{type:'image/svg+xml'}),new File([svg],'two.svg',{type:'image/svg+xml'})]);
@@ -245,13 +245,13 @@ app.whenReady().then(async () => {
       const list=await window.formaDesktop.listProjects();const saved=await window.formaDesktop.openLocalProject(oldId);
       restoreProject(saved);await window.FormaSession.flushAutosave();
       return {before,batch:batch.added,large:largeImport.added,afterBatch,afterDrop,oldId,newId,newCount,listed:list.some(p=>p.id===oldId),restored:scene.shapes.length,name:scene.projectName};
-    })()`);
+    })()}`);
     assert.equal(projectChecks.batch,2);assert.equal(projectChecks.large,1);assert.equal(projectChecks.afterBatch,projectChecks.before+2);assert.equal(projectChecks.afterDrop,projectChecks.before+3);
     assert.notEqual(projectChecks.oldId,projectChecks.newId);assert.equal(projectChecks.newCount,3);assert(projectChecks.listed);assert.equal(projectChecks.restored,projectChecks.before+3);assert.equal(projectChecks.name,'Bulk import test');
     const defaultProject = await win.webContents.executeJavaScript('window.FormaSession.snapshot()');
     defaultProject.bg='#abcdef';
     await fs.writeFile(path.join(app.getPath('userData'),'default-project.json'),JSON.stringify(defaultProject));
-    const defaultCheck = await win.webContents.executeJavaScript(`(async()=>{document.getElementById('reset').click();await new Promise(resolve=>setTimeout(resolve,100));return {bg:scene.bg,loaded:(await window.formaDesktop.loadDefault()).bg}})()`);
+    const defaultCheck = await win.webContents.executeJavaScript(`with(window.__forma){(async()=>{document.getElementById('reset').click();await new Promise(resolve=>setTimeout(resolve,100));return {bg:scene.bg,loaded:(await window.formaDesktop.loadDefault()).bg}})()}`);
     assert.deepEqual(defaultCheck,{bg:'#abcdef',loaded:'#abcdef'});
     const closed = new Promise(resolve => win.once('closed', resolve)); win.close(); await closed;
     const recovered = JSON.parse(await fs.readFile(path.join(app.getPath('userData'),'last-session.json'),'utf8'));
