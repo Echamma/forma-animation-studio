@@ -4,7 +4,7 @@ Forma MCP gives Codex, Claude Code, and Claude Desktop typed tools for the **liv
 
 ## Install
 
-1. Download Forma **1.1.0 or later** and `forma-mcp.cjs` from [the release](https://github.com/Echamma/forma-animation-studio/releases/tag/linux-v1.1.0). Windows uses the portable `.exe`; Linux uses the AppImage or Debian package.
+1. Download Forma **1.2.0 or later** and `forma-mcp.cjs` from [GitHub Releases](https://github.com/Echamma/forma-animation-studio/releases). Windows uses the installer or the portable `.exe`; Linux uses the AppImage or Debian package. (`forma_duplicate_shape`, clip timing, easing, color keys, and MP4 need 1.2.0.)
 2. Install Node.js 22 or later. Save `forma-mcp.cjs` in a permanent folder. The file is bundled and needs no `npm install`.
 3. Open Forma and click **MCP off** in the header. It becomes **MCP on**. This allows local assistant control until you turn it off or close the app. You can also start the desktop executable with `--mcp`.
 4. Register the server using its **absolute path**:
@@ -45,21 +45,24 @@ Use a full path to your `node` executable if the client cannot find it. The [Cla
 | `forma_get_scene` | Inspect dimensions, layers, keyframes, selection, playback, and current transforms. Asset payloads are omitted by default. |
 | `forma_create_scene` | Start an empty project; `replace=true` confirms replacing the current scene. |
 | `forma_update_scene` | Edit dimensions, duration, or background; dimensions do not scale existing layers. |
-| `forma_add_shape` | Add circles, rectangles, triangles, diamonds, arrows, and text. |
-| `forma_update_shape` | Set name, color, interpolation, text, or a text layer's follow target. |
-| `forma_set_keyframes` | Merge or replace complete poses; supports position, dimensions, rotation, and opacity. |
+| `forma_add_shape` | Add circles, rectangles, triangles, diamonds, arrows, and text, optionally with clip timing (`inTime`, `outTime`, `trackId`). |
+| `forma_update_shape` | Set name, color, interpolation, text, a text layer's follow target, clip timing (`inTime`, `outTime`, or `null` to last until the end, `trackId`), or fill color keyframes (`colorKeys`). |
+| `forma_set_keyframes` | Merge or replace complete poses; supports position, dimensions, rotation, opacity, and per-keyframe easing (`ease`, plus `curve` for a custom cubic-bezier). |
+| `forma_duplicate_shape` | Copy a layer. `placement=after` puts a still copy right after its clip on the same track (pushing later clips right); pass `x`/`y` to make the picture jump there, which builds stop-motion sequences. `placement=same_time` makes an independent copy. |
 | `forma_delete_shape` | Delete a layer with `confirm=true`; attached text is detached at its current pose. |
 | `forma_set_playback` | Play, pause, or seek. |
 | `forma_preview` | Return an inline PNG frame for the assistant to inspect. |
-| `forma_export` | Save PNG, static SVG, animated SVG, WebM, or an editable JSON project. |
+| `forma_export` | Save PNG, static SVG, animated SVG, MP4 or WebM video (`fps` 12–60), or an editable JSON project. |
 | `forma_open_project` | Open a local Forma JSON project with `replace=true`. |
-| `forma_import_asset` | Import local PNG, JPEG, WebP, and sanitized SVG artwork. |
+| `forma_import_asset` | Import local PNG, JPEG, WebP, and sanitized SVG artwork. Pictures go into the app's media library. |
 
 Try this prompt:
 
-> Use Forma to inspect my current scene and save a JSON backup. Make a 4-second animation with a coral circle moving left to right on a dark background. Add a caption that follows it. Show me previews at 0, 2, and 4 seconds, then export the animated SVG and WebM.
+> Use Forma to inspect my current scene and save a JSON backup. Make a 4-second animation with a coral circle moving left to right on a dark background. Add a caption that follows it. Show me previews at 0, 2, and 4 seconds, then export the animated SVG and an MP4.
 
-Coordinates describe each layer's **center**, in pixels from the top left. Width/height are pixels, rotation is degrees, opacity is 0–100, and keyframe time is seconds. Canvas dimensions support 100–4000 pixels and scene durations of 1 second or longer. Limits are 100 layers and 1000 keyframes per layer. For example:
+> Import pose.png, show it for 0.25 s at x=100, then duplicate it after itself three times at x=250, 400, and 550 so it hops across the screen. Preview 0.3 and 0.8 seconds.
+
+Coordinates describe each layer's **center**, in pixels from the top left. Width/height are pixels, rotation is degrees, opacity is 0–100, and keyframe time is seconds. Canvas dimensions support 100–4000 pixels and scene durations of 1 second or longer. Limits are 500 layers and 1000 keyframes per layer. For example:
 
 ```json
 {
@@ -71,13 +74,13 @@ Coordinates describe each layer's **center**, in pixels from the top left. Width
 }
 ```
 
-Text linked to another layer follows its transform; its offset is derived from its current pose when linked. Use an empty `linkId` to detach it at its current pose. Editing keyframes clears that layer's drawn-motion metadata so it cannot later overwrite those keyframes. Video assets can be imported through the desktop UI and existing video layers can be animated through MCP.
+Text linked to another layer follows its transform; its offset is derived from its current pose when linked. Use an empty `linkId` to detach it at its current pose. Editing keyframes clears that layer's drawn-motion metadata so it cannot later overwrite those keyframes. A layer is visible from `inTime` up to `outTime`; layers sharing a `trackId` sit side by side on one timeline row. Video assets can be imported through the desktop UI and existing video layers can be animated through MCP.
 
 ## Files and connection
 
 Exports go to **Documents/Forma Exports** by default; each export returns its absolute path and byte count. Only simple filenames with the correct extension are accepted. Existing exports require `overwrite=true`. Set `FORMA_EXPORT_DIR` in the **desktop app's** environment to choose another export folder. Do not set it only on the MCP server.
 
-Forma does not impose a file size cap on project or image imports; very large files still depend on available device memory and disk space. Files to import must use absolute local paths. PNG previews are capped at 1600 pixels per dimension; PNG exports use full scene dimensions. WebM records one complete loop in real time and keeps the app open until completion. Animated SVG uses poster frames for video layers, matching the editor's existing export behavior. Audio is not exported.
+Forma does not impose a file size cap on project or image imports; very large files still depend on available device memory and disk space. Files to import must use absolute local paths. PNG previews are capped at 1600 pixels per dimension; PNG exports use full scene dimensions. MP4 and WebM render every frame at its exact time, faster than real time, and include sound from video layers. Animated SVG uses poster frames for video layers. Project and SVG exports embed their images as data URLs so they open anywhere; `forma_get_scene` with `includeAssets` returns the `forma-asset://` links the editor uses internally.
 
 The bridge is disabled by default, listens only on `127.0.0.1` at a random port, and requires a random local bearer token. Browser origins are rejected. There is no arbitrary JavaScript execution or remote URL import tool. Requests are serialized and validated against the contract before reaching the editor. Turning MCP off blocks new/queued commands; a command already running may finish. Closing Forma removes its discovery file. Scene edits are autosaved locally while you work.
 
@@ -98,7 +101,7 @@ npm ci
 npm run start:mcp
 ```
 
-You can register `/absolute/path/to/mcp/server.cjs` instead of the bundled entry point for development. `npm run mcp:build` bundles the distributable file in `dist/forma-mcp.cjs`. `npm test` builds that bundle, checks the generated contract, tests the editor, and runs a real stdio MCP client against all twelve tools and the bundle. On headless Linux, use `xvfb-run -a npm test`.
+You can register `/absolute/path/to/mcp/server.cjs` instead of the bundled entry point for development. `npm run mcp:build` bundles the distributable file in `dist/forma-mcp.cjs`. `npm test` builds that bundle, checks the generated contract, tests the editor, and runs a real stdio MCP client against all thirteen tools and the bundle. On headless Linux, use `xvfb-run -a npm test`.
 
 `openapi.json` is the contract source. `npm run mcp:contract` resolves schemas and generates `tool_manifest.json`. Both the stdio server and the desktop bridge validate arguments against that manifest. Tests reject contract drift. Tool names remain stable; breaking changes should use new tool IDs.
 
