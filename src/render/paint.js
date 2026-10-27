@@ -1,5 +1,5 @@
 import {isAsset, mediaElement} from '../media.js';
-import {state} from '../model/animation.js';
+import {colorAt, state} from '../model/animation.js';
 import {layerBlur} from './canvas.js';
 import {editor} from '../state.js';
 
@@ -24,7 +24,7 @@ export function paint(ctx, t) {
       if (media.tagName === 'VIDEO' ? media.readyState >= 2 : media.complete)
         ctx.drawImage(media, -p.w / 2, -p.h / 2, p.w, p.h);
     } else if (s.type === 'text') {
-      ctx.fillStyle = s.color;
+      ctx.fillStyle = colorAt(s, t);
       ctx.font = `600 ${p.h}px DM Sans, sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
@@ -32,7 +32,7 @@ export function paint(ctx, t) {
       ctx.scale(p.w / measured, 1);
       ctx.fillText(s.text || 'Text', 0, 0);
     } else {
-      ctx.fillStyle = s.color;
+      ctx.fillStyle = colorAt(s, t);
       ctx.beginPath();
       if (s.type === 'circle') ctx.ellipse(0, 0, p.w / 2, p.h / 2, 0, 0, Math.PI * 2);
       else if (s.type === 'rect') ctx.roundRect(-p.w / 2, -p.h / 2, p.w, p.h, 3);

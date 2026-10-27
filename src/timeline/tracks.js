@@ -1,6 +1,6 @@
 import {editMotion, selectMotion} from '../animate/motion.js';
 import {editRotation, selectRotation} from '../animate/rotation.js';
-import {$} from '../dom.js';
+import {$, toast} from '../dom.js';
 import {assetHref, isAsset} from '../media.js';
 import {clipEnd, clipStart, inClip, reappearAt} from '../model/animation.js';
 import {earliestShift, MIN_CLIP, shiftLayer, trimClip} from '../model/clips.js';
@@ -10,6 +10,7 @@ import {editor} from '../state.js';
 import {openClipMenu} from '../ui/clips.js';
 import {openKeyframeMenu} from '../ui/keyframe-menu.js';
 import {refresh} from '../ui/refresh.js';
+import {selectedLayers, toggleInSelection} from '../ui/selection.js';
 import {closeDrawer, showInspectorTab} from '../ui/tabs.js';
 
 const percent = t => `${(t / editor.scene.duration) * 100}%`;
@@ -23,14 +24,21 @@ export function selectClip(s) {
   refresh();
 }
 
+function toggleClip(s) {
+  stop();
+  toggleInSelection(s.id);
+  refresh();
+}
+
 export function lists() {
   $('layers').replaceChildren();
   $('tracks').replaceChildren();
   // One timeline row per layer, except that clips sharing a trackId sit side by side on one row.
-  const rows = new Map();
+  const rows = new Map(),
+    chosen = new Set(selectedLayers().map(s => s.id));
   for (const s of editor.scene.shapes) {
     const b = document.createElement('button');
-    b.className = 'layer' + (editor.selected === s.id ? ' active' : '');
+    b.className = 'layer' + (chosen.has(s.id) ? ' active' : '');
     const sw = document.createElement('span');
     sw.className = 'swatch' + (isAsset(s) ? ' asset' : '');
     if (isAsset(s)) sw.style.backgroundImage = `url("${assetHref(s).replace(/"/g, '%22')}")`;
@@ -41,7 +49,8 @@ export function lists() {
     end.className = 'layer-end';
     end.textContent = s.type === 'svg' ? '✎' : s.type === 'video' ? '▶' : '◇';
     b.append(sw, name, end);
-    b.onclick = () => {
+    b.onclick = e => {
+      if (e.shiftKey) return toggleClip(s);
       closeDrawer();
       selectClip(s);
     };
@@ -70,7 +79,7 @@ export function lists() {
     entry.clips.push(s);
     const {row, line} = entry;
     if (editor.selected === s.id && !editor.selectedMotionId && !editor.selectedRotationId) row.classList.add('active');
-    line.append(clipBar(s, line));
+    line.append(clipBar(s, line, chosen));
     for (const k of s.keys) {
       if (k.t < clipStart(s) - 1e-6 || k.t > clipEnd(s) + 1e-6) continue;
       const d = document.createElement('button');
@@ -90,6 +99,34 @@ export function lists() {
       };
       d.oncontextmenu = e => openKeyframeMenu(e, s, k);
       line.append(d);
+    }
+    for (const k of s.colorKeys || []) {
+      if (k.t < clipStart(s) - 1e-6 || k.t > clipEnd(s) + 1e-6) continue;
+      const dot = document.createElement('button');
+      dot.className = 'color-dot';
+      dot.style.left = percent(k.t);
+      dot.style.background = k.color;
+      dot.title = `${s.name} color ${k.color.toUpperCase()} at ${k.t.toFixed(2)} s — right-click to delete`;
+      dot.onclick = e => {
+        e.stopPropagation();
+        stop();
+        editor.time = k.t;
+        editor.selected = s.id;
+        refresh();
+      };
+      dot.oncontextmenu = e => {
+        e.preventDefault();
+        e.stopPropagation();
+        s.colorKeys = s.colorKeys.filter(x => x !== k);
+        if (!s.colorKeys.length) {
+          s.color = k.color;
+          delete s.colorKeys;
+        }
+        refresh();
+        recordSceneChange('delete color keyframe');
+        toast('Color keyframe deleted');
+      };
+      line.append(dot);
     }
     // Animation rows sit under their layer; on a clip track only the selected clip shows them.
     if (s.trackId && editor.selected !== s.id) continue;
@@ -196,11 +233,11 @@ export function lists() {
 }
 
 // The bar that shows when a layer is visible. Drag it to move the clip with its animation, or drag an edge to trim.
-function clipBar(s, line) {
+function clipBar(s, line, chosen) {
   const start = clipStart(s),
     end = Math.min(clipEnd(s), editor.scene.duration),
     bar = document.createElement('button');
-  bar.className = 'clip-bar' + (s.id === editor.selected ? ' selected' : '');
+  bar.className = 'clip-bar' + (chosen.has(s.id) ? ' selected' : '');
   bar.dataset.layerId = s.id;
   bar.style.left = percent(start);
   bar.style.width = percent(end - start);
@@ -220,6 +257,7 @@ function clipBar(s, line) {
   bar.onclick = e => {
     e.stopPropagation();
     if (bar.dataset.ignoreClick === 'yes') delete bar.dataset.ignoreClick;
+    else if (e.shiftKey) toggleClip(s);
     else selectClip(s);
   };
   bar.oncontextmenu = e => openClipMenu(e, s);

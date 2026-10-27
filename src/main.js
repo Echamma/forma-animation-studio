@@ -7,6 +7,7 @@ import {setupWorkspace} from './ui/workspace.js';
 import {setupPlayback, tick} from './playback.js';
 import {setupInspector} from './ui/inspector.js';
 import {setupClips} from './ui/clips.js';
+import {setupArrange} from './ui/arrange.js';
 import {setupSceneSettings} from './ui/scene-settings.js';
 import {setupLayers} from './ui/layers.js';
 import {setupImport} from './ui/import.js';
@@ -37,6 +38,8 @@ import * as refresh from './ui/refresh.js';
 import * as clips from './model/clips.js';
 import * as clipControls from './ui/clips.js';
 import * as tracks from './timeline/tracks.js';
+import * as selection from './ui/selection.js';
+import * as arrange from './model/arrange.js';
 
 setupTabs();
 setupKeyframeMenu();
@@ -45,6 +48,7 @@ setupWorkspace();
 setupPlayback();
 setupInspector();
 setupClips();
+setupArrange();
 setupSceneSettings();
 setupLayers();
 setupImport();
@@ -81,7 +85,9 @@ if (window.formaDesktop?.testMode) {
     refresh,
     clips,
     clipControls,
-    tracks
+    tracks,
+    selection,
+    arrange
   );
   for (const key of Object.keys(editor))
     Object.defineProperty(handle, key, {get: () => editor[key], set: value => (editor[key] = value), enumerable: true});

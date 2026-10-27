@@ -12,6 +12,7 @@ let historyReady = false;
 let lastProjectJson = '';
 export const currentProjectJson = () => lastProjectJson;
 let undoHistory = [];
+let redoHistory = [];
 let gestureStart = null;
 let autosaveTimer = null;
 let pendingAutosaveJson = null;
@@ -101,6 +102,7 @@ export function recordSceneChange(source = 'edit', recordHistory = true) {
   if (!historyReady) return false;
   const current = packScene();
   if (current === lastProjectJson) return false;
+  redoHistory = [];
   if (recordHistory && gestureStart === null) {
     const now = performance.now(),
       grouped = source.startsWith('input:') && source === lastInputSource && now - lastInputAt < 1000;
@@ -116,6 +118,19 @@ function undoScene() {
   recordSceneChange('undo preparation');
   const previous = undoHistory.pop();
   if (!previous) return toast('Nothing to undo');
+  redoHistory.push(lastProjectJson);
+  showSnapshot(previous);
+  toast('Undid last change');
+}
+function redoScene() {
+  recordSceneChange('redo preparation');
+  const next = redoHistory.pop();
+  if (!next) return toast('Nothing to redo');
+  pushUndo(lastProjectJson);
+  showSnapshot(next);
+  toast('Redid change');
+}
+function showSnapshot(previous) {
   stop();
   closeKeyframeMenu();
   assetCache.clear();
@@ -133,7 +148,6 @@ function undoScene() {
   gestureStart = null;
   refresh();
   scheduleAutosave(previous, 0);
-  toast('Undid last change');
 }
 function endSceneGesture() {
   if (gestureStart === null) return;
@@ -173,6 +187,7 @@ export function restoreProject(saved) {
 
 export function setupPersistence() {
   $('undo-button').onclick = () => undoScene();
+  $('redo-button').onclick = () => redoScene();
   document.addEventListener('click', () => queueMicrotask(() => recordSceneChange('click')));
   document.addEventListener('input', e => {
     const source = 'input:' + (e.target.id || e.target.name || e.target.tagName);
@@ -198,16 +213,18 @@ export function setupPersistence() {
     'keydown',
     e => {
       if (
-        (e.ctrlKey || e.metaKey) &&
-        !e.shiftKey &&
-        e.key.toLowerCase() === 'z' &&
-        !e.target.closest?.('textarea,[contenteditable="true"]') &&
-        !document.body.classList.contains('mcp-working')
-      ) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        undoScene();
-      }
+        !(e.ctrlKey || e.metaKey) ||
+        e.target.closest?.('textarea,[contenteditable="true"]') ||
+        document.body.classList.contains('mcp-working')
+      )
+        return;
+      const key = e.key.toLowerCase(),
+        redo = (e.shiftKey && key === 'z') || (!e.shiftKey && key === 'y');
+      if (!redo && (e.shiftKey || key !== 'z')) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (redo) redoScene();
+      else undoScene();
     },
     true
   );

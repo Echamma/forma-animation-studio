@@ -1,8 +1,9 @@
 import {$, element} from '../dom.js';
 import {assetHref, isAsset, mediaElement, syncVideo} from '../media.js';
-import {clipEnd, clipStart, inClip, state} from '../model/animation.js';
+import {clipEnd, clipStart, colorAt, inClip, state} from '../model/animation.js';
 import {resizeCursor, resizeDirections} from '../model/geometry.js';
 import {editor} from '../state.js';
+import {selectedLayers} from '../ui/selection.js';
 
 export function geometry(s, p, exporting = false) {
   if (s.type === 'video' && !exporting) {
@@ -80,7 +81,7 @@ function onionSkin() {
     .sort((a, b) => clipEnd(b) - clipEnd(a))[0];
   if (!previous) return null;
   const p = state({...previous, inTime: undefined, outTime: undefined}, Math.max(clipStart(previous), clipEnd(previous) - 0.001));
-  const g = element('g', {transform: `translate(${p.x} ${p.y}) rotate(${p.r})`, fill: previous.color, opacity: 0.3, class: 'onion-skin', 'pointer-events': 'none'});
+  const g = element('g', {transform: `translate(${p.x} ${p.y}) rotate(${p.r})`, fill: colorAt(previous, clipEnd(previous) - 0.001), opacity: 0.3, class: 'onion-skin', 'pointer-events': 'none'});
   g.append(geometry(previous, p, true));
   return g;
 }
@@ -132,7 +133,7 @@ export function render() {
     if (s.type === 'video') syncVideo(s);
     const g = element('g', {
       transform: `translate(${p.x} ${p.y}) rotate(${p.r})`,
-      fill: s.color,
+      fill: colorAt(s),
       opacity: p.o / 100,
       class: 'object',
       'data-id': s.id
@@ -221,6 +222,21 @@ export function render() {
       svg.append(rotation);
     }
   }
+  if (!editor.playing && !editor.recording)
+    for (const s of selectedLayers().slice(1)) {
+      if (!inClip(s, editor.time)) continue;
+      const p = state(s);
+      svg.append(
+        element('rect', {
+          x: -p.w / 2,
+          y: -p.h / 2,
+          width: p.w,
+          height: p.h,
+          class: 'group-box',
+          transform: `translate(${p.x} ${p.y}) rotate(${p.r})`
+        })
+      );
+    }
   const guide = editor.motionDraft || editor.motionGuide;
   if (guide && !editor.playing) {
     const group = element('g', {class: 'motion-guide'}),

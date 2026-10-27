@@ -6,6 +6,7 @@ import {recordSceneChange} from '../persistence.js';
 import {stop} from '../playback.js';
 import {editor} from '../state.js';
 import {refresh} from './refresh.js';
+import {selectedLayers, setSelection} from './selection.js';
 
 let clipboard = null,
   menuTarget = null;
@@ -48,22 +49,26 @@ export function splitSelected() {
     focusOn(second, `Clip split at ${second.inTime.toFixed(2)} s`);
   });
 }
-export function duplicateSelected(source = selectedLayer()) {
+// Duplicates the given layers, or every selected layer, and selects the copies.
+export function duplicateSelected(sources = selectedLayers()) {
   act(() => {
-    if (!source) return toast('Select a layer first');
-    const copy = duplicateLayer(source);
-    editor.selected = copy.id;
-    if (!inClip(copy, editor.time)) editor.time = clipStart(copy);
+    if (!sources.length) return toast('Select a layer first');
+    const copies = sources.map(s => duplicateLayer(s));
+    setSelection(
+      copies.map(c => c.id),
+      copies[0].id
+    );
+    if (!inClip(copies[0], editor.time)) editor.time = clipStart(copies[0]);
     refresh();
     recordSceneChange('duplicate');
-    toast(`${copy.name} added`);
+    toast(copies.length > 1 ? `${copies.length} layers duplicated` : `${copies[0].name} added`);
   });
 }
 function copySelected() {
-  const s = selectedLayer();
-  if (!s) return;
-  clipboard = cloneLayer(s);
-  toast(`${s.name} copied`);
+  const layers = selectedLayers();
+  if (!layers.length) return;
+  clipboard = layers.map(cloneLayer);
+  toast(layers.length > 1 ? `${layers.length} layers copied` : `${layers[0].name} copied`);
 }
 
 export function clipFields(s) {
@@ -91,7 +96,7 @@ export function openClipMenu(e, s) {
   const linked = isLinkedText(s);
   $('clip-menu-title').textContent = s.name;
   menu.querySelector('[data-clip-action="continue"]').disabled = linked;
-  menu.querySelector('[data-clip-action="paste-after"]').disabled = linked || !clipboard || isLinkedText(clipboard);
+  menu.querySelector('[data-clip-action="paste-after"]').disabled = linked || !clipboard || isLinkedText(clipboard[0]);
   menu.querySelector('[data-clip-action="split"]').disabled =
     linked || !(editor.time > clipStart(s) + MIN_CLIP && editor.time < clipEnd(s) - MIN_CLIP);
   menu.hidden = false;
@@ -143,9 +148,9 @@ export function setupClips() {
     closeClipMenu();
     editor.selected = s.id;
     if (action === 'continue') continueSelected();
-    if (action === 'paste-after') continueSelected(clipboard);
+    if (action === 'paste-after') continueSelected(clipboard?.[0]);
     if (action === 'split') splitSelected();
-    if (action === 'duplicate') duplicateSelected(s);
+    if (action === 'duplicate') duplicateSelected([s]);
     if (action === 'delete') $('delete').click();
   };
   document.addEventListener('pointerdown', e => {
@@ -157,8 +162,16 @@ export function setupClips() {
       return;
     const command = e.ctrlKey || e.metaKey,
       key = e.key.toLowerCase();
-    if (command && !e.shiftKey && key === 'c' && !getSelection().toString()) copySelected();
-    else if (command && e.shiftKey && key === 'v') continueSelected(clipboard || undefined);
+    if (e.key === 'Escape' && editor.group) {
+      editor.group = null;
+      refresh();
+    } else if (command && !e.shiftKey && key === 'a') {
+      const visible = editor.scene.shapes.filter(s => inClip(s, editor.time)).map(s => s.id);
+      if (!visible.length) return;
+      setSelection(visible, visible.includes(editor.selected) ? editor.selected : visible[0]);
+      refresh();
+    } else if (command && !e.shiftKey && key === 'c' && !getSelection().toString()) copySelected();
+    else if (command && e.shiftKey && key === 'v') continueSelected(clipboard?.[0]);
     else if (command && !e.shiftKey && key === 'v') {
       if (clipboard) duplicateSelected(clipboard);
     } else if (command && !e.shiftKey && key === 'd') duplicateSelected();

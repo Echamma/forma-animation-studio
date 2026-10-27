@@ -1,4 +1,5 @@
 import {props} from './animation.js';
+import {EASES, validCurve} from './easing.js';
 
 export const MAX_LAYERS = 500;
 
@@ -10,6 +11,17 @@ function clipTimesOk(x, duration) {
     (x.outTime === undefined || (time(x.outTime) && x.outTime > (x.inTime ?? 0))) &&
     (x.trackId === undefined || (typeof x.trackId === 'string' && x.trackId.length > 0 && x.trackId.length <= 64)) &&
     (x.mediaStart === undefined || (Number.isFinite(x.mediaStart) && x.mediaStart >= 0))
+  );
+}
+// Optional per-keyframe easing and the separate color keyframe track.
+const keyEaseOk = k => (k.ease === undefined || EASES.includes(k.ease)) && (k.curve === undefined || validCurve(k.curve));
+function colorKeysOk(x, duration) {
+  if (x.colorKeys === undefined) return true;
+  return (
+    Array.isArray(x.colorKeys) &&
+    x.colorKeys.length <= 1000 &&
+    new Set(x.colorKeys.map(k => k.t)).size === x.colorKeys.length &&
+    x.colorKeys.every(k => Number.isFinite(k.t) && k.t >= 0 && k.t <= duration + 0.001 && /^#[0-9a-f]{6}$/i.test(k.color))
   );
 }
 
@@ -61,6 +73,8 @@ export function valid(s) {
         (x.blur === undefined || (Number.isFinite(x.blur) && x.blur >= 0 && x.blur <= 100)) &&
         (x.baseRotation === undefined || (Number.isFinite(x.baseRotation) && Math.abs(x.baseRotation) <= 10000)) &&
         clipTimesOk(x, s.duration) &&
+        colorKeysOk(x, s.duration) &&
+        x.keys?.every?.(keyEaseOk) &&
         (x.disappear === undefined ||
           (x.disappear &&
             Number.isFinite(x.disappear.startTime) &&

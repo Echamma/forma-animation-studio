@@ -10,6 +10,7 @@ import {editor} from '../state.js';
 import {lists} from '../timeline/tracks.js';
 import {fields, setLinkedTextPose} from './inspector.js';
 import {refresh} from './refresh.js';
+import {focusInSelection, selectedLayers, toggleInSelection} from './selection.js';
 
 let drag = null;
 let rotationDrag = null;
@@ -83,11 +84,16 @@ export function setupCanvasInput() {
     const g = e.target.closest('[data-id]');
     if (!g) return;
     stop();
-    editor.selected = g.dataset.id;
-    editor.selectedMotionId = editor.selectedRotationId = null;
-    editor.motionGuide = null;
-    const s = editor.scene.shapes.find(s => s.id === editor.selected);
-    drag = {start: point(e), value: editableState(s), id: s.id};
+    if (e.shiftKey) {
+      toggleInSelection(g.dataset.id);
+      refresh();
+      return;
+    }
+    focusInSelection(g.dataset.id);
+    // Every selected layer moves together; linked text whose shape is also selected follows it on its own.
+    const group = selectedLayers(),
+      moving = group.filter(s => !(s.type === 'text' && s.linkId && group.some(x => x.id === s.linkId)));
+    drag = {start: point(e), layers: moving.map(s => ({id: s.id, value: editableState(s)}))};
     $('canvas').setPointerCapture(e.pointerId);
     refresh();
   };
@@ -127,11 +133,14 @@ export function setupCanvasInput() {
       return;
     }
     if (!drag) return;
-    const p = point(e),
-      s = editor.scene.shapes.find(s => s.id === drag.id),
-      pose = {...drag.value, x: drag.value.x + p.x - drag.start.x, y: drag.value.y + p.y - drag.start.y};
-    if (s.type === 'text' && s.linkId) setLinkedTextPose(s, pose);
-    else key(s, pose);
+    const p = point(e);
+    for (const {id, value} of drag.layers) {
+      const s = editor.scene.shapes.find(s => s.id === id);
+      if (!s) continue;
+      const pose = {...value, x: value.x + p.x - drag.start.x, y: value.y + p.y - drag.start.y};
+      if (s.type === 'text' && s.linkId) setLinkedTextPose(s, pose);
+      else key(s, pose);
+    }
     render();
     fields();
   };

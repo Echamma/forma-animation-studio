@@ -1,6 +1,6 @@
 // Video-editor style clip operations: each layer is a clip with a visible window, and clips that share a trackId sit
 // one after another on a single timeline row.
-import {clipEnd, clipStart, rawState, rotationAt} from './animation.js';
+import {clipEnd, clipStart, colorAt, rawState, rotationAt} from './animation.js';
 import {extendSceneTo} from './keyframes.js';
 import {MAX_LAYERS} from './validate.js';
 import {editor} from '../state.js';
@@ -38,6 +38,7 @@ function earliestTime(s) {
   return Math.min(
     clipStart(s),
     ...s.keys.map(k => k.t),
+    ...(s.colorKeys || []).map(k => k.t),
     ...(s.motions || []).map(m => m.startTime),
     ...(s.rotationClips || []).map(c => c.startTime),
     ...(s.disappear ? [s.disappear.startTime] : [])
@@ -47,6 +48,7 @@ export function latestTime(s) {
   return Math.max(
     s.outTime ?? 0,
     ...s.keys.map(k => k.t),
+    ...(s.colorKeys || []).map(k => k.t),
     ...(s.motions || []).map(m => m.startTime + m.duration),
     ...(s.rotationClips || []).map(c => c.startTime + c.duration),
     ...(s.disappear ? [s.disappear.startTime + s.disappear.duration] : []),
@@ -61,7 +63,7 @@ export function shiftLayer(s, delta) {
   if (!delta) return 0;
   s.inTime = round(clipStart(s) + delta);
   if (s.outTime !== undefined) s.outTime = round(s.outTime + delta);
-  for (const k of s.keys) k.t = round(k.t + delta);
+  for (const k of [...s.keys, ...(s.colorKeys || [])]) k.t = round(k.t + delta);
   for (const m of s.motions || []) {
     m.startTime = round(m.startTime + delta);
     for (const k of m.baseKeys || []) k.t = round(k.t + delta);
@@ -116,6 +118,8 @@ export function continueAfter(source, template = source) {
   const pose = template === source ? ending : {...stillPose(template, clipStart(template)), x: ending.x, y: ending.y, r: ending.r};
   Object.assign(copy, {name: numberedName(template), trackId: source.trackId, inTime: end, outTime: round(end + length)});
   copy.keys = [{t: end, ...pose}];
+  copy.color = template === source ? colorAt(source, end) : colorAt(template, clipStart(template));
+  delete copy.colorKeys;
   if (template !== source) copy.baseRotation = source.baseRotation;
   if (copy.baseRotation === undefined) delete copy.baseRotation;
   delete copy.motions;

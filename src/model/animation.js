@@ -1,3 +1,4 @@
+import {ease, mixColors} from './easing.js';
 import {editor} from '../state.js';
 
 export const props = ['x', 'y', 'w', 'h', 'r', 'o'];
@@ -13,9 +14,25 @@ export function rawState(s, t = editor.time) {
     b = k;
   }
   let f = a === b ? 0 : Math.max(0, Math.min(1, (t - a.t) / (b.t - a.t)));
-  if (s.ease === 'smooth') f = f * f * (3 - 2 * f);
-  if (s.ease === 'hold') f = 0;
+  f = ease(a.ease ?? s.ease, f, a.curve);
   return Object.fromEntries(props.map(p => [p, a[p] + (b[p] - a[p]) * f]));
+}
+// Fill color at time t. Color keyframes form their own track so they never add movement keyframes.
+export function colorAt(s, t = editor.time) {
+  const keys = s.colorKeys;
+  if (!keys?.length) return s.color;
+  let a = keys[0],
+    b = a;
+  for (const k of keys) {
+    if (k.t <= t) a = k;
+    if (k.t >= t) {
+      b = k;
+      break;
+    }
+    b = k;
+  }
+  if (a === b) return a.color;
+  return mixColors(a.color, b.color, ease(s.ease, Math.max(0, Math.min(1, (t - a.t) / (b.t - a.t)))));
 }
 export function rotationAt(s, t = editor.time) {
   return (s.rotationClips || []).reduce((sum, clip) => {

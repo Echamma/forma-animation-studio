@@ -345,3 +345,18 @@ main.drawer-open #tool-drawer{transform:translateX(0);pointer-events:auto}
 #clip-menu button:disabled{opacity:.45;cursor:default}
 .onion-skin{pointer-events:none}
 #tracks{max-height:clamp(85px,18vh,220px)}
+/* Color keyframes sit below the movement diamonds on a layer's row. */
+.color-dot{position:absolute;bottom:1px;z-index:2;width:9px;height:9px;min-height:0;padding:0;border:1px solid #1f2b25;border-radius:50%;transform:translateX(-50%)}
+.color-dot:hover{transform:translateX(-50%) scale(1.25)}
+#keyframe-menu select{width:100%;padding:6px;border:1px solid #b6cbb5;border-radius:4px;background:#fff;color:var(--text)}
+#curve-editor{align-self:center;border-radius:6px;background:#f3f7f1;touch-action:none}
+.curve-frame{fill:none;stroke:#c9d8c6;stroke-dasharray:3 3}
+.curve-line{fill:none;stroke:#286244;stroke-width:2.5;stroke-linejoin:round}
+.curve-arm{stroke:#7d9b85;stroke-width:1.5}
+.curve-handle{fill:#fff;stroke:#286244;stroke-width:2;cursor:grab}
+/* Multi-selection */
+.arrange-tools{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.arrange-tools button{min-height:34px;padding:6px 4px;font-size:11px}
+.arrange-tools .wide{grid-column:span 3}
+#arrange-panel{margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.group-box{fill:none;stroke:#2f6fb0;stroke-width:1.5;stroke-dasharray:6 4;vector-effect:non-scaling-stroke;pointer-events:none}

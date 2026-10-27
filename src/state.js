@@ -16,5 +16,7 @@ export const editor = {
   workspacePanX: 0,
   workspacePanY: 0,
   workspacePan: null,
-  onionSkin: true
+  onionSkin: true,
+  // Extra layers selected with Shift; see ui/selection.js.
+  group: null
 };

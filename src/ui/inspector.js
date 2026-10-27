@@ -1,6 +1,6 @@
 import {$, toast} from '../dom.js';
 import {assetCache, isAsset, mediaElement, mediaKey} from '../media.js';
-import {editableState, props, rawState, rotationAt, state} from '../model/animation.js';
+import {colorAt, editableState, props, rawState, rotationAt, state} from '../model/animation.js';
 import {key} from '../model/keyframes.js';
 import {stop} from '../playback.js';
 import {layerBlur, render} from '../render/canvas.js';
@@ -9,6 +9,8 @@ import {lists} from '../timeline/tracks.js';
 import {removeKeyframe} from './keyframe-menu.js';
 import {refresh} from './refresh.js';
 import {clipFields} from './clips.js';
+import {arrangeFields} from './arrange.js';
+import {selectedLayers} from './selection.js';
 
 export function fields() {
   const s = editor.scene.shapes.find(s => s.id === editor.selected),
@@ -30,20 +32,23 @@ export function fields() {
   for (const id of ['ease', 'delete', 'keyframe', 'delete-key', 'draw-arrow', 'record-path']) $(id).disabled = !s;
   $('drop-item').disabled = !s || (isText && !!s.linkId);
   $('color').disabled = !s || asset;
+  $('animate-color').disabled = !s || asset;
+  $('animate-color').checked = !!s?.colorKeys?.length;
   $('fill-control').classList.toggle('disabled', asset);
   $('edit-svg').hidden = s?.type !== 'svg';
   $('text-panel').hidden = !isText;
   clipFields(s);
+  arrangeFields();
   document.querySelectorAll('[data-outside]').forEach(b => (b.disabled = !s));
   if (s) {
-    $('color').value = asset ? '#888888' : s.color;
+    $('color').value = asset ? '#888888' : colorAt(s);
     $('color-value').textContent = asset
       ? s.type === 'svg'
         ? 'VECTOR'
         : s.type === 'video'
           ? 'VIDEO'
           : 'IMAGE'
-      : s.color.toUpperCase();
+      : colorAt(s).toUpperCase();
     $('ease').value = s.ease;
   }
   if (isText) {
@@ -80,24 +85,30 @@ export function setLinkedTextPose(s, pose) {
 }
 
 export function setupInspector() {
+  const setProperty = (s, p, v) => {
+    const n = editableState(s);
+    n[p] =
+      p === 'r' && !(s.type === 'text' && s.linkId)
+        ? v - rotationAt(s, editor.time) - (s.baseRotation || 0)
+        : p === 'o'
+          ? Math.max(0, Math.min(100, v))
+          : p === 'w' || p === 'h'
+            ? Math.max(5, Math.min(2000, v))
+            : Math.max(-10000, Math.min(10000, v));
+    if (s.type === 'text' && s.linkId) setLinkedTextPose(s, n);
+    else key(s, n);
+  };
   for (const p of props)
     $(p).oninput = () => {
-      const s = editor.scene.shapes.find(s => s.id === editor.selected);
+      const [s, ...others] = selectedLayers();
       if (!s) return;
       stop();
       const v = +$(p).value;
       if (!Number.isFinite(v)) return;
-      const n = editableState(s);
-      n[p] =
-        p === 'r' && !(s.type === 'text' && s.linkId)
-          ? v - rotationAt(s, editor.time) - (s.baseRotation || 0)
-          : p === 'o'
-            ? Math.max(0, Math.min(100, v))
-            : p === 'w' || p === 'h'
-              ? Math.max(5, Math.min(2000, v))
-              : Math.max(-10000, Math.min(10000, v));
-      if (s.type === 'text' && s.linkId) setLinkedTextPose(s, n);
-      else key(s, n);
+      // With several layers selected, position moves them all by the same amount; other values apply to each.
+      const shift = p === 'x' || p === 'y' ? v - state(s)[p] : 0;
+      setProperty(s, p, v);
+      for (const other of others) setProperty(other, p, p === 'x' || p === 'y' ? state(other)[p] + shift : v);
       render();
       lists();
     };
@@ -120,12 +131,31 @@ export function setupInspector() {
   };
   $('color').oninput = () => {
     const s = editor.scene.shapes.find(s => s.id === editor.selected);
-    if (s) {
-      s.color = $('color').value;
-      render();
-      fields();
-      lists();
+    if (!s) return;
+    const color = $('color').value;
+    // With an animated fill, editing the color sets a color keyframe at the playhead.
+    if (s.colorKeys?.length) {
+      const t = Math.round(editor.time * 100) / 100,
+        existing = s.colorKeys.find(k => Math.abs(k.t - t) < 0.011);
+      if (existing) existing.color = color;
+      else s.colorKeys = [...s.colorKeys, {t, color}].sort((a, b) => a.t - b.t);
+    } else s.color = color;
+    render();
+    fields();
+    lists();
+  };
+  $('animate-color').onchange = () => {
+    const s = editor.scene.shapes.find(s => s.id === editor.selected);
+    if (!s) return;
+    stop();
+    if ($('animate-color').checked) {
+      s.colorKeys = [{t: Math.round(editor.time * 100) / 100, color: colorAt(s)}];
+      toast('Move the playhead and pick another color to animate the fill');
+    } else {
+      s.color = colorAt(s);
+      delete s.colorKeys;
     }
+    refresh();
   };
   $('ease').onchange = () => {
     const s = editor.scene.shapes.find(s => s.id === editor.selected);
@@ -153,18 +183,21 @@ export function setupInspector() {
       })
   );
   $('delete').onclick = () => {
-    const s = editor.scene.shapes.find(s => s.id === editor.selected);
-    if (!s) return;
-    for (const linked of editor.scene.shapes.filter(x => x.linkId === s.id)) {
-      const p = state(linked);
-      linked.keys = [{t: 0, ...p}];
-      delete linked.linkId;
-      delete linked.linkBase;
+    const doomed = selectedLayers();
+    if (!doomed.length) return;
+    for (const s of doomed) {
+      for (const linked of editor.scene.shapes.filter(x => x.linkId === s.id && !doomed.includes(x))) {
+        const p = state(linked);
+        linked.keys = [{t: 0, ...p}];
+        delete linked.linkId;
+        delete linked.linkBase;
+      }
+      if (s.type === 'video') mediaElement(s).pause();
+      if (isAsset(s)) assetCache.delete(mediaKey(s));
     }
-    if (s.type === 'video') mediaElement(s).pause();
-    if (isAsset(s)) assetCache.delete(mediaKey(s));
-    editor.scene.shapes = editor.scene.shapes.filter(x => x.id !== editor.selected);
+    editor.scene.shapes = editor.scene.shapes.filter(x => !doomed.includes(x));
     editor.selected = editor.scene.shapes.at(-1)?.id;
+    editor.group = null;
     editor.selectedMotionId = editor.selectedRotationId = null;
     editor.motionGuide = null;
     refresh();
