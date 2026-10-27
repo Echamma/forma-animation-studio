@@ -32,6 +32,7 @@ export function setupSceneSettings() {
         ...s.keys.map(k => k.t),
         s.inTime ?? 0,
         s.outTime ?? 0,
+        ...(s.colorKeys || []).map(k => k.t),
         ...(s.motions || []).map(m => m.startTime + m.duration),
         ...(s.rotationClips || []).map(c => c.startTime + c.duration),
         ...(s.disappear

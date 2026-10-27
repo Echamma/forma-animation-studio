@@ -84,6 +84,8 @@ export function setupAutomation() {
     else if (args.trackId !== undefined) layer.trackId = args.trackId;
     if (layer.outTime !== undefined && layer.outTime <= (layer.inTime ?? 0))
       throw problem('INVALID_TIMING', 'outTime must be later than inTime.');
+    if (args.colorKeys?.length === 0) delete layer.colorKeys;
+    else if (args.colorKeys) layer.colorKeys = clone(args.colorKeys).sort((a, b) => a.t - b.t);
     project.duration = Math.max(project.duration, layer.inTime ?? 0, layer.outTime ?? 0);
   }
   function newLayer(args, type = args.type) {
@@ -229,6 +231,7 @@ export function setupAutomation() {
           if (next.shapes.some(
               layer =>
                 layer.keys.some(key => key.t > next.duration) ||
+                layer.colorKeys?.some(key => key.t > next.duration) ||
                 (layer.inTime ?? 0) > next.duration ||
                 (layer.outTime ?? 0) > next.duration
             ))

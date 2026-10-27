@@ -114,6 +114,12 @@ app.whenReady().then(async () => {
     await rejected('forma_update_shape', {id:nextPose.id, inTime:.5, outTime:.4}, 'INVALID_TIMING');
     assert.equal((await call('forma_update_shape', {id:nextPose.id, outTime:null, trackId:''})).layer.outTime, undefined);
     assert.equal((await call('forma_duplicate_shape', {id:pose.id, placement:'same_time'})).layer.keys[0].x, 120);
+    const eased = (await call('forma_set_keyframes', {id:pose.id, replace:true, keyframes:[{t:0,x:0,y:300,w:40,h:40,r:0,o:100,ease:'hold'},{t:1,x:200,y:300,w:40,h:40,r:0,o:100}]})).layer;
+    assert.equal(eased.keys[0].ease, 'hold');
+    await rejected('forma_set_keyframes', {id:pose.id, keyframes:[{t:0,x:0,y:0,w:1,h:1,r:0,o:100,ease:'custom',curve:[2,0,1,1]}]}, 'INVALID_PROJECT');
+    const tinted = (await call('forma_update_shape', {id:pose.id, colorKeys:[{t:.5,color:'#00ff00'},{t:0,color:'#ff0000'}]})).layer;
+    assert.deepEqual(tinted.colorKeys.map(key => key.t), [0, .5]);
+    assert.equal((await call('forma_update_shape', {id:pose.id, colorKeys:[]})).layer.colorKeys, undefined);
     await call('forma_open_project', {file:path.join(output,'exports','scene.json'),replace:true});
     assert.equal((await call('forma_get_scene')).project.shapes.length,4);
     const invalidFile = path.join(output, 'invalid.json'); await fs.writeFile(invalidFile,'{"version":1}');
