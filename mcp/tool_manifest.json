@@ -55,8 +55,7 @@
           "duration": {
             "type": "number",
             "minimum": 1,
-            "maximum": 30,
-            "description": "Scene length in seconds."
+            "description": "Scene length in seconds; no fixed upper limit."
           },
           "bg": {
             "type": "string",
@@ -98,8 +97,7 @@
           "duration": {
             "type": "number",
             "minimum": 1,
-            "maximum": 30,
-            "description": "Scene length in seconds."
+            "description": "Scene length in seconds; no fixed upper limit."
           },
           "bg": {
             "type": "string",
@@ -315,7 +313,6 @@
                 "t": {
                   "type": "number",
                   "minimum": 0,
-                  "maximum": 30,
                   "description": "Time in seconds within the scene duration."
                 },
                 "x": {
@@ -425,7 +422,6 @@
           "time": {
             "type": "number",
             "minimum": 0,
-            "maximum": 30,
             "description": "Time in seconds within the scene duration."
           }
         },
@@ -450,7 +446,6 @@
           "time": {
             "type": "number",
             "minimum": 0,
-            "maximum": 30,
             "description": "Time in seconds within the scene duration."
           },
           "maxWidth": {
@@ -504,7 +499,6 @@
           "time": {
             "type": "number",
             "minimum": 0,
-            "maximum": 30,
             "description": "Time in seconds within the scene duration."
           },
           "overwrite": {
@@ -527,7 +521,7 @@
     },
     {
       "name": "forma_open_project",
-      "description": "Open an editable Forma JSON file from an absolute local path (up to 64 MB). Replaces the current scene and requires replace=true. Invalid projects leave the scene intact.",
+      "description": "Open an editable Forma JSON file from an absolute local path. Replaces the current scene and requires replace=true. Invalid projects leave the scene intact.",
       "inputSchema": {
         "type": "object",
         "required": [
@@ -561,7 +555,7 @@
     },
     {
       "name": "forma_import_asset",
-      "description": "Import a PNG, JPEG, WebP, or SVG file (up to 30 MB) as an embedded layer. SVG is sanitized. Returns its ID for later keyframes. Video layers can be imported through the desktop UI.",
+      "description": "Import a PNG, JPEG, WebP, or SVG file as an embedded layer. SVG is sanitized. Returns its ID for later keyframes. Video layers can be imported through the desktop UI.",
       "inputSchema": {
         "type": "object",
         "required": [

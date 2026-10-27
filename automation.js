@@ -4,12 +4,13 @@
   const problem = (code, message) => Object.assign(new Error(message), {code});
   let busy = false;
   function snapshot(includeAssets = false) {
-    const project = clone(scene);
-    if (!includeAssets) for (const layer of project.shapes) {
+    const project = includeAssets ? clone(scene) : clone({...scene, shapes: scene.shapes.map(layer => {
+      const copy = {...layer};
       for (const field of ['assetData', 'posterData', 'svgSource']) {
-        if (layer[field]) { layer[field + 'Bytes'] = layer[field].length; delete layer[field]; }
+        if (typeof copy[field] === 'string') {copy[field + 'Bytes'] = copy[field].length; delete copy[field];}
       }
-    }
+      return copy;
+    })});
     return {project, selected: selected || null, time, playing,
       transforms: scene.shapes.map(layer => ({id: layer.id, ...state(layer, time)}))};
   }
@@ -27,6 +28,7 @@
     try {
       if (!valid(project)) return false;
       const number = value => Number.isFinite(value) && Math.abs(value) <= 10000;
+      const timeValue = value => Number.isFinite(value) && value >= 0;
       const pose = value => value && props.every(key => number(value[key])) && value.w > 0 && value.h > 0 && value.o >= 0 && value.o <= 100;
       return project.shapes.every(layer => {
         if (layer.type === 'text') {
@@ -38,13 +40,13 @@
         if (layer.motions === undefined) return true;
         return Array.isArray(layer.motions) && layer.motions.length <= 1000 && layer.motions.every(motion =>
           motion && typeof motion.id === 'string' && ['arrow', 'path'].includes(motion.type) &&
-          number(motion.startTime) && motion.startTime >= 0 && motion.startTime <= project.duration &&
-          number(motion.duration) && motion.duration > 0 && motion.duration <= 30 &&
+          timeValue(motion.startTime) && motion.startTime <= project.duration &&
+          timeValue(motion.duration) && motion.duration > 0 && motion.startTime + motion.duration <= project.duration + .001 &&
           number(motion.distance) && motion.distance >= 0 && motion.distance <= 500 && number(motion.spin) &&
           typeof motion.face === 'boolean' && pose(motion.startPose) &&
           Array.isArray(motion.sourcePoints) && motion.sourcePoints.length >= 1 && motion.sourcePoints.length <= 1000 &&
           motion.sourcePoints.every(point => point && number(point.x) && number(point.y)) &&
-          (motion.baseKeys === undefined || Array.isArray(motion.baseKeys) && motion.baseKeys.length <= 1000 && motion.baseKeys.every(key => pose(key) && number(key.t) && key.t >= 0 && key.t <= project.duration)));
+          (motion.baseKeys === undefined || Array.isArray(motion.baseKeys) && motion.baseKeys.length <= 1000 && motion.baseKeys.every(key => pose(key) && timeValue(key.t) && key.t <= project.duration)));
       });
     } catch {return false;}
   }
@@ -53,8 +55,8 @@
     stop(); assetCache.clear(); scene = project;
     selected = scene.shapes.some(layer => layer.id === selection) ? selection : scene.shapes[0]?.id;
     time = resetTime ? 0 : Math.min(time, scene.duration);
-    motionMode = motionDraft = motionGuide = selectedMotionId = null;
-    $('stage').classList.remove('motion-mode'); refresh();
+    motionMode = motionDraft = motionGuide = selectedMotionId = selectedRotationId = null;
+    $('stage').classList.remove('motion-mode'); refresh(); recordSceneChange('automation');
   }
   function newLayer(args, type = args.type) {
     const width = args.w ?? (type === 'text' ? 240 : 160);

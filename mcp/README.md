@@ -59,7 +59,7 @@ Try this prompt:
 
 > Use Forma to inspect my current scene and save a JSON backup. Make a 4-second animation with a coral circle moving left to right on a dark background. Add a caption that follows it. Show me previews at 0, 2, and 4 seconds, then export the animated SVG and WebM.
 
-Coordinates describe each layer's **center**, in pixels from the top left. Width/height are pixels, rotation is degrees, opacity is 0–100, and keyframe time is seconds. Canvas dimensions support 100–4000 pixels and scene durations 1–30 seconds. Limits are 100 layers and 1000 keyframes per layer. For example:
+Coordinates describe each layer's **center**, in pixels from the top left. Width/height are pixels, rotation is degrees, opacity is 0–100, and keyframe time is seconds. Canvas dimensions support 100–4000 pixels and scene durations of 1 second or longer. Limits are 100 layers and 1000 keyframes per layer. For example:
 
 ```json
 {
@@ -77,9 +77,9 @@ Text linked to another layer follows its transform; its offset is derived from i
 
 Exports go to **Documents/Forma Exports** by default; each export returns its absolute path and byte count. Only simple filenames with the correct extension are accepted. Existing exports require `overwrite=true`. Set `FORMA_EXPORT_DIR` in the **desktop app's** environment to choose another export folder. Do not set it only on the MCP server.
 
-Projects may be up to 64 MB. Image imports may be up to 30 MB; SVG markup must be smaller than 5 MB. Files to import must use absolute local paths. PNG previews are capped at 1600 pixels per dimension; PNG exports use full scene dimensions. WebM records one complete loop in real time and keeps the app open until completion. Animated SVG uses poster frames for video layers, matching the editor's existing export behavior. Audio is not exported.
+Forma does not impose a file size cap on project or image imports; very large files still depend on available device memory and disk space. Files to import must use absolute local paths. PNG previews are capped at 1600 pixels per dimension; PNG exports use full scene dimensions. WebM records one complete loop in real time and keeps the app open until completion. Animated SVG uses poster frames for video layers, matching the editor's existing export behavior. Audio is not exported.
 
-The bridge is disabled by default, listens only on `127.0.0.1` at a random port, and requires a random local bearer token. Browser origins are rejected. There is no arbitrary JavaScript execution or remote URL import tool. Requests are serialized and validated against the contract before reaching the editor. Turning MCP off blocks new/queued commands; a command already running may finish. Closing Forma removes its discovery file. Each successful MCP scene edit writes recovery data; normal desktop edits are saved on close.
+The bridge is disabled by default, listens only on `127.0.0.1` at a random port, and requires a random local bearer token. Browser origins are rejected. There is no arbitrary JavaScript execution or remote URL import tool. Requests are serialized and validated against the contract before reaching the editor. Turning MCP off blocks new/queued commands; a command already running may finish. Closing Forma removes its discovery file. Scene edits are autosaved locally while you work.
 
 The token is discovered automatically from:
 

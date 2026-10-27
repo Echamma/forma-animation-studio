@@ -68,6 +68,11 @@ app.whenReady().then(async () => {
     const caption = live.transforms.find(layer => layer.id === text.id);
     assert.equal(caption.x, 560); assert.ok(Math.abs(caption.y - 180) < .001);
     await rejected('forma_set_playback', {action:'seek', time:2}, 'INVALID_TIME');
+    await call('forma_update_scene', {duration: 20000});
+    assert.equal((await call('forma_get_scene')).project.duration, 20000);
+    await call('forma_set_playback', {action:'seek', time: 15000});
+    await call('forma_update_scene', {duration: 1});
+
     await call('forma_set_playback', {action:'play'});
     assert.equal((await call('forma_get_scene')).playing, true);
     await call('forma_set_playback', {action:'pause'});

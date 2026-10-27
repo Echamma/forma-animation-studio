@@ -8,7 +8,7 @@
       "id": {"type": "string", "minLength": 1, "maxLength": 100, "description": "Layer ID returned by Forma."},
       "color": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$", "description": "Six digit hex color."},
       "dimension": {"type": "integer", "minimum": 100, "maximum": 4000, "description": "Canvas dimension in pixels."},
-      "duration": {"type": "number", "minimum": 1, "maximum": 30, "description": "Scene length in seconds."},
+      "duration": {"type": "number", "minimum": 1, "description": "Scene length in seconds; no fixed upper limit."},
       "coordinate": {"type": "number", "minimum": -10000, "maximum": 10000, "description": "Position in pixels, measured from the canvas top left. Layers are positioned by their centers."},
       "size": {"type": "number", "exclusiveMinimum": 0, "maximum": 10000, "description": "Layer size in pixels."},
       "rotation": {"type": "number", "minimum": -10000, "maximum": 10000, "description": "Rotation in degrees."},
@@ -17,7 +17,7 @@
       "name": {"type": "string", "minLength": 1, "maxLength": 99, "description": "Display name of the layer."},
       "text": {"type": "string", "maxLength": 120, "description": "Text displayed by a text layer."},
       "file": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Absolute local file path on the computer running Forma."},
-      "time": {"type": "number", "minimum": 0, "maximum": 30, "description": "Time in seconds within the scene duration."},
+      "time": {"type": "number", "minimum": 0, "description": "Time in seconds within the scene duration."},
       "keyframe": {
         "type": "object", "additionalProperties": false, "required": ["t", "x", "y", "w", "h", "r", "o"],
         "properties": {"t": {"$ref": "#/components/schemas/time"}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}, "w": {"$ref": "#/components/schemas/size"}, "h": {"$ref": "#/components/schemas/size"}, "r": {"$ref": "#/components/schemas/rotation"}, "o": {"$ref": "#/components/schemas/opacity"}}
@@ -77,12 +77,12 @@
       "responses": {"200": {"description": "Saved path and byte count"}}
     }},
     "/tools/forma_open_project": {"post": {
-      "operationId": "forma_open_project", "summary": "Open an editable Forma JSON file from an absolute local path (up to 64 MB). Replaces the current scene and requires replace=true. Invalid projects leave the scene intact.", "x-destructive": true,
+      "operationId": "forma_open_project", "summary": "Open an editable Forma JSON file from an absolute local path. Replaces the current scene and requires replace=true. Invalid projects leave the scene intact.", "x-destructive": true,
       "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["file", "replace"], "properties": {"file": {"$ref": "#/components/schemas/file"}, "replace": {"type": "boolean", "const": true, "description": "Explicitly confirm replacing the current scene."}}}}}},
       "responses": {"200": {"description": "Loaded scene snapshot"}}
     }},
     "/tools/forma_import_asset": {"post": {
-      "operationId": "forma_import_asset", "summary": "Import a PNG, JPEG, WebP, or SVG file (up to 30 MB) as an embedded layer. SVG is sanitized. Returns its ID for later keyframes. Video layers can be imported through the desktop UI.",
+      "operationId": "forma_import_asset", "summary": "Import a PNG, JPEG, WebP, or SVG file as an embedded layer. SVG is sanitized. Returns its ID for later keyframes. Video layers can be imported through the desktop UI.",
       "requestBody": {"content": {"application/json": {"schema": {"type": "object", "required": ["file"], "properties": {"file": {"$ref": "#/components/schemas/file"}, "name": {"$ref": "#/components/schemas/name"}, "x": {"$ref": "#/components/schemas/coordinate"}, "y": {"$ref": "#/components/schemas/coordinate"}, "w": {"$ref": "#/components/schemas/size"}, "h": {"$ref": "#/components/schemas/size"}}}}}},
       "responses": {"200": {"description": "Imported layer"}}
     }}

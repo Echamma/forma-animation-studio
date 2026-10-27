@@ -8,33 +8,30 @@ function createBridge({discoveryFile, exportDirectory, dispatch, checkpoint}) {
   let server, token, generation = 0, queue = Promise.resolve();
   const exportRoot = path.resolve(exportDirectory);
   const status = () => ({enabled: !!server?.listening, exportDirectory: exportRoot});
-  async function localFile(file, limit, extensions) {
+  async function localFile(file, extensions) {
     if (!path.isAbsolute(file)) throw fail('INVALID_PATH', 'Use an absolute local path.');
     if (!extensions.includes(path.extname(file).toLowerCase())) throw fail('UNSUPPORTED_FILE', 'Supported file extensions: ' + extensions.join(', '));
     const handle = await fs.open(file, 'r');
     try {
       const stat = await handle.stat();
-      if (!stat.isFile() || stat.size > limit) throw fail('FILE_TOO_LARGE', 'File is not regular or exceeds ' + limit / 1024 / 1024 + ' MB.');
-      const buffer = await handle.readFile();
-      if (buffer.length > limit) throw fail('FILE_TOO_LARGE', 'File grew beyond the size limit.');
-      return buffer;
+      if (!stat.isFile()) throw fail('INVALID_FILE', 'Path must point to a regular file.');
+      return await handle.readFile();
     } finally { await handle.close(); }
   }
   async function invoke(name, args) {
     validate(name, args);
     let payload = {...args};
     if (name === 'forma_open_project') {
-      const bytes = await localFile(args.file, 64 * 1024 * 1024, ['.json']);
+      const bytes = await localFile(args.file, ['.json']);
       try { payload.project = JSON.parse(bytes.toString('utf8')); }
       catch { throw fail('INVALID_PROJECT', 'This file is not valid JSON.'); }
     }
     if (name === 'forma_import_asset') {
-      const bytes = await localFile(args.file, 30 * 1024 * 1024, ['.png', '.jpg', '.jpeg', '.webp', '.svg']);
+      const bytes = await localFile(args.file, ['.png', '.jpg', '.jpeg', '.webp', '.svg']);
       const ext = path.extname(args.file).toLowerCase();
       payload.name ||= path.basename(args.file).slice(0, 99);
       payload.assetType = ext === '.svg' ? 'svg' : 'image';
       if (ext === '.svg') {
-        if (bytes.length >= 5000000) throw fail('FILE_TOO_LARGE', 'SVG markup must be smaller than 5 MB.');
         payload.svgSource = bytes.toString('utf8');
       } else {
         const png = bytes.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
