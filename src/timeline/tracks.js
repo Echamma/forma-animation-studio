@@ -15,6 +15,16 @@ import {closeDrawer, showInspectorTab} from '../ui/tabs.js';
 
 const percent = t => `${(t / editor.scene.duration) * 100}%`;
 
+// A small picture of a layer for the Layers list and the timeline: its fill color or its artwork.
+function swatchFor(s) {
+  const sw = document.createElement('span');
+  sw.className = 'swatch' + (isAsset(s) ? ' asset' : '');
+  sw.setAttribute('aria-hidden', 'true');
+  if (isAsset(s)) sw.style.backgroundImage = `url("${assetHref(s).replace(/"/g, '%22')}")`;
+  else sw.style.background = s.color;
+  return sw;
+}
+
 export function selectClip(s) {
   stop();
   editor.selected = s.id;
@@ -39,10 +49,7 @@ export function lists() {
   for (const s of editor.scene.shapes) {
     const b = document.createElement('button');
     b.className = 'layer' + (chosen.has(s.id) ? ' active' : '');
-    const sw = document.createElement('span');
-    sw.className = 'swatch' + (isAsset(s) ? ' asset' : '');
-    if (isAsset(s)) sw.style.backgroundImage = `url("${assetHref(s).replace(/"/g, '%22')}")`;
-    else sw.style.background = s.color;
+    const sw = swatchFor(s);
     const name = document.createElement('span');
     name.textContent = s.name;
     const end = document.createElement('span');
@@ -65,6 +72,7 @@ export function lists() {
       label.className = 'track-name';
       label.textContent = s.trackId ? s.name.replace(/ \d+$/, '') : s.name;
       label.title = label.textContent;
+      label.prepend(swatchFor(s));
       const line = document.createElement('div');
       line.className = 'track-line';
       row.append(label, line);
@@ -143,13 +151,13 @@ export function lists() {
         end = reappearAt(s);
       visibilityRow.className = 'track motion-track disappear-track' + (editor.selected === s.id ? ' active' : '');
       visibilityLabel.className = 'track-name';
-      visibilityLabel.textContent = '↳ Disappear';
+      visibilityLabel.textContent = 'Fade out';
       visibilityLine.className = 'track-line';
       bar.className = 'motion-bar disappear-bar';
       bar.style.left = percent(d.startTime);
       bar.style.width = `${Math.max(1.5, ((Math.min(end, editor.scene.duration) - d.startTime) / editor.scene.duration) * 100)}%`;
       bar.title = `Fade out ${d.startTime.toFixed(2)}–${(d.startTime + d.duration).toFixed(2)} s${Number.isFinite(end) ? `; reappear ${end.toFixed(2)} s` : '; stay hidden'}`;
-      bar.textContent = '◌ Hidden';
+      bar.textContent = 'Hidden';
       bar.onclick = e => {
         e.stopPropagation();
         stop();
@@ -170,7 +178,7 @@ export function lists() {
       motionRow.dataset.motionId = m.id;
       const motionLabel = document.createElement('span');
       motionLabel.className = 'track-name';
-      motionLabel.textContent = `↳ ${m.type === 'path' ? 'Path' : 'Move'} ${i + 1}`;
+      motionLabel.textContent = `${m.type === 'path' ? 'Path' : 'Move'} ${i + 1}`;
       const motionLine = document.createElement('div');
       motionLine.className = 'track-line';
       const clip = document.createElement('button');
@@ -202,7 +210,7 @@ export function lists() {
       rotationRow.dataset.rotationId = clip.id;
       const rotationLabel = document.createElement('span');
       rotationLabel.className = 'track-name';
-      rotationLabel.textContent = `↳ Rotation ${i + 1}`;
+      rotationLabel.textContent = `Spin ${i + 1}`;
       const rotationLine = document.createElement('div');
       rotationLine.className = 'track-line';
       const bar = document.createElement('button');
@@ -211,7 +219,7 @@ export function lists() {
       bar.style.width = percent(clip.duration);
       bar.title = `Rotation ${clip.degrees}° · ${clip.startTime.toFixed(2)}–${(clip.startTime + clip.duration).toFixed(2)} s`;
       const text = document.createElement('span');
-      text.textContent = `↻ ${clip.degrees}°`;
+      text.textContent = `Spin ${clip.degrees}°`;
       const handle = document.createElement('span');
       handle.className = 'motion-handle';
       handle.title = 'Drag to change rotation length';

@@ -19,16 +19,19 @@ function showDrawerTab(name, focus = false) {
     if (active && focus) tab.focus();
   }
   $('tool-drawer').scrollTop = 0;
+  // Only the rail button for the open drawer tab shows as expanded.
+  const open = document.querySelector('main').classList.contains('drawer-open');
+  $('open-create').setAttribute('aria-expanded', String(open && name === 'create'));
+  $('open-layers').setAttribute('aria-expanded', String(open && name === 'layers'));
 }
 let drawerReturnFocus = null;
 function openDrawer(name) {
   drawerReturnFocus = $(name === 'create' ? 'open-create' : 'open-layers');
-  showDrawerTab(name);
   document.querySelector('main').classList.add('drawer-open');
+  showDrawerTab(name);
   $('tool-drawer').setAttribute('aria-hidden', 'false');
   $('tool-drawer').removeAttribute('inert');
   $('drawer-scrim').hidden = false;
-  for (const id of ['open-create', 'open-layers']) $(id).setAttribute('aria-expanded', 'true');
   $('close-drawer').focus();
 }
 export function closeDrawer() {
@@ -53,7 +56,7 @@ export function setupTabs() {
     };
   }
   showInspectorTab('edit');
-  $('help-open').onclick = $('guide-open').onclick = () => $('help-dialog').showModal();
+  $('help-open').onclick = $('guide-open').onclick = $('guide-open-start').onclick = () => $('help-dialog').showModal();
   $('open-create').onclick = () => openDrawer('create');
   $('open-layers').onclick = () => openDrawer('layers');
   $('close-drawer').onclick = $('drawer-scrim').onclick = closeDrawer;

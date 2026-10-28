@@ -5,7 +5,40 @@ import {render} from '../render/canvas.js';
 import {editor} from '../state.js';
 import {lists} from '../timeline/tracks.js';
 import {refresh} from './refresh.js';
-import {closeDrawer} from './tabs.js';
+import {closeDrawer, showInspectorTab} from './tabs.js';
+
+// With a layer selected, new text follows it; otherwise it is free text in the middle of the canvas.
+export function addText() {
+  const target = editor.scene.shapes.find(s => s.id === editor.selected);
+  if (target && target.type !== 'text') return $('add-linked-text').click();
+  stop();
+  const fontSize = Math.round(Math.max(24, Math.min(editor.scene.width, editor.scene.height) * 0.08)),
+    textWidth = fontSize * 4.2,
+    id = crypto.randomUUID();
+  editor.scene.shapes.push({
+    id,
+    name: 'Your text',
+    type: 'text',
+    text: 'Your text',
+    linkId: '',
+    offsetX: 0,
+    offsetY: 0,
+    textWidth,
+    fontSize,
+    color: '#1F3D2B',
+    ease: 'smooth',
+    keys: [{t: 0, x: editor.scene.width / 2, y: editor.scene.height / 2, w: textWidth, h: fontSize, r: 0, o: 100}]
+  });
+  editor.selected = id;
+  editor.selectedMotionId = editor.selectedRotationId = null;
+  editor.motionGuide = null;
+  closeDrawer();
+  showInspectorTab('edit');
+  refresh();
+  $('text-content').focus();
+  $('text-content').select();
+  toast('Text added. Type your words in the panel on the right.');
+}
 
 export function setupLayers() {
   document.querySelectorAll('[data-add]').forEach(
@@ -62,6 +95,7 @@ export function setupLayers() {
     editor.selectedMotionId = editor.selectedRotationId = null;
     editor.motionGuide = null;
     closeDrawer();
+    showInspectorTab('edit');
     refresh();
     $('text-content').focus();
     $('text-content').select();

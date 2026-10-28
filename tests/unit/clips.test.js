@@ -2,7 +2,7 @@ import {test, beforeEach} from 'node:test';
 import assert from 'node:assert/strict';
 import {editor} from '../../src/state.js';
 import {clipEnd, clipStart, inClip, state} from '../../src/model/animation.js';
-import {continueAfter, duplicateLayer, shiftLayer, splitAt, trackClips, trimClip} from '../../src/model/clips.js';
+import {arrangeAsPoses, continueAfter, duplicateLayer, shiftLayer, splitAt, trackClips, trimClip} from '../../src/model/clips.js';
 import {valid} from '../../src/model/validate.js';
 
 const PNG = 'data:image/png;base64,iVBORw0KGgo=';
@@ -190,4 +190,19 @@ test('the clip fields are validated', () => {
   assert.ok(!valid({...p, shapes: [image({outTime: 9})]}));
   assert.ok(!valid({...p, shapes: [image({trackId: ''})]}));
   assert.ok(!valid({...p, shapes: [image({mediaStart: -1})]}));
+});
+
+test('arranging pictures as poses plays them one after another on one track, at the first pose spot', () => {
+  const poses = ['a', 'b', 'c'].map((id, i) => image({id, keys: [{t: 0, x: 100 + i * 50, y: 100, w: 50, h: 80, r: 0, o: 100}]}));
+  editor.scene.shapes.push(...poses);
+  editor.scene.duration = 1;
+  arrangeAsPoses(poses);
+  assert.deepEqual(
+    poses.map(s => [s.name, s.inTime, s.outTime, s.keys[0].t, s.keys[0].x]),
+    [['Pose 1', 0, 0.5, 0, 100], ['Pose 2', 0.5, 1, 0.5, 100], ['Pose 3', 1, 1.5, 1, 100]]
+  );
+  assert.equal(new Set(poses.map(s => s.trackId)).size, 1);
+  assert.equal(editor.scene.duration, 1.5);
+  assert.deepEqual(visibleAt(0.75), ['b']);
+  assert.ok(valid(editor.scene));
 });

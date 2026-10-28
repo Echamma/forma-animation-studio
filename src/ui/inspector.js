@@ -1,5 +1,5 @@
 import {$, toast} from '../dom.js';
-import {assetCache, isAsset, mediaElement, mediaKey} from '../media.js';
+import {assetCache, assetHref, isAsset, mediaElement, mediaKey} from '../media.js';
 import {colorAt, editableState, props, rawState, rotationAt, state} from '../model/animation.js';
 import {key} from '../model/keyframes.js';
 import {stop} from '../playback.js';
@@ -11,6 +11,7 @@ import {refresh} from './refresh.js';
 import {clipFields} from './clips.js';
 import {arrangeFields} from './arrange.js';
 import {selectedLayers} from './selection.js';
+import {easingFields} from './easing-panel.js';
 
 export function fields() {
   const s = editor.scene.shapes.find(s => s.id === editor.selected),
@@ -18,8 +19,11 @@ export function fields() {
     isText = s?.type === 'text';
   $('selected-title').textContent = s ? s.name : 'Select a layer';
   $('inspector-hint').textContent = s
-    ? `Editing at ${editor.time.toFixed(2)} s · Open Animate to add movement.`
-    : 'Choose a layer on the canvas or in Layers.';
+    ? `Changes save as a keyframe at ${editor.time.toFixed(2)} s`
+    : 'Choose a layer on the canvas, or add one with the tools on the left.';
+  const swatch = $('selected-swatch');
+  swatch.style.background = !s || asset ? '' : colorAt(s);
+  swatch.style.backgroundImage = asset ? `url("${assetHref(s).replace(/"/g, '%22')}")` : '';
   $('base-rotation').disabled = !s;
   $('base-rotation').value = s ? Math.round((s.baseRotation || 0) * 100) / 100 : '';
   $('layer-blur').disabled = !s;
@@ -29,6 +33,12 @@ export function fields() {
     $(p).disabled = !s;
     $(p).value = s ? Math.round((p === 'o' ? editableState(s)[p] : state(s)[p]) * 100) / 100 : '';
   }
+  $('o-value').textContent = s ? `${Math.round(editableState(s).o)}%` : '';
+  const pose = s && state(s);
+  $('position-summary').textContent = pose
+    ? `${Math.round(pose.x)}, ${Math.round(pose.y)} · ${Math.round(pose.w)} × ${Math.round(pose.h)} · ${Math.round(pose.r)}°`
+    : '';
+  easingFields(s);
   for (const id of ['ease', 'delete', 'keyframe', 'delete-key', 'draw-arrow', 'record-path']) $(id).disabled = !s;
   $('drop-item').disabled = !s || (isText && !!s.linkId);
   $('color').disabled = !s || asset;
@@ -55,7 +65,7 @@ export function fields() {
     $('text-content').value = s.text || '';
     const link = $('text-link');
     link.replaceChildren();
-    if (!s.linkId) link.append(new Option('Not linked', '', true, true));
+    if (!s.linkId) link.append(new Option('Nothing (free text)', '', true, true));
     for (const target of editor.scene.shapes.filter(x => x.id !== s.id && x.type !== 'text')) {
       const option = document.createElement('option');
       option.value = target.id;
@@ -108,6 +118,7 @@ export function setupInspector() {
       // With several layers selected, position moves them all by the same amount; other values apply to each.
       const shift = p === 'x' || p === 'y' ? v - state(s)[p] : 0;
       setProperty(s, p, v);
+      if (p === 'o') $('o-value').textContent = `${Math.round(v)}%`;
       for (const other of others) setProperty(other, p, p === 'x' || p === 'y' ? state(other)[p] + shift : v);
       render();
       lists();

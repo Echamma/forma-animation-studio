@@ -7,6 +7,7 @@ import {editor} from '../state.js';
 import {lists} from '../timeline/tracks.js';
 import {fields} from './inspector.js';
 import {sizePasteboard} from './workspace.js';
+import {sceneLabel} from '../playback.js';
 
 export function refresh() {
   const v = pasteboard();
@@ -25,8 +26,7 @@ export function refresh() {
     .querySelectorAll('[data-bg]')
     .forEach(b => b.classList.toggle('active', b.dataset.bg.toLowerCase() === editor.scene.bg.toLowerCase()));
   $('format').value = `${editor.scene.width}x${editor.scene.height}`;
-  $('canvas-size').innerHTML =
-    `${editor.scene.width} × ${editor.scene.height} <span> • </span> ${editor.playing ? 'PREVIEW' : 'EDIT VIEW'}`;
+  $('canvas-size').textContent = sceneLabel();
   $('scrub').max = editor.scene.duration;
   document
     .querySelectorAll('.ruler span')

@@ -2,7 +2,7 @@ import {$, toast} from '../dom.js';
 import {editableState} from '../model/animation.js';
 import {applyMotion, extendSceneTo, motionGuideFor, restoreMotionKeys} from '../model/keyframes.js';
 import {recordSceneChange} from '../persistence.js';
-import {stop} from '../playback.js';
+import {showPlaying, stop} from '../playback.js';
 import {render} from '../render/canvas.js';
 import {editor} from '../state.js';
 import {refresh} from '../ui/refresh.js';
@@ -188,8 +188,7 @@ export function previewMotion(m) {
   editor.previewEnd = Math.min(editor.scene.duration, m.startTime + m.duration);
   editor.playing = true;
   editor.last = performance.now();
-  $('play').textContent = 'Ⅱ';
-  $('play').setAttribute('aria-label', 'Pause preview');
+  showPlaying('Pause preview');
   render();
 }
 let editPreviewTimer;

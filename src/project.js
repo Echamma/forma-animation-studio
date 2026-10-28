@@ -7,6 +7,7 @@ import {stop} from './playback.js';
 import {editor} from './state.js';
 import {sanitizeSvg} from './svg/sanitize.js';
 import {refresh} from './ui/refresh.js';
+import {pickPoses} from './ui/import.js';
 
 export function example() {
   editor.scene = {
@@ -78,6 +79,90 @@ export function syncProjectName() {
   document.title = `${editor.scene.projectName} — Forma`;
 }
 const projectDialog = $('projects-dialog');
+const initials = name => name.trim().split(/\s+/).slice(0, 2).map(word => word[0]).join('').toUpperCase() || 'F';
+
+// The start screen: what to make next, the canvas shape, and the projects saved on this device.
+export async function showStartScreen() {
+  try {
+    if (window.formaDesktop) await window.FormaSession.flushAutosave();
+    await listProjects();
+  } catch (error) {
+    $('projects-status').textContent = error.message || 'Could not list your projects';
+  }
+  if (!projectDialog.open) projectDialog.showModal();
+}
+
+async function listProjects() {
+  const list = $('projects-list');
+  list.replaceChildren();
+  $('projects-status').textContent = '';
+  if (!window.formaDesktop) {
+    list.textContent = 'The desktop app keeps your projects here. In the browser, use Open a file.';
+    return;
+  }
+  const projects = await window.formaDesktop.listProjects();
+  for (const item of projects) {
+    const button = document.createElement('button'),
+      thumb = document.createElement('span'),
+      text = document.createElement('span'),
+      title = document.createElement('b'),
+      meta = document.createElement('small');
+    button.type = 'button';
+    button.className = 'project-entry';
+    thumb.className = 'project-thumb';
+    thumb.setAttribute('aria-hidden', 'true');
+    thumb.textContent = initials(item.name);
+    title.textContent = item.name + (item.id === editor.scene.projectId ? ' · open now' : '');
+    meta.textContent = `${item.layerCount} layer${item.layerCount === 1 ? '' : 's'} · ${new Date(item.savedAt).toLocaleString()}`;
+    text.append(title, meta);
+    button.append(thumb, text);
+    button.onclick = async () => {
+      if (item.id === editor.scene.projectId) return projectDialog.close();
+      try {
+        await window.FormaSession.flushAutosave();
+        const saved = await window.formaDesktop.openLocalProject(item.id);
+        if (!saved || !restoreProject(saved)) throw Error('That project could not be opened');
+        recordSceneChange('switch project');
+        await window.FormaSession.flushAutosave();
+        projectDialog.close();
+        toast('Project opened');
+      } catch (error) {
+        $('projects-status').textContent = error.message;
+      }
+    };
+    list.append(button);
+  }
+  if (!projects.length) list.textContent = 'Nothing saved yet. Projects appear here as you work.';
+}
+
+// A new project: the example shapes, or an empty canvas, in the shape chosen on the start screen.
+export async function newProject(kind) {
+  try {
+    await window.FormaSession.flushAutosave();
+    example();
+    if (kind !== 'shapes') {
+      editor.scene.shapes = [];
+      editor.selected = undefined;
+    }
+    const format = document.querySelector('input[name="start-format"]:checked')?.value;
+    if (format && format !== `${editor.scene.width}x${editor.scene.height}`) {
+      $('format').value = format;
+      $('format').dispatchEvent(new Event('change'));
+    }
+    editor.scene.projectId = crypto.randomUUID();
+    editor.scene.projectName = 'Untitled exploration';
+    syncProjectName();
+    refresh();
+    recordSceneChange('new project');
+    await window.FormaSession.flushAutosave();
+    if (projectDialog.open) projectDialog.close();
+    toast(kind === 'shapes' ? 'New project created' : 'Empty project created. Add something with the tools on the left.');
+    return true;
+  } catch (error) {
+    toast(error.message || 'Could not create a project');
+    return false;
+  }
+}
 
 export function setupProject() {
   $('open').onclick = () => $('file').click();
@@ -90,59 +175,11 @@ export function setupProject() {
     syncProjectName();
     recordSceneChange('rename project');
   });
-  $('projects').onclick = async () => {
-    try {
-      await window.FormaSession.flushAutosave();
-      const projects = await window.formaDesktop.listProjects(),
-        list = $('projects-list');
-      list.replaceChildren();
-      for (const item of projects) {
-        const button = document.createElement('button');
-        button.className = 'project-entry';
-        const title = document.createElement('b'),
-          meta = document.createElement('small');
-        title.textContent = item.name + (item.id === editor.scene.projectId ? ' · Current' : '');
-        meta.textContent = `${item.layerCount} layers · ${new Date(item.savedAt).toLocaleString()}`;
-        button.append(title, meta);
-        button.onclick = async () => {
-          if (item.id === editor.scene.projectId) {
-            projectDialog.close();
-            return;
-          }
-          try {
-            await window.FormaSession.flushAutosave();
-            const saved = await window.formaDesktop.openLocalProject(item.id);
-            if (!saved || !restoreProject(saved)) throw Error('Project could not be opened');
-            recordSceneChange('switch project');
-            await window.FormaSession.flushAutosave();
-            projectDialog.close();
-            toast('Project opened');
-          } catch (error) {
-            $('projects-status').textContent = error.message;
-          }
-        };
-        list.append(button);
-      }
-      if (!projects.length) list.textContent = 'No saved projects yet.';
-      $('projects-status').textContent = '';
-      projectDialog.showModal();
-    } catch (error) {
-      toast(error.message || 'Could not list projects');
-    }
-  };
-  $('new-project').onclick = async () => {
-    try {
-      await window.FormaSession.flushAutosave();
-      example();
-      editor.scene.projectId = crypto.randomUUID();
-      editor.scene.projectName = 'Untitled exploration';
-      syncProjectName();
-      recordSceneChange('new project');
-      await window.FormaSession.flushAutosave();
-      toast('New project created');
-    } catch (error) {
-      toast(error.message || 'Could not create project');
-    }
+  $('projects').onclick = () => showStartScreen();
+  $('new-project').onclick = () => newProject('shapes');
+  $('new-empty').onclick = () => newProject('empty');
+  $('new-stop-motion').onclick = async () => {
+    if (await newProject('empty')) pickPoses();
   };
   $('file').onchange = async e => {
     const f = e.target.files[0];

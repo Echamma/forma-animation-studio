@@ -148,6 +148,19 @@ export function splitAt(s, t) {
   return second;
 }
 
+// Pictures picked in order become a stop-motion sequence: one track, each pose shown for `length` seconds in one spot.
+export function arrangeAsPoses(layers, length = 0.5) {
+  const trackId = crypto.randomUUID(),
+    {x, y} = layers[0].keys[0];
+  layers.forEach((s, i) => {
+    const start = round(i * length);
+    Object.assign(s, {name: `Pose ${i + 1}`, trackId, inTime: start, outTime: round(start + length)});
+    s.keys = [{...s.keys[0], t: start, x, y}];
+  });
+  extendSceneTo(round(layers.length * length));
+  return layers;
+}
+
 // An independent copy at the same time, nudged so it does not hide the original.
 export function duplicateLayer(s, offset = 20) {
   const copy = cloneLayer(s);

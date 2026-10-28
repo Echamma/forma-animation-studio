@@ -4,6 +4,7 @@ import {clipEnd, clipStart, colorAt, inClip, state} from '../model/animation.js'
 import {resizeCursor, resizeDirections} from '../model/geometry.js';
 import {editor} from '../state.js';
 import {selectedLayers} from '../ui/selection.js';
+import {showQuickAnimate} from '../ui/rail.js';
 
 export function geometry(s, p, exporting = false) {
   if (s.type === 'video' && !exporting) {
@@ -103,7 +104,7 @@ export function render() {
       orient: 'auto-start-reverse'
     });
   clip.append(element('rect', {x: 0, y: 0, width: editor.scene.width, height: editor.scene.height}));
-  marker.append(element('path', {d: 'M 0 0 L 10 5 L 0 10 z', fill: '#d2f583'}));
+  marker.append(element('path', {d: 'M 0 0 L 10 5 L 0 10 z', fill: '#2F6B45'}));
   defs.append(clip, marker);
   svg.append(defs);
   svg.append(
@@ -266,6 +267,8 @@ export function render() {
       class: 'frame-edge'
     })
   );
-  $('time').innerHTML = `${editor.time.toFixed(2)} <span>/ ${editor.scene.duration.toFixed(2)} s</span>`;
+  $('time').innerHTML = `${editor.time.toFixed(2)} s <span>of ${editor.scene.duration.toFixed(2)} s</span>`;
+  $('timeline-body').style.setProperty('--progress', Math.min(1, editor.time / editor.scene.duration));
+  showQuickAnimate();
   $('scrub').value = editor.time;
 }

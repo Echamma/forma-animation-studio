@@ -3,7 +3,7 @@ import {assetCache} from './media.js';
 import {migrateMedia} from './media-library.js';
 import {valid} from './model/validate.js';
 import {stop} from './playback.js';
-import {ensureProjectIdentity, syncProjectName} from './project.js';
+import {ensureProjectIdentity, showStartScreen, syncProjectName} from './project.js';
 import {editor} from './state.js';
 import {sanitizeSvg} from './svg/sanitize.js';
 import {closeKeyframeMenu} from './ui/keyframe-menu.js';
@@ -272,12 +272,16 @@ export function setupPersistence() {
       if (window.formaDesktop?.autosave) await sendAutosave(autosavePayload());
     }
   };
+  let restored = false;
   window.FormaSession.ready = (
     window.formaDesktop
       ? window.formaDesktop
           .loadRecovery()
           .then(saved => {
-            if (saved && restoreProject(saved)) toast('Previous animation restored');
+            if (saved && restoreProject(saved)) {
+              restored = true;
+              toast('Previous animation restored');
+            }
           })
           .catch(() => toast('Could not restore the previous session'))
       : Promise.resolve()
@@ -287,5 +291,7 @@ export function setupPersistence() {
     lastProjectJson = packScene();
     historyReady = true;
     if (!window.formaDesktop) $('autosave-status').textContent = 'Browser preview only';
+    // A first launch (nothing to restore) opens on the start screen instead of a sample scene.
+    if (!restored && !window.formaDesktop?.testMode) showStartScreen();
   });
 }

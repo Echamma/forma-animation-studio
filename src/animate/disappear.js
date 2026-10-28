@@ -2,7 +2,7 @@ import {$, toast} from '../dom.js';
 import {animationClips, reappearAt} from '../model/animation.js';
 import {extendSceneTo} from '../model/keyframes.js';
 import {recordSceneChange} from '../persistence.js';
-import {stop} from '../playback.js';
+import {showPlaying, stop} from '../playback.js';
 import {render} from '../render/canvas.js';
 import {editor} from '../state.js';
 import {refresh} from '../ui/refresh.js';
@@ -138,8 +138,7 @@ export function setupDisappear() {
     if (!Number.isFinite(editor.previewEnd)) editor.previewEnd = editor.scene.duration;
     editor.playing = true;
     editor.last = performance.now();
-    $('play').textContent = 'Ⅱ';
-    $('play').setAttribute('aria-label', 'Pause preview');
+    showPlaying('Pause preview');
     render();
   };
 }

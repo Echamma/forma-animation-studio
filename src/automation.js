@@ -388,7 +388,7 @@ export function setupAutomation() {
   button.id = 'mcp-control';
   button.textContent = 'MCP off';
   button.title = 'Allow Codex or Claude to control this editor through Forma MCP';
-  $('open').before(button);
+  $('help-open').before(button);
   function showStatus(status) {
     button.textContent = status.enabled ? 'MCP on' : 'MCP off';
     button.setAttribute('aria-pressed', String(status.enabled));

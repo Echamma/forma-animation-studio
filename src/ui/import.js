@@ -1,6 +1,7 @@
 import {$, toast} from '../dom.js';
 import {mediaBlob, storeMedia} from '../media-library.js';
 import {MAX_LAYERS} from '../model/validate.js';
+import {arrangeAsPoses} from '../model/clips.js';
 import {recordSceneChange} from '../persistence.js';
 import {stop} from '../playback.js';
 import {editor} from '../state.js';
@@ -80,7 +81,8 @@ function fittedAssetSize(width, height) {
 }
 export async function importMediaFiles(files) {
   const items = [...files],
-    errors = [];
+    errors = [],
+    layers = [];
   let added = 0;
   stop();
   for (const file of items) {
@@ -140,6 +142,7 @@ export async function importMediaFiles(files) {
       shape.keys[0].y += offset;
       editor.scene.shapes.push(shape);
       editor.selected = id;
+      layers.push(shape);
       added++;
       refresh();
       recordSceneChange('import');
@@ -152,7 +155,27 @@ export async function importMediaFiles(files) {
     toast(
       `${added} media layer${added === 1 ? '' : 's'} added${errors.length ? `; ${errors.length} skipped (${errors[0]})` : ''}`
     );
-  return {added, errors};
+  return {added, errors, layers};
+}
+
+// The stop-motion start: pictures picked in order become poses on one track.
+let asPoses = false;
+export function pickPoses() {
+  asPoses = true;
+  $('asset-file').click();
+}
+export async function importPoses(files) {
+  const {layers} = await importMediaFiles(files),
+    pictures = layers.filter(s => s.type !== 'video');
+  if (!pictures.length) return pictures;
+  editor.scene.duration = Math.max(1, pictures.length * 0.5);
+  arrangeAsPoses(pictures);
+  editor.selected = pictures[0].id;
+  editor.time = 0;
+  refresh();
+  recordSceneChange('arrange poses');
+  toast(`${pictures.length} pose${pictures.length === 1 ? '' : 's'} added. Press play, or drag a pose to move it.`);
+  return pictures;
 }
 let mediaDragDepth = 0;
 
@@ -160,10 +183,14 @@ export function setupImport() {
   $('import-asset').onclick = () => $('asset-file').click();
   $('asset-file').multiple = true;
   $('asset-file').onchange = e => {
-    const files = [...e.target.files];
+    const files = [...e.target.files],
+      poses = asPoses;
+    asPoses = false;
     e.target.value = '';
-    importMediaFiles(files);
+    if (poses) importPoses(files);
+    else importMediaFiles(files);
   };
+  $('asset-file').addEventListener('cancel', () => (asPoses = false));
   document.addEventListener('dragenter', e => {
     if (!e.dataTransfer?.types?.includes('Files')) return;
     e.preventDefault();
