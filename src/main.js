@@ -21,6 +21,7 @@ import {example, setupProject} from './project.js';
 import {setupDialog} from './export/dialog.js';
 import {currentProjectJson, setupPersistence} from './persistence.js';
 import {setupAutomation} from './automation.js';
+import {setupCanopy} from './canopy.js';
 import * as animation from './model/animation.js';
 import * as geometry from './model/geometry.js';
 import * as keyframes from './model/keyframes.js';
@@ -70,6 +71,7 @@ example();
 requestAnimationFrame(tick);
 setupPersistence();
 setupAutomation();
+setupCanopy();
 
 // Test builds get one handle onto the editor's functions and state; tests evaluate their checks inside `with (__forma)`.
 if (window.formaDesktop?.testMode) {

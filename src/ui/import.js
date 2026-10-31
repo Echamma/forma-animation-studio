@@ -79,13 +79,15 @@ function fittedAssetSize(width, height) {
     ratio = Math.max(0.05, Math.min(20, width / height));
   return ratio >= 1 ? {w: max, h: max / ratio} : {w: max * ratio, h: max};
 }
-export async function importMediaFiles(files) {
-  const items = [...files],
-    errors = [],
+// A picked, dropped or pasted file. Canopy hands over sources whose media is already in the library (see canopy.js).
+const fileSource = file => ({name: file.name, type: file.type, text: () => file.text(), store: () => storeMedia(file)});
+export const importMediaFiles = files => importMediaSources([...files].map(fileSource));
+export async function importMediaSources(sources) {
+  const errors = [],
     layers = [];
   let added = 0;
   stop();
-  for (const file of items) {
+  for (const file of sources) {
     try {
       if (editor.scene.shapes.length >= MAX_LAYERS) throw Error(`Scene is full (${MAX_LAYERS} layers)`);
       const id = crypto.randomUUID(),
@@ -105,7 +107,7 @@ export async function importMediaFiles(files) {
           keys: [{t: 0, x: editor.scene.width / 2, y: editor.scene.height / 2, w: size.w, h: size.h, r: 0, o: 100}]
         };
       } else if (['video/mp4', 'video/webm', 'video/ogg'].includes(file.type) || /\.(mp4|webm|ogv)$/i.test(file.name)) {
-        const data = await storeMedia(file),
+        const data = await file.store(),
           info = await videoInfo(data),
           size = fittedAssetSize(info.width, info.height),
           poster = await mediaBlob(info.poster);
@@ -124,7 +126,7 @@ export async function importMediaFiles(files) {
         ['image/png', 'image/jpeg', 'image/webp'].includes(file.type) ||
         /\.(png|jpe?g|webp)$/i.test(file.name)
       ) {
-        const data = await storeMedia(file),
+        const data = await file.store(),
           info = await imageInfo(data),
           size = fittedAssetSize(info.width, info.height);
         shape = {

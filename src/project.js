@@ -119,11 +119,7 @@ async function listProjects() {
     button.onclick = async () => {
       if (item.id === editor.scene.projectId) return projectDialog.close();
       try {
-        await window.FormaSession.flushAutosave();
-        const saved = await window.formaDesktop.openLocalProject(item.id);
-        if (!saved || !restoreProject(saved)) throw Error('That project could not be opened');
-        recordSceneChange('switch project');
-        await window.FormaSession.flushAutosave();
+        await openSavedProject(item.id);
         projectDialog.close();
         toast('Project opened');
       } catch (error) {
@@ -134,6 +130,16 @@ async function listProjects() {
   }
   if (!projects.length) list.textContent = 'Nothing saved yet. Projects appear here as you work.';
 }
+
+// Switches to a project saved on this device (or, inside Canopy, in the open space).
+export async function openSavedProject(id) {
+  await window.FormaSession.flushAutosave();
+  const saved = await window.formaDesktop.openLocalProject(id);
+  if (!saved || !restoreProject(saved)) throw Error('That project could not be opened');
+  recordSceneChange('switch project');
+  await window.FormaSession.flushAutosave();
+}
+export const closeStartScreen = () => projectDialog.open && projectDialog.close();
 
 // A new project: the example shapes, or an empty canvas, in the shape chosen on the start screen.
 export async function newProject(kind) {

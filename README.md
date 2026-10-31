@@ -19,6 +19,7 @@ Install Node.js 22 and run `npm ci`, then `npm start`. The editor source lives i
 - `npm test` runs the unit tests (`tests/unit`, plain Node), then the Electron editor and MCP tests. Headless Linux needs Xvfb: `xvfb-run -a npm test`. `npm run test:unit` runs only the fast unit tests.
 - `npm run build` creates the AppImage and `.deb`; `npm run build:win` creates the Windows installer and portable `.exe`.
 - GitHub Actions tests every push and pull request on Ubuntu and Windows. Pushing a tag like `v1.2.0` that matches `package.json` builds, smoke-tests and publishes both platforms with SHA-256 checksums and update metadata. Pushing a branch never publishes anything.
+- The editor's main-process side (autosave, projects, media library, MCP bridge) lives in `app-host.cjs`. `main.cjs` creates it for the standalone app, and Canopy creates it to show Forma in one of its panes, with the space's own data folder. Inside Canopy, files sent from the space arrive as layers (`src/canopy.js`) and the sidebar opens the space's projects.
 
 ## Use
 
