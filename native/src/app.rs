@@ -15,6 +15,14 @@ use egui::{
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// What Electron Forma's export dialog can make.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportKind {
+    Video,
+    Picture,
+    Project,
+}
+
 fn new_id() -> String {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -39,6 +47,9 @@ pub struct Forma {
     last_tick: Instant,
     edited_at: Option<Instant>,
     show_projects: bool,
+    show_export: bool,
+    export_kind: ExportKind,
+    video_settings: video::Settings,
     /// Draws the preview the way exports draw frames. Made again when the scene's pictures change.
     renderer: Option<render::Renderer>,
     /// The preview picture, and what it shows: the scene, the time, its size in pixels, and which video frames.
@@ -66,6 +77,9 @@ impl Forma {
             last_tick: Instant::now(),
             edited_at: None,
             show_projects: false,
+            show_export: false,
+            export_kind: ExportKind::Video,
+            video_settings: video::Settings::default(),
             renderer: None,
             preview: None,
             videos: Videos::default(),
@@ -171,55 +185,11 @@ impl Forma {
                 }
             }
             if ui
-                .button("PNG")
-                .on_hover_text("Export this frame into Files")
+                .add_enabled(self.export.is_none(), egui::Button::new("Export"))
+                .on_hover_text("A video, a picture or the project file, into Files")
                 .clicked()
             {
-                let _ = std::fs::create_dir_all(&self.place.exports_dir);
-                let name = canopy_ui::canopy_core::files::unique_name(
-                    &self.place.exports_dir,
-                    &format!("{}.png", self.scene.project_name),
-                );
-                let path = self.place.exports_dir.join(name);
-                match render::save_png(&self.scene, &self.place, self.time, &path) {
-                    Ok(()) => host.exported(path),
-                    Err(error) => host.toast(error),
-                }
-            }
-            if ui
-                .add_enabled(self.export.is_none(), egui::Button::new("MP4"))
-                .on_hover_text("Export a video into Files")
-                .clicked()
-            {
-                if let Err(error) = std::fs::create_dir_all(&self.place.exports_dir) {
-                    host.toast(error.to_string());
-                } else {
-                    let name = canopy_ui::canopy_core::files::unique_name(
-                        &self.place.exports_dir,
-                        &format!("{}.mp4", self.scene.project_name),
-                    );
-                    let path = self.place.exports_dir.join(name);
-                    match video::start(&self.scene, &self.place, path, ui.ctx().clone()) {
-                        Ok(export) => self.export = Some(export),
-                        Err(error) => host.toast(error),
-                    }
-                }
-            }
-            if ui
-                .button(".forma")
-                .on_hover_text("Save the project with its pictures and videos as one file in Files")
-                .clicked()
-            {
-                let _ = std::fs::create_dir_all(&self.place.exports_dir);
-                let name = canopy_ui::canopy_core::files::unique_name(
-                    &self.place.exports_dir,
-                    &format!("{}.forma", self.scene.project_name),
-                );
-                let path = self.place.exports_dir.join(name);
-                match archive::pack(&self.scene, &self.place, &path) {
-                    Ok(()) => host.exported(path),
-                    Err(error) => host.toast(error),
-                }
+                self.show_export = true;
             }
             if let Some(export) = &self.export {
                 let fraction = export.progress.load(Ordering::Relaxed) as f32 / 1000.0;
@@ -631,6 +601,113 @@ impl Forma {
         }
     }
 
+    /// Electron Forma's export dialog: what to make, the video's options, and what it will contain.
+    fn export_window(&mut self, ui: &mut Ui, host: &mut dyn Host) {
+        if !self.show_export {
+            return;
+        }
+        let mut run = false;
+        let modal = egui::Modal::new(ui.scope_id().with("forma-export")).show(ui.ctx(), |ui| {
+            ui.set_width(380.0);
+            ui.label(egui::RichText::new("Export").font(font::bold(18.0)).color(color::INK));
+            ui.add_space(6.0);
+            for (kind, title, detail) in [
+                (ExportKind::Video, "Video", "MP4 or WebM, with sound. Plays anywhere."),
+                (ExportKind::Picture, "Picture", "A PNG of the frame at the playhead."),
+                (ExportKind::Project, "Project file", "Everything, to open in Forma elsewhere."),
+            ] {
+                ui.radio_value(&mut self.export_kind, kind, egui::RichText::new(format!("{title}  ·  {detail}")).font(font::ui(13.0)));
+            }
+            ui.separator();
+            let scene = &self.scene;
+            if self.export_kind == ExportKind::Video {
+                let settings = &mut self.video_settings;
+                egui::Grid::new("forma-video-options").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    ui.label("Format");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut settings.format, video::Format::Mp4, "MP4");
+                        ui.selectable_value(&mut settings.format, video::Format::WebM, "WebM");
+                    });
+                    ui.end_row();
+                    ui.label("Smoothness");
+                    ui.horizontal(|ui| {
+                        for fps in [24, 30, 60] {
+                            ui.selectable_value(&mut settings.fps, fps, fps.to_string());
+                        }
+                        ui.label(egui::RichText::new("frames per second").color(color::INK_MUTED));
+                    });
+                    ui.end_row();
+                    ui.label("Size");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut settings.scale, 1, "Normal");
+                        ui.selectable_value(&mut settings.scale, 2, "Large");
+                        let (w, h) = settings.size(scene);
+                        ui.label(egui::RichText::new(format!("{w} × {h} pixels")).color(color::INK_MUTED));
+                    });
+                    ui.end_row();
+                });
+                ui.separator();
+            }
+            let summary = match self.export_kind {
+                ExportKind::Video => {
+                    let sound = if scene.shapes.iter().any(|s| s.kind == "video") { "  ·  Includes sound" } else { "" };
+                    format!("{:.1} seconds · {} frames{sound}", scene.duration, self.video_settings.frames(scene))
+                }
+                ExportKind::Picture => format!("The frame at {:.2} s · {} × {}", self.time, scene.width, scene.height),
+                ExportKind::Project => {
+                    let n = scene.shapes.len();
+                    format!("{n} layer{} with their pictures and video", if n == 1 { "" } else { "s" })
+                }
+            };
+            ui.label(egui::RichText::new(summary).font(font::bold(13.0)));
+            ui.add_space(6.0);
+            let label = match self.export_kind {
+                ExportKind::Video => "Export video",
+                ExportKind::Picture => "Save picture",
+                ExportKind::Project => "Save project file",
+            };
+            run = ui.button(label).clicked();
+        });
+        if run {
+            self.show_export = false;
+            self.export(host, ui.ctx());
+        } else if modal.should_close() {
+            self.show_export = false;
+        }
+    }
+
+    /// Makes the export chosen in the dialog, named after the project, into Files (a video on its own thread).
+    fn export(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
+        let extension = match self.export_kind {
+            ExportKind::Video => self.video_settings.extension(),
+            ExportKind::Picture => "png",
+            ExportKind::Project => "forma",
+        };
+        if let Err(error) = std::fs::create_dir_all(&self.place.exports_dir) {
+            return host.toast(error.to_string());
+        }
+        let name = canopy_ui::canopy_core::files::unique_name(
+            &self.place.exports_dir,
+            &format!("{}.{extension}", self.scene.project_name),
+        );
+        let path = self.place.exports_dir.join(name);
+        let done = match self.export_kind {
+            ExportKind::Video => match video::start(&self.scene, &self.place, path, self.video_settings, ctx.clone()) {
+                Ok(export) => {
+                    self.export = Some(export);
+                    return;
+                }
+                Err(error) => Err(error),
+            },
+            ExportKind::Picture => render::save_png(&self.scene, &self.place, self.time, &path).map(|_| path),
+            ExportKind::Project => archive::pack(&self.scene, &self.place, &path).map(|_| path),
+        };
+        match done {
+            Ok(path) => host.exported(path),
+            Err(error) => host.toast(error),
+        }
+    }
+
     fn projects_window(&mut self, ui: &mut Ui) {
         if !self.show_projects {
             return;
@@ -746,6 +823,7 @@ impl CanopyApp for Forma {
         let timeline = Rect::from_min_max(pos2(rect.left(), middle.bottom() + 6.0), rect.max);
         ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| self.timeline(ui));
         self.projects_window(ui);
+        self.export_window(ui, host);
         if !self.suppress_history && self.scene != before {
             let dragging = ui.input(|i| i.pointer.any_down());
             if !self.recording_drag || !dragging {

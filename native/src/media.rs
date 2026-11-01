@@ -26,7 +26,7 @@ pub fn ffmpeg() -> &'static Path {
     PATH.get_or_init(|| find("ffmpeg"))
 }
 
-fn ffprobe() -> &'static Path {
+pub fn ffprobe() -> &'static Path {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| find("ffprobe"))
 }
@@ -69,7 +69,7 @@ pub fn probe(path: &Path) -> Result<Info, String> {
     })
 }
 
-/// Raw RGBA frames `width` × `height` (stretched, like `drawImage`), 30 a second, starting `from` seconds in and
+/// Raw RGBA frames `width` × `height` (stretched, like `drawImage`), `fps` a second, starting `from` seconds in and
 /// looping at the end, as a looping `<video>` plays.
 pub struct Frames {
     child: Child,
@@ -78,12 +78,12 @@ pub struct Frames {
 }
 
 impl Frames {
-    pub fn start(path: &Path, from: f64, width: u32, height: u32) -> Result<Self, String> {
+    pub fn start(path: &Path, from: f64, fps: u32, width: u32, height: u32) -> Result<Self, String> {
         let size = IntSize::from_wh(width.max(1), height.max(1)).ok_or("Invalid video size")?;
         let mut child = command(ffmpeg())
             .args(["-v", "error", "-stream_loop", "-1", "-ss", &format!("{:.3}", from.max(0.0)), "-i"])
             .arg(path)
-            .args(["-an", "-vf", &format!("fps=30,scale={}:{}:flags=bicubic", size.width(), size.height()), "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
+            .args(["-an", "-vf", &format!("fps={fps},scale={}:{}:flags=bicubic", size.width(), size.height()), "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -156,7 +156,7 @@ pub mod tests {
         assert_eq!((info.width, info.height, info.sound), (64, 48, true));
         assert!((info.duration - 2.0).abs() < 0.1, "{info:?}");
         // From 1.5 s: half a second of lime, then red again from the start.
-        let mut frames = Frames::start(&path, 1.5, 8, 6).unwrap();
+        let mut frames = Frames::start(&path, 1.5, 30, 8, 6).unwrap();
         let colors: Vec<[u8; 3]> = (0..30).map(|_| {
             let frame = frames.next().unwrap();
             let p = frame.pixel(4, 3).unwrap();

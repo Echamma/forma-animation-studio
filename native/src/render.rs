@@ -123,24 +123,26 @@ impl Renderer {
             || (matches!(shape.kind.as_str(), "image" | "video" | "svg") && self.images.contains_key(&shape.id))
     }
 
-    /// The frame at `t`, for export, with video layers showing `frames`: a visible layer it can't draw is an error,
-    /// never left out.
-    pub fn frame(&self, scene: &Scene, t: f64, frames: &Frames) -> Result<Pixmap, String> {
-        self.draw(scene, t, 1.0, true, frames)
+    /// The frame at `t`, `width` × `height` pixels, for export, with video layers showing `frames`: a visible layer it
+    /// can't draw is an error, never left out.
+    pub fn frame(&self, scene: &Scene, t: f64, (width, height): (u32, u32), frames: &Frames) -> Result<Pixmap, String> {
+        self.draw(scene, t, (width, height), true, frames)
     }
 
     /// The frame at `t` at `scale` times the scene's size, for the editor: layers it can't draw are left out, and
     /// video layers without one of `frames` show their poster.
     pub fn preview(&self, scene: &Scene, t: f64, scale: f32, frames: &Frames) -> Option<Pixmap> {
-        self.draw(scene, t, scale, false, frames).ok()
+        let size = ((scene.width * scale).round().max(1.0) as u32, (scene.height * scale).round().max(1.0) as u32);
+        self.draw(scene, t, size, false, frames).ok()
     }
 
-    fn draw(&self, scene: &Scene, t: f64, scale: f32, strict: bool, frames: &Frames) -> Result<Pixmap, String> {
-        let (width, height) = ((scene.width * scale).round().max(1.0) as u32, (scene.height * scale).round().max(1.0) as u32);
-        let mut canvas = Pixmap::new(width, height).ok_or("Scene is too large to render")?;
+    fn draw(&self, scene: &Scene, t: f64, (width, height): (u32, u32), strict: bool, frames: &Frames) -> Result<Pixmap, String> {
+        let mut canvas = Pixmap::new(width.max(1), height.max(1)).ok_or("Scene is too large to render")?;
         let [r, g, b] = rgb(&scene.bg);
         canvas.fill(Color::from_rgba8(r, g, b, 255));
-        let view = Transform::from_scale(scale, scale);
+        // Like Electron's export, which scales the canvas by width and height separately.
+        let (scale_x, scale_y) = (width as f32 / scene.width, height as f32 / scene.height);
+        let (scale, view) = (scale_x, Transform::from_scale(scale_x, scale_y));
         for shape in &scene.shapes {
             if !shape.visible(t, scene.duration) {
                 continue;
@@ -320,16 +322,21 @@ pub fn frame(scene: &Scene, place: &Place, t: f64) -> Result<Pixmap, String> {
     for shape in scene.shapes.iter().filter(|s| s.kind == "video" && s.visible(t, scene.duration)) {
         let Some(file) = renderer.video(&shape.id) else { continue };
         let duration = crate::media::probe(file)?.duration;
-        let (width, height) = video_size(shape);
-        frames.insert(shape.id.clone(), crate::media::Frames::start(file, shape.media_time(t, duration), width, height)?.next()?);
+        let (width, height) = video_size(shape, 1.0);
+        frames.insert(shape.id.clone(), crate::media::Frames::start(file, shape.media_time(t, duration), 30, width, height)?.next()?);
     }
-    renderer.frame(scene, t, &frames)
+    renderer.frame(scene, t, scene_size(scene), &frames)
 }
 
-/// The size to decode a video layer's frames at for export: its largest size.
-pub fn video_size(shape: &Shape) -> (u32, u32) {
+/// The scene's size in whole pixels.
+pub fn scene_size(scene: &Scene) -> (u32, u32) {
+    (scene.width.round() as u32, scene.height.round() as u32)
+}
+
+/// The size to decode a video layer's frames at for an export `scale` times the scene's size: its largest size.
+pub fn video_size(shape: &Shape, scale: f32) -> (u32, u32) {
     let (w, h) = shape.keys.iter().fold((2.0f32, 2.0f32), |(w, h), key| (w.max(key.w), h.max(key.h)));
-    (w.round() as u32, h.round() as u32)
+    ((w * scale).round() as u32, (h * scale).round() as u32)
 }
 
 pub fn save_png(scene: &Scene, place: &Place, t: f64, output: &Path) -> Result<(), String> {
@@ -393,7 +400,7 @@ mod tests {
         scene.add_shape("lost".into(), "image");
         scene.shapes[0].extra.insert("assetData".into(), format!("forma-asset://media/{}.png", "0".repeat(64)).into());
         let renderer = Renderer::new(&scene, &place(std::env::temp_dir()));
-        assert!(renderer.frame(&scene, 0.0, &Frames::new()).is_err());
+        assert!(renderer.frame(&scene, 0.0, scene_size(&scene), &Frames::new()).is_err());
         assert!(renderer.check(&scene).is_err());
         assert!(renderer.leaves_out(&scene.shapes[0]));
         assert_eq!(renderer.preview(&scene, 0.0, 0.5, &Frames::new()).unwrap().width(), 480);

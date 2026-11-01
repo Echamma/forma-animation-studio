@@ -15,7 +15,45 @@ use std::sync::{
     mpsc::{self, Receiver},
 };
 
-const FPS: u32 = 30;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Mp4,
+    WebM,
+}
+
+/// What Electron Forma's export dialog lets you choose for a video.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settings {
+    pub format: Format,
+    pub fps: u32,
+    /// 1 is the scene's size, 2 twice it.
+    pub scale: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { format: Format::Mp4, fps: 30, scale: 1 }
+    }
+}
+
+impl Settings {
+    /// The scene's size times `scale`, in even numbers (H.264 and VP9 need them), as Electron rounds it.
+    pub fn size(&self, scene: &Scene) -> (u32, u32) {
+        let even = |side: f32| (((side * self.scale as f32) / 2.0).round() as u32 * 2).max(2);
+        (even(scene.width), even(scene.height))
+    }
+
+    pub fn frames(&self, scene: &Scene) -> u32 {
+        ((scene.duration * self.fps as f64).round() as u32).max(1)
+    }
+
+    pub fn extension(&self) -> &'static str {
+        match self.format {
+            Format::Mp4 => "mp4",
+            Format::WebM => "webm",
+        }
+    }
+}
 
 pub struct Export {
     pub progress: Arc<AtomicU32>,
@@ -27,6 +65,7 @@ pub fn start(
     scene: &Scene,
     place: &Place,
     output: PathBuf,
+    settings: Settings,
     ctx: egui::Context,
 ) -> Result<Export, String> {
     let renderer = Renderer::new(scene, place);
@@ -37,7 +76,7 @@ pub fn start(
     let (send, result) = mpsc::channel();
     let (progress_out, cancel_in) = (progress.clone(), cancel.clone());
     std::thread::spawn(move || {
-        let outcome = render_video(&scene, &renderer, &output, &progress_out, &cancel_in);
+        let outcome = render_video(&scene, &renderer, &output, settings, &progress_out, &cancel_in);
         if outcome.is_err() {
             let _ = std::fs::remove_file(&output);
         }
@@ -60,11 +99,11 @@ struct Sound<'a> {
 }
 
 /// FFmpeg's arguments: frames come in raw on stdin; each sound is its own input, delayed to its clip and mixed.
-fn arguments(scene: &Scene, sounds: &[Sound], frames: u32, output: &Path) -> Vec<String> {
-    let (width, height) = (scene.width.round() as u32, scene.height.round() as u32);
-    let mut args: Vec<String> = ["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{width}x{height}"), "-r", &FPS.to_string(), "-i", "pipe:0"]
+fn arguments(scene: &Scene, sounds: &[Sound], settings: Settings, output: &Path) -> Vec<String> {
+    let (width, height) = settings.size(scene);
+    let mut args: Vec<String> = ["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &format!("{width}x{height}"), "-r", &settings.fps.to_string(), "-i", "pipe:0"]
         .map(String::from).into();
-    let length = frames as f64 / FPS as f64;
+    let length = settings.frames(scene) as f64 / settings.fps as f64;
     let mut filters = Vec::new();
     for (index, sound) in sounds.iter().enumerate() {
         args.extend(["-stream_loop", "-1", "-ss", &format!("{:.3}", sound.offset), "-t", &format!("{:.3}", sound.end - sound.start), "-i"].map(String::from));
@@ -78,9 +117,18 @@ fn arguments(scene: &Scene, sounds: &[Sound], frames: u32, output: &Path) -> Vec
         let inputs: String = (0..sounds.len()).map(|i| format!("[s{i}]")).collect();
         let mix = if sounds.len() > 1 { format!("{inputs}amix=inputs={}:normalize=0:duration=longest", sounds.len()) } else { format!("{inputs}anull") };
         filters.push(format!("{mix},apad,atrim=0:{length:.3}[sound]"));
-        args.extend(["-filter_complex".into(), filters.join(";"), "-map".into(), "[sound]".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
+        args.extend(["-filter_complex".into(), filters.join(";"), "-map".into(), "[sound]".into()]);
+        args.extend(match settings.format {
+            Format::Mp4 => ["-c:a", "aac", "-b:a", "192k"],
+            Format::WebM => ["-c:a", "libopus", "-b:a", "160k"],
+        }.map(String::from));
     }
-    args.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-t", &format!("{length:.3}")].map(String::from));
+    let video: &[&str] = match settings.format {
+        Format::Mp4 => &["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        Format::WebM => &["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "32", "-deadline", "good", "-cpu-used", "4", "-row-mt", "1", "-pix_fmt", "yuv420p"],
+    };
+    args.extend(video.iter().map(|s| s.to_string()));
+    args.extend(["-t".to_string(), format!("{length:.3}")]);
     args.push(output.to_string_lossy().into_owned());
     args
 }
@@ -89,10 +137,11 @@ fn render_video(
     scene: &Scene,
     renderer: &Renderer,
     output: &Path,
+    settings: Settings,
     progress: &AtomicU32,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let frames = ((scene.duration * FPS as f64).round() as u32).max(1);
+    let (frames, size) = (settings.frames(scene), settings.size(scene));
     let mut videos: HashMap<String, (&Path, Info)> = HashMap::new();
     for shape in scene.shapes.iter().filter(|s| s.kind == "video") {
         let file = renderer.video(&shape.id).ok_or_else(|| format!("{}: the video file is missing", shape.name))?;
@@ -104,7 +153,7 @@ fn render_video(
         (end > start).then(|| Sound { file, start, end, offset: shape.media_time(start, info.duration) })
     }).collect();
     let mut child = media::command(media::ffmpeg())
-        .args(arguments(scene, &sounds, frames, output))
+        .args(arguments(scene, &sounds, settings, output))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -125,12 +174,12 @@ fn render_video(
         for shape in showing {
             let (file, info) = videos[&shape.id];
             if !readers.contains_key(&shape.id) {
-                let (width, height) = render::video_size(shape);
-                readers.insert(shape.id.clone(), media::Frames::start(file, shape.media_time(t, info.duration), width, height)?);
+                let (width, height) = render::video_size(shape, settings.scale as f32);
+                readers.insert(shape.id.clone(), media::Frames::start(file, shape.media_time(t, info.duration), settings.fps, width, height)?);
             }
             current.insert(shape.id.clone(), readers.get_mut(&shape.id).unwrap().next()?);
         }
-        renderer.frame(scene, t, &current)
+        renderer.frame(scene, t, size, &current)
     };
     let mut failure = None;
     if let Some(mut stdin) = child.stdin.take() {
@@ -138,7 +187,7 @@ fn render_video(
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            match frame_at(index as f64 / FPS as f64) {
+            match frame_at(index as f64 / settings.fps as f64) {
                 Ok(frame) => {
                     if let Err(error) = stdin.write_all(frame.data()) {
                         failure = Some(error.to_string());
@@ -195,7 +244,7 @@ mod tests {
         let pose = crate::model::Pose { x: 32.0, y: 32.0, w: 30.0, h: 30.0, ..shape.pose(0.0) };
         shape.edit_pose(0.0, pose);
         let output = root.join("out.mp4");
-        let run = start(&scene, &place(&root), output.clone(), egui::Context::default()).unwrap();
+        let run = start(&scene, &place(&root), output.clone(), Settings::default(), egui::Context::default()).unwrap();
         assert_eq!(run.result.recv().unwrap(), Ok(output.clone()));
         let info = media::probe(&output).unwrap();
         assert!(!info.sound, "nothing in the scene makes sound");
@@ -222,12 +271,12 @@ mod tests {
         let pose = crate::model::Pose { x: 32.0, y: 24.0, w: 64.0, h: 48.0, ..layer.pose(0.0) };
         layer.edit_pose(0.0, pose);
         let output = root.join("out.mp4");
-        let run = start(&scene, &place, output.clone(), egui::Context::default()).unwrap();
+        let run = start(&scene, &place, output.clone(), Settings::default(), egui::Context::default()).unwrap();
         assert_eq!(run.result.recv().unwrap(), Ok(output.clone()));
         let exported = media::probe(&output).unwrap();
         assert!(exported.sound && (exported.duration - 2.5).abs() < 0.1, "{exported:?}");
         let color = |t: f64| {
-            let frame = media::Frames::start(&output, t, 8, 6).unwrap().next().unwrap();
+            let frame = media::Frames::start(&output, t, 30, 8, 6).unwrap().next().unwrap();
             let p = frame.pixel(4, 3).unwrap();
             [p.red(), p.green(), p.blue()]
         };
@@ -245,9 +294,32 @@ mod tests {
             Sound { file: Path::new("a.mp4"), start: 0.5, end: 3.0, offset: 1.25 },
             Sound { file: Path::new("b.mp4"), start: 0.0, end: 1.0, offset: 0.0 },
         ];
-        let args = arguments(&scene, &sounds, 90, Path::new("out.mp4")).join(" ");
+        let args = arguments(&scene, &sounds, Settings::default(), Path::new("out.mp4")).join(" ");
         assert!(args.contains("-stream_loop -1 -ss 1.250 -t 2.500 -i a.mp4"), "{args}");
         assert!(args.contains("adelay=500:all=1[s0]") && args.contains("adelay=0:all=1[s1]"), "{args}");
         assert!(args.contains("[s0][s1]amix=inputs=2:normalize=0:duration=longest,apad,atrim=0:3.000[sound]"), "{args}");
+    }
+
+    #[test]
+    fn large_webm_at_sixty_frames_a_second() {
+        let root = std::env::temp_dir().join(format!("forma-native-webm-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut scene = Scene::empty("test".into());
+        (scene.width, scene.height, scene.duration) = (101.0, 61.0, 1.0);
+        scene.add_shape("a".into(), "circle");
+        let settings = Settings { format: Format::WebM, fps: 60, scale: 2 };
+        assert_eq!(settings.size(&scene), (202, 122));
+        let output = root.join("out.webm");
+        let run = start(&scene, &place(&root), output.clone(), settings, egui::Context::default()).unwrap();
+        assert_eq!(run.result.recv().unwrap(), Ok(output.clone()));
+        let info = media::probe(&output).unwrap();
+        assert_eq!((info.width, info.height), (202, 122));
+        let frames = media::command(media::ffprobe())
+            .args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "60");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

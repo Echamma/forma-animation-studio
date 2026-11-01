@@ -90,7 +90,7 @@ impl Videos {
                 let (send, receive) = channel();
                 let file = file.to_owned();
                 std::thread::spawn(move || {
-                    let frame = media::Frames::start(&file, key.0 as f64 / FPS, key.1, key.2).and_then(|mut f| f.next()).ok();
+                    let frame = media::Frames::start(&file, key.0 as f64 / FPS, FPS as u32, key.1, key.2).and_then(|mut f| f.next()).ok();
                     let _ = send.send(frame);
                 });
                 self.stills.insert(shape.id.clone(), (key, receive));
@@ -105,7 +105,7 @@ impl Stream {
     fn start(file: std::path::PathBuf, at: f64, from: f64, size: (u32, u32)) -> Self {
         let (send, frames): (SyncSender<Pixmap>, _) = sync_channel(3);
         std::thread::spawn(move || {
-            let Ok(mut reader) = media::Frames::start(&file, at, size.0, size.1) else { return };
+            let Ok(mut reader) = media::Frames::start(&file, at, FPS as u32, size.0, size.1) else { return };
             // Ends when the editor drops the stream (the send fails) or the video does.
             while let Ok(frame) = reader.next() {
                 if send.send(frame).is_err() {
