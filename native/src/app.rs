@@ -133,8 +133,9 @@ impl Forma {
         let mut hits = Vec::new();
         for shape in &self.scene.shapes {
             if !shape.visible(self.time, self.scene.duration) { continue; }
-            let pose = shape.pose(self.time);
-            let bounds = paint_shape(painter, canvas, scale, shape, pose, self.textures.get(&shape.id));
+            let pose = self.scene.render_pose(shape, self.time);
+            let fill = shape.color_at(self.time);
+            let bounds = paint_shape(painter, canvas, scale, shape, pose, &fill, self.textures.get(&shape.id));
             if self.selected.as_deref() == Some(&shape.id) {
                 painter.rect_stroke(bounds.expand(4.0), 3.0, Stroke::new(1.5, color::SUN), StrokeKind::Outside);
             }
@@ -290,11 +291,11 @@ fn hex(value: &str, alpha: u8) -> Color32 {
     } else { Color32::from_rgba_unmultiplied(170, 160, 206, alpha) }
 }
 
-fn paint_shape(painter: &egui::Painter, canvas: Rect, scale: f32, shape: &Shape, pose: Pose, texture: Option<&TextureHandle>) -> Rect {
+fn paint_shape(painter: &egui::Painter, canvas: Rect, scale: f32, shape: &Shape, pose: Pose, layer_color: &str, texture: Option<&TextureHandle>) -> Rect {
     let center = pos2(canvas.left() + pose.x * scale, canvas.top() + pose.y * scale);
     let size = vec2(pose.w * scale, pose.h * scale);
     let bounds = Rect::from_center_size(center, size);
-    let fill = hex(&shape.color, (pose.o * 2.55).round() as u8);
+    let fill = hex(layer_color, (pose.o * 2.55).round() as u8);
     let angle = pose.r.to_radians();
     let point = |x: f32, y: f32| pos2(center.x + x * angle.cos() - y * angle.sin(), center.y + x * angle.sin() + y * angle.cos());
     let (w, h) = (size.x / 2.0, size.y / 2.0);
