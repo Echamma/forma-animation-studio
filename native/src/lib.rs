@@ -5,6 +5,7 @@ pub mod assets;
 pub mod model;
 pub mod render;
 pub mod storage;
+pub mod svg;
 pub mod text;
 pub mod video;
 
@@ -23,7 +24,7 @@ pub static DESCRIPTOR: AppDescriptor = AppDescriptor {
     folder: "Forma",
     icon_png: &[],
     accepts: |file: &SharedFile| {
-        [".json", ".png", ".jpg", ".jpeg", ".webp"]
+        [".json", ".png", ".jpg", ".jpeg", ".webp", ".svg"]
             .iter()
             .any(|ext| file.name.to_lowercase().ends_with(ext))
     },

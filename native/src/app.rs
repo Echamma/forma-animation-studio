@@ -90,6 +90,20 @@ impl Forma {
         self.suppress_history = true;
     }
 
+    /// A new media layer in the middle of the scene, named and sized the way Electron Forma imports media.
+    fn add_media(&mut self, file_name: &str, kind: &str, field: &str, value: String, width: f32, height: f32) -> String {
+        let id = self.scene.add_shape(new_id(), kind);
+        let (w, h) = self.scene.fitted_size(width, height);
+        let shape = self.scene.shapes.last_mut().unwrap();
+        let stem = file_name.rsplit_once('.').map_or(file_name, |(stem, _)| stem);
+        shape.name = if stem.is_empty() { "Media".into() } else { stem.chars().take(70).collect() };
+        shape.color = "#888888".into();
+        shape.extra.insert(field.into(), value.into());
+        let pose = Pose { w, h, ..shape.pose(0.0) };
+        shape.edit_pose(0.0, pose);
+        id
+    }
+
     fn undo(&mut self) {
         if let Some(scene) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.scene, scene));
@@ -736,20 +750,16 @@ impl CanopyApp for Forma {
                     Err(_) => receipt.skipped.push(file.name),
                 }
             } else {
-                match assets::import_picture(&file.path, &self.place) {
-                    Ok((url, width, height)) => {
-                        let id = self.scene.add_shape(new_id(), "image");
-                        if let Some(shape) = self.scene.shapes.last_mut() {
-                            shape.name = file.name.clone();
-                            shape.extra.insert("assetData".into(), url.into());
-                            let scale = (300.0 / width.max(height) as f32).min(1.0);
-                            let pose = Pose {
-                                w: width as f32 * scale,
-                                h: height as f32 * scale,
-                                ..shape.pose(0.0)
-                            };
-                            shape.edit_pose(0.0, pose);
-                        }
+                let svg = file.name.to_lowercase().ends_with(".svg");
+                let media = if svg {
+                    assets::import_svg(&file.path).map(|(source, w, h)| ("svg", "svgSource", source, w, h))
+                } else {
+                    assets::import_picture(&file.path, &self.place)
+                        .map(|(url, w, h)| ("image", "assetData", url, w as f32, h as f32))
+                };
+                match media {
+                    Ok((kind, field, value, width, height)) => {
+                        let id = self.add_media(&file.name, kind, field, value, width, height);
                         self.selected = Some(id);
                         self.edited();
                         receipt.accepted += 1;

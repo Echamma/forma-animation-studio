@@ -158,6 +158,13 @@ impl Scene {
         id
     }
 
+    /// Electron Forma's size for imported media: its shape, the longer side 38 % of the scene's shorter side.
+    pub fn fitted_size(&self, width: f32, height: f32) -> (f32, f32) {
+        let longest = self.width.min(self.height) * 0.38;
+        let ratio = (width / height.max(0.001)).clamp(0.05, 20.0);
+        if ratio >= 1.0 { (longest, longest / ratio) } else { (longest * ratio, longest) }
+    }
+
     pub fn resize(&mut self, width: f32, height: f32) {
         let (sx, sy) = (width / self.width, height / self.height);
         for shape in &mut self.shapes {

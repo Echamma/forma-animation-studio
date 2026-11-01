@@ -2,7 +2,7 @@
 //! Exports and the editor's preview both draw through it, so what the editor shows is what gets exported.
 
 use crate::model::{Pose, Scene, Shape};
-use crate::{assets, text};
+use crate::{assets, svg, text};
 use canopy_ui::Place;
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,8 +14,8 @@ pub struct Renderer {
     images: HashMap<String, Pixmap>,
     /// Picture layers whose picture couldn't be read, and why. Exports stop on them; the editor leaves them out.
     missing: HashMap<String, String>,
-    /// Which picture each picture layer was read from, so the editor knows when to read again.
-    sources: Vec<(String, Option<String>)>,
+    /// What each media layer was read from (hashed), so the editor knows when to read again.
+    sources: Vec<(String, Option<u64>)>,
 }
 
 /// What a layer puts on the canvas, in canvas pixels.
@@ -53,10 +53,12 @@ impl Renderer {
         let mut missing = HashMap::new();
         for shape in &scene.shapes {
             // Video layers show their poster until video frames are drawn natively.
-            if !matches!(shape.kind.as_str(), "image" | "video") {
-                continue;
-            }
-            match picture(shape, place) {
+            let read = match shape.kind.as_str() {
+                "image" | "video" => picture(shape, place),
+                "svg" => svg_picture(shape, place),
+                _ => continue,
+            };
+            match read {
                 Ok(pixmap) => {
                     images.insert(shape.id.clone(), pixmap);
                 }
@@ -98,7 +100,7 @@ impl Renderer {
 
     fn draws(&self, shape: &Shape) -> bool {
         matches!(shape.kind.as_str(), "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text")
-            || (matches!(shape.kind.as_str(), "image" | "video") && self.images.contains_key(&shape.id))
+            || (matches!(shape.kind.as_str(), "image" | "video" | "svg") && self.images.contains_key(&shape.id))
     }
 
     /// The frame at `t`, for export: a visible layer it can't draw is an error, never left out.
@@ -264,8 +266,26 @@ fn picture(shape: &Shape, place: &Place) -> Result<Pixmap, String> {
     Pixmap::from_vec(bytes, size).ok_or_else(|| "Invalid picture pixels".into())
 }
 
-fn sources(scene: &Scene) -> Vec<(String, Option<String>)> {
-    scene.shapes.iter().filter(|s| matches!(s.kind.as_str(), "image" | "video")).map(|s| (s.id.clone(), assets::image_key(s))).collect()
+/// An SVG layer drawn at twice its largest size, so it stays sharp shown larger than the scene (the editor on a
+/// high-density screen); after that it's drawn like a picture.
+fn svg_picture(shape: &Shape, place: &Place) -> Result<Pixmap, String> {
+    let source = assets::svg_source(shape, place)?.ok_or("This layer has no SVG")?;
+    let tree = svg::parse(&source)?;
+    let (w, h) = shape.keys.iter().fold((1.0f32, 1.0f32), |(w, h), key| (w.max(key.w), h.max(key.h)));
+    let fit = (4096.0 / (2.0 * w.max(h))).min(1.0);
+    svg::rasterize(&tree, (2.0 * w * fit).ceil() as u32, (2.0 * h * fit).ceil() as u32).ok_or_else(|| "This SVG is too large to draw".into())
+}
+
+fn sources(scene: &Scene) -> Vec<(String, Option<u64>)> {
+    use std::hash::{Hash, Hasher};
+    scene.shapes.iter().filter(|s| matches!(s.kind.as_str(), "image" | "video" | "svg")).map(|s| {
+        let key = assets::image_key(s).map(|key| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            hasher.finish()
+        });
+        (s.id.clone(), key)
+    }).collect()
 }
 
 pub fn frame(scene: &Scene, place: &Place, t: f64) -> Result<Pixmap, String> {

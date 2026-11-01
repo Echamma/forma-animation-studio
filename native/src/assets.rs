@@ -9,14 +9,30 @@ use std::path::Path;
 
 const PREFIX: &str = "forma-asset://media/";
 
+/// A media field's value: inline, or saved once under `assets/` with its token in `<field>Ref` (Electron's packScene).
+fn stored(shape: &Shape, field: &str, place: &Place) -> Result<Option<String>, String> {
+    if let Some(value) = shape.extra.get(field).and_then(|v| v.as_str()) { return Ok(Some(value.to_owned())); }
+    let Some(token) = shape.extra.get(&format!("{field}Ref")).and_then(|v| v.as_str()) else { return Ok(None) };
+    if !valid_uuid(token) { return Err("Invalid Forma media reference".into()); }
+    std::fs::read_to_string(place.data_dir.join("assets").join(token)).map(Some).map_err(|e| e.to_string())
+}
+
+/// An SVG layer's markup.
+pub fn svg_source(shape: &Shape, place: &Place) -> Result<Option<String>, String> {
+    if shape.kind != "svg" { return Ok(None); }
+    stored(shape, "svgSource", place)
+}
+
+/// Reads an SVG file for a new layer: its markup and its own size.
+pub fn import_svg(path: &Path) -> Result<(String, f32, f32), String> {
+    let source = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let (width, height) = crate::svg::size(&crate::svg::parse(&source)?);
+    Ok((source, width, height))
+}
+
 pub fn image(shape: &Shape, place: &Place) -> Result<Option<ColorImage>, String> {
     let field = if shape.kind == "video" { "posterData" } else if shape.kind == "image" { "assetData" } else { return Ok(None) };
-    let value = shape.extra.get(field).and_then(|v| v.as_str());
-    let owned = if let Some(value) = value { value.to_owned() } else {
-        let Some(token) = shape.extra.get(&format!("{field}Ref")).and_then(|v| v.as_str()) else { return Ok(None) };
-        if !valid_uuid(token) { return Err("Invalid Forma media reference".into()); }
-        std::fs::read_to_string(place.data_dir.join("assets").join(token)).map_err(|e| e.to_string())?
-    };
+    let Some(owned) = stored(shape, field, place)? else { return Ok(None) };
     let bytes = if let Some(name) = owned.strip_prefix(PREFIX) {
         if !valid_media_name(name) { return Err("Invalid Forma media name".into()); }
         std::fs::read(place.data_dir.join("media").join(name)).map_err(|e| e.to_string())?
@@ -52,8 +68,9 @@ pub fn import_picture(path: &Path, place: &Place) -> Result<(String, u32, u32), 
     Ok((format!("{PREFIX}{name}"), width, height))
 }
 
+/// What a media layer shows, so the editor can tell when it changes.
 pub fn image_key(shape: &Shape) -> Option<String> {
-    let field = if shape.kind == "video" { "posterData" } else if shape.kind == "image" { "assetData" } else { return None };
+    let field = match shape.kind.as_str() { "video" => "posterData", "image" => "assetData", "svg" => "svgSource", _ => return None };
     shape.extra.get(field).or_else(|| shape.extra.get(&format!("{field}Ref"))).and_then(|v| v.as_str()).map(str::to_owned)
 }
 
