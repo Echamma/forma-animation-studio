@@ -130,6 +130,8 @@ pub struct Forma {
     motion_draft: Option<(Pose, Vec<motion::Point>)>,
     /// The move chosen in the inspector, and its fields being edited (start, length, options).
     selected_motion: Option<String>,
+    /// The spin chosen in the inspector.
+    selected_spin: Option<String>,
     motion_edit: (f64, f64, motion::Options),
     /// A message for the next toast.
     notice: Option<String>,
@@ -167,6 +169,7 @@ impl Forma {
             motion_options: motion::Options::default(),
             motion_draft: None,
             selected_motion: None,
+            selected_spin: None,
             motion_edit: (0.0, 1.0, motion::Options::default()),
             notice: None,
             suppress_history: false,
@@ -408,8 +411,49 @@ impl Forma {
                 changed = true;
             }
         }
-        ui.label("Fill (hex)");
-        changed |= ui.text_edit_singleline(&mut shape.color).changed();
+        // The fill: with "Animate color" on, picking a color sets a color keyframe at the playhead (as in Electron).
+        let current = shape.color_at(self.time);
+        let channel = |i: usize| u8::from_str_radix(current.get(i..i + 2).unwrap_or("00"), 16).unwrap_or(0);
+        let mut rgb = [channel(1), channel(3), channel(5)];
+        ui.horizontal(|ui| {
+            ui.label("Fill");
+            if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
+                let picked = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                if shape.color_keys.is_empty() {
+                    shape.color = picked;
+                } else {
+                    let t = model::hundredths(self.time);
+                    match shape.color_keys.iter_mut().find(|k| (k.t - t).abs() < 0.011) {
+                        Some(key) => key.color = picked,
+                        None => {
+                            shape.color_keys.push(model::ColorKey { t, color: picked, extra: Default::default() });
+                            shape.color_keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+                        }
+                    }
+                }
+                changed = true;
+            }
+            ui.label(egui::RichText::new(current.to_uppercase()).color(color::INK_MUTED));
+        });
+        let mut animated = !shape.color_keys.is_empty();
+        if ui.checkbox(&mut animated, "Animate color").on_hover_text("Then move the playhead and pick another color").changed() {
+            if animated {
+                shape.color_keys = vec![model::ColorKey { t: model::hundredths(self.time), color: current.clone(), extra: Default::default() }];
+            } else {
+                shape.color = current.clone();
+                shape.color_keys.clear();
+            }
+            changed = true;
+        }
+        let mut blur = shape.extra.get("blur").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        if ui.add(egui::Slider::new(&mut blur, 0.0..=100.0).step_by(1.0).text("Blur").suffix(" px")).changed() {
+            if blur > 0.0 {
+                shape.extra.insert("blur".into(), serde_json::json!(blur));
+            } else {
+                shape.extra.remove("blur");
+            }
+            changed = true;
+        }
         let mut posed = false;
         for (label, value, range) in [
             ("X", &mut pose.x, -4000.0..=4000.0),
@@ -489,6 +533,147 @@ impl Forma {
             self.edited();
         }
         self.motion_panel(ui, index);
+        self.spin_panel(ui, index);
+        self.fade_panel(ui, index);
+    }
+
+    /// Electron's rotation animations: spins added at the playhead (or over the chosen move), then retimed.
+    fn spin_panel(&mut self, ui: &mut Ui, index: usize) {
+        ui.separator();
+        ui.label(egui::RichText::new("Spins").font(font::bold(13.0)).color(color::INK));
+        if ui.button("Add spin").on_hover_text("360° from the playhead, or over the chosen drawn move").clicked() {
+            let chosen = motion::motions(&self.scene.shapes[index]).into_iter().find(|m| Some(&m.id) == self.selected_motion.as_ref());
+            let (start, length) = chosen.map_or((self.time, self.motion_options.seconds), |m| (m.start_time, m.duration));
+            let id = new_id();
+            self.scene.shapes[index].rotation_clips.push(RotationClip { id: id.clone(), start_time: start, duration: length, degrees: 360.0, ease: "linear".into(), extra: Default::default() });
+            self.scene.duration = self.scene.duration.max(start + length);
+            self.selected_spin = Some(id);
+            self.edited();
+        }
+        let mut changed = false;
+        let shape = &mut self.scene.shapes[index];
+        for (i, clip) in shape.rotation_clips.iter().enumerate() {
+            let name = format!("Spin {} · {}° · {:.2}–{:.2} s", i + 1, clip.degrees, clip.start_time, clip.start_time + clip.duration);
+            if ui.selectable_label(self.selected_spin.as_ref() == Some(&clip.id), name).clicked() {
+                self.selected_spin = Some(clip.id.clone());
+                (self.time, self.playing) = (clip.start_time, false);
+            }
+        }
+        let Some(at) = shape.rotation_clips.iter().position(|c| Some(&c.id) == self.selected_spin.as_ref()) else { return };
+        let clip = &mut shape.rotation_clips[at];
+        egui::Grid::new("forma-spin").num_columns(2).show(ui, |ui| {
+            ui.label("Starts at (s)");
+            changed |= ui.add(egui::DragValue::new(&mut clip.start_time).range(0.0..=3600.0).speed(0.01).fixed_decimals(2)).changed();
+            ui.end_row();
+            ui.label("Length (s)");
+            changed |= ui.add(egui::DragValue::new(&mut clip.duration).range(0.1..=3600.0).speed(0.01).fixed_decimals(2)).changed();
+            ui.end_row();
+            ui.label("Degrees");
+            changed |= ui.add(egui::DragValue::new(&mut clip.degrees).range(-10000.0..=10000.0).speed(5.0)).changed();
+            ui.end_row();
+            ui.label("Easing");
+            egui::ComboBox::from_id_salt("forma-spin-ease").selected_text(if clip.ease == "smooth" { "Smooth" } else { "Steady" }).show_ui(ui, |ui| {
+                changed |= ui.selectable_value(&mut clip.ease, "linear".into(), "Steady").changed();
+                changed |= ui.selectable_value(&mut clip.ease, "smooth".into(), "Smooth").changed();
+            });
+            ui.end_row();
+        });
+        if changed {
+            (clip.start_time, clip.duration) = (model::hundredths(clip.start_time), model::hundredths(clip.duration));
+            let end = clip.start_time + clip.duration;
+            self.scene.duration = self.scene.duration.max(end);
+            self.edited();
+        }
+        if ui.button("Delete spin").clicked() {
+            let clip = self.scene.shapes[index].rotation_clips.remove(at);
+            (self.selected_spin, self.time) = (None, clip.start_time);
+            self.edited();
+        }
+    }
+
+    /// Electron's disappear: fade the layer out, then bring it back never, at a time, or when another layer's
+    /// animation ends.
+    fn fade_panel(&mut self, ui: &mut Ui, index: usize) {
+        ui.separator();
+        ui.label(egui::RichText::new("Fade out and back").font(font::bold(13.0)).color(color::INK));
+        let Some(mut d) = self.scene.shapes[index].disappear.clone() else {
+            if ui.button("Add fade out").on_hover_text("Fades out from the playhead").clicked() {
+                let length = 0.5_f64.min((self.scene.duration - self.time).max(0.0));
+                self.scene.shapes[index].disappear = Some(model::Disappear {
+                    start_time: model::hundredths(self.time), duration: model::hundredths(length), reappear_mode: "never".into(),
+                    reappear_time: None, trigger_shape_id: None, trigger_clip_id: None, extra: Default::default(),
+                });
+                self.edited();
+            }
+            return;
+        };
+        // Animations on other layers it can come back with: their keyframes, drawn moves and spins.
+        let mut clips: Vec<(String, String, String, f64)> = Vec::new();
+        for other in self.scene.shapes.iter().filter(|s| s.id != self.scene.shapes[index].id) {
+            if other.keys.len() > 1 {
+                clips.push((other.id.clone(), "keys".into(), format!("{} · Keyframes", other.name), other.keys.last().unwrap().t));
+            }
+            for (i, m) in motion::motions(other).iter().enumerate() {
+                clips.push((other.id.clone(), m.id.clone(), format!("{} · {} {}", other.name, if m.kind == "path" { "Path" } else { "Move" }, i + 1), m.start_time + m.duration));
+            }
+            for (i, c) in other.rotation_clips.iter().enumerate() {
+                clips.push((other.id.clone(), c.id.clone(), format!("{} · Rotation {}", other.name, i + 1), c.start_time + c.duration));
+            }
+        }
+        egui::Grid::new("forma-fade").num_columns(2).show(ui, |ui| {
+            ui.label("Starts at (s)");
+            ui.add(egui::DragValue::new(&mut d.start_time).range(0.0..=3600.0).speed(0.01).fixed_decimals(2));
+            ui.end_row();
+            ui.label("Length (s)");
+            ui.add(egui::DragValue::new(&mut d.duration).range(0.0..=3600.0).speed(0.01).fixed_decimals(2));
+            ui.end_row();
+            ui.label("Comes back");
+            let modes = [("never", "Never"), ("time", "At a time"), ("clip", "With an animation")];
+            egui::ComboBox::from_id_salt("forma-reappear").selected_text(modes.iter().find(|(m, _)| *m == d.reappear_mode).map_or("Never", |(_, l)| *l)).show_ui(ui, |ui| {
+                for (mode, label) in modes {
+                    ui.selectable_value(&mut d.reappear_mode, mode.into(), label);
+                }
+            });
+            ui.end_row();
+        });
+        let fade_end = d.start_time + d.duration;
+        match d.reappear_mode.as_str() {
+            "time" => {
+                let mut at = d.reappear_time.unwrap_or((fade_end + 1.0).min(self.scene.duration)).max(fade_end);
+                ui.horizontal(|ui| {
+                    ui.label("At (s)");
+                    ui.add(egui::DragValue::new(&mut at).range(fade_end..=3600.0).speed(0.01).fixed_decimals(2));
+                });
+                d.reappear_time = Some(model::hundredths(at));
+                (d.trigger_shape_id, d.trigger_clip_id) = (None, None);
+            }
+            "clip" => {
+                let chosen = clips.iter().find(|(s, c, ..)| Some(s) == d.trigger_shape_id.as_ref() && Some(c) == d.trigger_clip_id.as_ref());
+                let text = chosen.map_or(if clips.is_empty() { "Animate another layer first".into() } else { "Choose an animation".to_owned() }, |(.., label, end)| format!("{label} · ends {end:.2} s"));
+                egui::ComboBox::from_id_salt("forma-reappear-clip").selected_text(text).width(200.0).show_ui(ui, |ui| {
+                    for (shape, clip, label, end) in &clips {
+                        // It has to end after the fade out finishes (Electron refuses one that doesn't).
+                        let ok = *end >= fade_end - 0.001;
+                        if ui.add_enabled(ok, egui::Button::selectable(false, format!("{label} · ends {end:.2} s"))).clicked() {
+                            (d.trigger_shape_id, d.trigger_clip_id) = (Some(shape.clone()), Some(clip.clone()));
+                        }
+                    }
+                });
+                d.reappear_time = None;
+            }
+            _ => (d.reappear_time, d.trigger_shape_id, d.trigger_clip_id) = (None, None, None),
+        }
+        (d.start_time, d.duration) = (model::hundredths(d.start_time), model::hundredths(d.duration));
+        let shape = &mut self.scene.shapes[index];
+        if shape.disappear.as_ref() != Some(&d) {
+            self.scene.duration = self.scene.duration.max(d.start_time + d.duration).max(d.reappear_time.unwrap_or(0.0));
+            self.scene.shapes[index].disappear = Some(d);
+            self.edited();
+        }
+        if ui.button("Delete fade out").clicked() {
+            self.scene.shapes[index].disappear = None;
+            self.edited();
+        }
     }
 
     /// Electron's drawn moves: draw an arrow or record a path on the canvas from the playhead, then retime, rescale
