@@ -3,12 +3,14 @@
 pub mod app;
 pub mod archive;
 pub mod assets;
+pub mod media;
 pub mod model;
 pub mod render;
 pub mod storage;
 pub mod svg;
 pub mod text;
 pub mod video;
+pub mod videos;
 
 use canopy_ui::{Accent, AppDescriptor, CanopyApp, Place, SharedFile};
 
@@ -25,7 +27,7 @@ pub static DESCRIPTOR: AppDescriptor = AppDescriptor {
     folder: "Forma",
     icon_png: &[],
     accepts: |file: &SharedFile| {
-        [".json", ".forma", ".png", ".jpg", ".jpeg", ".webp", ".svg"]
+        [".json", ".forma", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".mp4", ".webm", ".ogv"]
             .iter()
             .any(|ext| file.name.to_lowercase().ends_with(ext))
     },

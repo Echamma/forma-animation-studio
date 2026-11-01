@@ -6,6 +6,7 @@ use crate::model::{Pose, RotationClip, Scene};
 use crate::render;
 use crate::storage;
 use crate::video;
+use crate::videos::Videos;
 use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
 use egui::{
     Align2, Color32, Rect, Sense, Stroke, StrokeKind, TextureHandle,
@@ -40,8 +41,9 @@ pub struct Forma {
     show_projects: bool,
     /// Draws the preview the way exports draw frames. Made again when the scene's pictures change.
     renderer: Option<render::Renderer>,
-    /// The preview picture, and what it shows: the scene, the time, and its size in pixels.
-    preview: Option<(TextureHandle, Scene, f64, [u32; 2])>,
+    /// The preview picture, and what it shows: the scene, the time, its size in pixels, and which video frames.
+    preview: Option<(TextureHandle, Scene, f64, [u32; 2], u64)>,
+    videos: Videos,
     undo: Vec<Scene>,
     redo: Vec<Scene>,
     recording_drag: bool,
@@ -66,6 +68,7 @@ impl Forma {
             show_projects: false,
             renderer: None,
             preview: None,
+            videos: Videos::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             recording_drag: false,
@@ -86,6 +89,7 @@ impl Forma {
         self.playing = false;
         self.renderer = None;
         self.preview = None;
+        self.videos = Videos::default();
         self.undo.clear();
         self.redo.clear();
         self.suppress_history = true;
@@ -184,7 +188,7 @@ impl Forma {
             }
             if ui
                 .add_enabled(self.export.is_none(), egui::Button::new("MP4"))
-                .on_hover_text("Export a silent video into Files")
+                .on_hover_text("Export a video into Files")
                 .clicked()
             {
                 if let Err(error) = std::fs::create_dir_all(&self.place.exports_dir) {
@@ -449,23 +453,28 @@ impl Forma {
         // Drawn at the screen's pixel size, again only when the scene, the time or the size changes.
         let pixels = ui.ctx().pixels_per_point();
         let size = [(canvas.width() * pixels).round() as u32, (canvas.height() * pixels).round() as u32];
-        let stale = self.preview.as_ref().is_none_or(|(_, scene, time, drawn)| {
-            *drawn != size || *time != self.time || *scene != self.scene
+        let scale = size[0] as f32 / self.scene.width;
+        if self.videos.update(&self.scene, renderer, self.time, self.playing, scale) {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+        let generation = self.videos.generation;
+        let stale = self.preview.as_ref().is_none_or(|(_, scene, time, drawn, shown)| {
+            *drawn != size || *time != self.time || *scene != self.scene || *shown != generation
         });
         if stale {
-            if let Some(pixmap) = renderer.preview(&self.scene, self.time, size[0] as f32 / self.scene.width) {
+            if let Some(pixmap) = renderer.preview(&self.scene, self.time, scale, &self.videos.frames) {
                 let image = egui::ColorImage::from_rgba_premultiplied(
                     [pixmap.width() as usize, pixmap.height() as usize],
                     pixmap.data(),
                 );
                 match &mut self.preview {
-                    Some((texture, scene, time, drawn)) => {
+                    Some((texture, scene, time, drawn, shown)) => {
                         texture.set(image, TextureOptions::LINEAR);
-                        (*scene, *time, *drawn) = (self.scene.clone(), self.time, size);
+                        (*scene, *time, *drawn, *shown) = (self.scene.clone(), self.time, size, generation);
                     }
                     None => {
                         let texture = ui.ctx().load_texture("forma-preview", image, TextureOptions::LINEAR);
-                        self.preview = Some((texture, self.scene.clone(), self.time, size));
+                        self.preview = Some((texture, self.scene.clone(), self.time, size, generation));
                     }
                 }
             }
@@ -778,16 +787,25 @@ impl CanopyApp for Forma {
                     }
                 }
             } else {
-                let svg = file.name.to_lowercase().ends_with(".svg");
-                let media = if svg {
-                    assets::import_svg(&file.path).map(|(source, w, h)| ("svg", "svgSource", source, w, h))
+                // A video also keeps its poster and its length, as Electron Forma's video layers do.
+                let media = if lower.ends_with(".svg") {
+                    assets::import_svg(&file.path).map(|(source, w, h)| ("svg", "svgSource", source, w, h, None))
+                } else if [".mp4", ".webm", ".ogv"].iter().any(|ext| lower.ends_with(ext)) {
+                    assets::import_video(&file.path, &self.place).map(|(url, poster, info)| {
+                        ("video", "assetData", url, info.width as f32, info.height as f32, Some((poster, info.duration)))
+                    })
                 } else {
                     assets::import_picture(&file.path, &self.place)
-                        .map(|(url, w, h)| ("image", "assetData", url, w as f32, h as f32))
+                        .map(|(url, w, h)| ("image", "assetData", url, w as f32, h as f32, None))
                 };
                 match media {
-                    Ok((kind, field, value, width, height)) => {
+                    Ok((kind, field, value, width, height, video)) => {
                         let id = self.add_media(&file.name, kind, field, value, width, height);
+                        if let Some((poster, duration)) = video {
+                            let shape = self.scene.shapes.last_mut().unwrap();
+                            shape.extra.insert("posterData".into(), poster.into());
+                            shape.extra.insert("mediaDuration".into(), duration.into());
+                        }
                         self.selected = Some(id);
                         self.edited();
                         receipt.accepted += 1;

@@ -5,13 +5,19 @@ use crate::model::{Pose, Scene, Shape};
 use crate::{assets, svg, text};
 use canopy_ui::Place;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tiny_skia::{
     Color, FillRule, IntRect, IntSize, Paint, Path as Outline, PathBuilder, Pixmap, PixmapPaint, Point, Rect, Transform,
 };
 
+/// Video layers' frames at one moment, by layer id.
+pub type Frames = HashMap<String, Pixmap>;
+
 pub struct Renderer {
+    /// Pictures, SVGs (drawn once), and video posters, by layer id.
     images: HashMap<String, Pixmap>,
+    /// Video layers' files.
+    videos: HashMap<String, PathBuf>,
     /// Picture layers whose picture couldn't be read, and why. Exports stop on them; the editor leaves them out.
     missing: HashMap<String, String>,
     /// What each media layer was read from (hashed), so the editor knows when to read again.
@@ -51,6 +57,12 @@ impl Renderer {
     pub fn new(scene: &Scene, place: &Place) -> Self {
         let mut images = HashMap::new();
         let mut missing = HashMap::new();
+        let mut videos = HashMap::new();
+        for shape in scene.shapes.iter().filter(|s| s.kind == "video") {
+            if let Some(file) = assets::stored(shape, "assetData", place).ok().flatten().and_then(|url| assets::library_file(&url, place)) {
+                videos.insert(shape.id.clone(), file);
+            }
+        }
         for shape in &scene.shapes {
             // Video layers show their poster until video frames are drawn natively.
             let read = match shape.kind.as_str() {
@@ -67,7 +79,7 @@ impl Renderer {
                 }
             }
         }
-        Self { images, missing, sources: sources(scene) }
+        Self { images, videos, missing, sources: sources(scene) }
     }
 
     /// Whether this renderer has read the pictures `scene` shows.
@@ -81,16 +93,24 @@ impl Renderer {
     }
 
     fn exportable(&self, shape: &Shape) -> Result<(), String> {
+        if shape.kind == "video" {
+            return match self.videos.get(&shape.id) {
+                Some(file) if file.is_file() => Ok(()),
+                _ => Err(format!("{}: the video file is missing", shape.name)),
+            };
+        }
         if let Some(error) = self.missing.get(&shape.id) {
             return Err(format!("{}: {error}", shape.name));
-        }
-        if shape.kind == "video" {
-            return Err("Export of video layers is coming later.".into());
         }
         if !self.draws(shape) {
             return Err(format!("Export of {} layers is coming later.", shape.kind));
         }
         Ok(())
+    }
+
+    /// A video layer's file.
+    pub fn video(&self, id: &str) -> Option<&Path> {
+        self.videos.get(id).map(PathBuf::as_path)
     }
 
     /// Whether the editor's preview leaves this layer out (the editor marks where it is).
@@ -103,17 +123,19 @@ impl Renderer {
             || (matches!(shape.kind.as_str(), "image" | "video" | "svg") && self.images.contains_key(&shape.id))
     }
 
-    /// The frame at `t`, for export: a visible layer it can't draw is an error, never left out.
-    pub fn frame(&self, scene: &Scene, t: f64) -> Result<Pixmap, String> {
-        self.draw(scene, t, 1.0, true)
+    /// The frame at `t`, for export, with video layers showing `frames`: a visible layer it can't draw is an error,
+    /// never left out.
+    pub fn frame(&self, scene: &Scene, t: f64, frames: &Frames) -> Result<Pixmap, String> {
+        self.draw(scene, t, 1.0, true, frames)
     }
 
-    /// The frame at `t` at `scale` times the scene's size, for the editor: layers it can't draw are left out.
-    pub fn preview(&self, scene: &Scene, t: f64, scale: f32) -> Option<Pixmap> {
-        self.draw(scene, t, scale, false).ok()
+    /// The frame at `t` at `scale` times the scene's size, for the editor: layers it can't draw are left out, and
+    /// video layers without one of `frames` show their poster.
+    pub fn preview(&self, scene: &Scene, t: f64, scale: f32, frames: &Frames) -> Option<Pixmap> {
+        self.draw(scene, t, scale, false, frames).ok()
     }
 
-    fn draw(&self, scene: &Scene, t: f64, scale: f32, strict: bool) -> Result<Pixmap, String> {
+    fn draw(&self, scene: &Scene, t: f64, scale: f32, strict: bool, frames: &Frames) -> Result<Pixmap, String> {
         let (width, height) = ((scene.width * scale).round().max(1.0) as u32, (scene.height * scale).round().max(1.0) as u32);
         let mut canvas = Pixmap::new(width, height).ok_or("Scene is too large to render")?;
         let [r, g, b] = rgb(&scene.bg);
@@ -129,8 +151,11 @@ impl Renderer {
             }
             if strict {
                 self.exportable(shape)?;
+                if shape.kind == "video" && !frames.contains_key(&shape.id) {
+                    return Err(format!("{}: no video frame", shape.name));
+                }
             }
-            let Some(ink) = self.ink(shape, pose, &shape.color_at(t), view) else { continue };
+            let Some(ink) = self.ink(shape, pose, &shape.color_at(t), view, frames) else { continue };
             let blur = blur(shape) * scale;
             if blur <= 0.0 {
                 ink.paint(&mut canvas, Transform::identity());
@@ -154,9 +179,9 @@ impl Renderer {
 
     /// A layer at `pose` in `color`: shapes and text as outlines, pictures as pixmaps. Each is drawn around its center,
     /// turned by its rotation, then placed (Electron translates, rotates, then draws at the origin).
-    fn ink(&self, shape: &Shape, pose: Pose, color: &str, view: Transform) -> Option<Ink<'_>> {
+    fn ink<'a>(&'a self, shape: &Shape, pose: Pose, color: &str, view: Transform, frames: &'a Frames) -> Option<Ink<'a>> {
         let place = Transform::from_rotate(pose.r).post_translate(pose.x, pose.y).post_concat(view);
-        if let Some(pixmap) = self.images.get(&shape.id) {
+        if let Some(pixmap) = frames.get(&shape.id).or_else(|| self.images.get(&shape.id)) {
             let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
             let mut paint = PixmapPaint::default();
             paint.opacity = (pose.o / 100.0).clamp(0.0, 1.0);
@@ -288,8 +313,23 @@ fn sources(scene: &Scene) -> Vec<(String, Option<u64>)> {
     }).collect()
 }
 
+/// One frame, video layers included (each read from its file).
 pub fn frame(scene: &Scene, place: &Place, t: f64) -> Result<Pixmap, String> {
-    Renderer::new(scene, place).frame(scene, t)
+    let renderer = Renderer::new(scene, place);
+    let mut frames = Frames::new();
+    for shape in scene.shapes.iter().filter(|s| s.kind == "video" && s.visible(t, scene.duration)) {
+        let Some(file) = renderer.video(&shape.id) else { continue };
+        let duration = crate::media::probe(file)?.duration;
+        let (width, height) = video_size(shape);
+        frames.insert(shape.id.clone(), crate::media::Frames::start(file, shape.media_time(t, duration), width, height)?.next()?);
+    }
+    renderer.frame(scene, t, &frames)
+}
+
+/// The size to decode a video layer's frames at for export: its largest size.
+pub fn video_size(shape: &Shape) -> (u32, u32) {
+    let (w, h) = shape.keys.iter().fold((2.0f32, 2.0f32), |(w, h), key| (w.max(key.w), h.max(key.h)));
+    (w.round() as u32, h.round() as u32)
 }
 
 pub fn save_png(scene: &Scene, place: &Place, t: f64, output: &Path) -> Result<(), String> {
@@ -353,10 +393,10 @@ mod tests {
         scene.add_shape("lost".into(), "image");
         scene.shapes[0].extra.insert("assetData".into(), format!("forma-asset://media/{}.png", "0".repeat(64)).into());
         let renderer = Renderer::new(&scene, &place(std::env::temp_dir()));
-        assert!(renderer.frame(&scene, 0.0).is_err());
+        assert!(renderer.frame(&scene, 0.0, &Frames::new()).is_err());
         assert!(renderer.check(&scene).is_err());
         assert!(renderer.leaves_out(&scene.shapes[0]));
-        assert_eq!(renderer.preview(&scene, 0.0, 0.5).unwrap().width(), 480);
+        assert_eq!(renderer.preview(&scene, 0.0, 0.5, &Frames::new()).unwrap().width(), 480);
     }
 
     #[test]

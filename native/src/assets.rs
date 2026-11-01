@@ -62,6 +62,30 @@ pub fn import_picture(path: &Path, place: &Place) -> Result<(String, u32, u32), 
     Ok((store(&bytes, extension, place)?, width, height))
 }
 
+/// Copies a video into the library and makes its poster (a JPEG from just after the start, as Electron Forma does):
+/// the video's URL, the poster's URL, and what FFmpeg says about the video.
+pub fn import_video(path: &Path, place: &Place) -> Result<(String, String, crate::media::Info), String> {
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !matches!(extension.as_str(), "mp4" | "webm" | "ogv") { return Err("Use MP4, WebM or Ogg videos".into()); }
+    let info = crate::media::probe(path)?;
+    let poster = crate::media::poster(path, (info.duration / 10.0).min(0.05))?;
+    // Videos can be large: hash and copy them without reading them into memory.
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|e| e.to_string())?;
+    let name = format!("{:x}.{extension}", hasher.finalize());
+    let directory = place.data_dir.join("media");
+    std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    if !directory.join(&name).exists() { std::fs::copy(path, directory.join(&name)).map_err(|e| e.to_string())?; }
+    Ok((format!("{PREFIX}{name}"), store(&poster, "jpg", place)?, info))
+}
+
+/// Where a library URL's file is.
+pub fn library_file(value: &str, place: &Place) -> Option<std::path::PathBuf> {
+    let name = value.strip_prefix(PREFIX).filter(|name| valid_media_name(name))?;
+    Some(place.data_dir.join("media").join(name))
+}
+
 /// Puts media in the library under the hash of its bytes (as Electron's storeMedia does) and returns its URL.
 pub fn store(bytes: &[u8], extension: &str, place: &Place) -> Result<String, String> {
     let name = format!("{:x}.{extension}", Sha256::digest(bytes));

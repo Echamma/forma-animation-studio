@@ -252,6 +252,12 @@ impl Shape {
         self.out_time.is_none_or(|end| t < end - EPSILON || (end >= scene_duration - EPSILON && t >= scene_duration - EPSILON))
     }
 
+    /// Where a video layer is in its file at scene time `t`: it starts at `mediaStart` when the clip starts, and loops.
+    pub fn media_time(&self, t: f64, duration: f64) -> f64 {
+        let local = (t - self.in_time.unwrap_or(0.0)).max(0.0) + self.extra.get("mediaStart").and_then(Value::as_f64).unwrap_or(0.0);
+        if duration > 0.0 { local % duration } else { local }
+    }
+
     pub fn rotation_at(&self, t: f64) -> f32 {
         self.rotation_clips.iter().filter(|clip| t > clip.start_time && clip.duration > 0.0).map(|clip| {
             let f = ((t - clip.start_time) / clip.duration).clamp(0.0, 1.0) as f32;
