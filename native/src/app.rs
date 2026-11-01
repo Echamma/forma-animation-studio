@@ -19,9 +19,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A drag on the canvas, with what it started from (scene pixels, editable poses).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Gesture {
-    Move { index: usize, start: Pos2, pose: Pose },
+    Move { start: Pos2, poses: Vec<(usize, Pose)> },
     Resize { index: usize, handle: (i8, i8), start: Pos2, pose: Pose, angle: f32 },
     Rotate { index: usize, center: Pos2, last: f32 },
 }
@@ -126,6 +126,7 @@ pub struct Forma {
     place: Place,
     scene: Scene,
     selected: Option<String>,
+    multi_selected: Vec<String>,
     layer_drag: Option<String>,
     time: f64,
     playing: bool,
@@ -177,6 +178,7 @@ impl Forma {
             place,
             scene,
             selected: None,
+            multi_selected: Vec::new(),
             layer_drag: None,
             time: 0.0,
             playing: false,
@@ -213,10 +215,26 @@ impl Forma {
         self.edited_at = Some(Instant::now());
     }
 
+    fn select_layer(&mut self, id: Option<String>, extend: bool) {
+        if !extend {
+            self.multi_selected = id.clone().into_iter().collect();
+            self.selected = id;
+        } else if let Some(id) = id {
+            if let Some(index) = self.multi_selected.iter().position(|selected| selected == &id) {
+                self.multi_selected.remove(index);
+                if self.selected.as_deref() == Some(&id) { self.selected = self.multi_selected.last().cloned(); }
+            } else {
+                self.multi_selected.push(id.clone());
+                self.selected = Some(id);
+            }
+        }
+    }
+
     fn open(&mut self, scene: Scene) {
         let _ = self.save();
         self.scene = scene;
         self.selected = None;
+        self.multi_selected.clear();
         self.layer_drag = None;
         self.time = 0.0;
         self.playing = false;
@@ -321,6 +339,7 @@ impl Forma {
     }
 
     fn layers(&mut self, ui: &mut Ui) {
+        if !self.selected.as_ref().is_some_and(|id| self.multi_selected.contains(id)) { self.multi_selected.clear(); }
         ui.label(
             egui::RichText::new("Layers")
                 .font(font::bold(14.0))
@@ -358,10 +377,11 @@ impl Forma {
         }
         egui::ScrollArea::vertical().id_salt("forma-layers").show(ui, |ui| {
             let mut destination = None;
+            let mut clicked = None;
             for (index, shape) in self.scene.shapes.iter().enumerate() {
-                let response = ui.add(egui::Button::selectable(self.selected.as_deref() == Some(&shape.id), &shape.name).sense(Sense::click_and_drag()));
+                let response = ui.add(egui::Button::selectable(self.multi_selected.contains(&shape.id) || self.selected.as_deref() == Some(&shape.id), &shape.name).sense(Sense::click_and_drag()));
                 if response.clicked() {
-                    self.selected = Some(shape.id.clone());
+                    clicked = Some(shape.id.clone());
                 }
                 if response.drag_started() { self.layer_drag = Some(shape.id.clone()); }
                 if self.layer_drag.is_some() && ui.input(|i| i.pointer.any_released()) && response.rect.contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or_default()) {
@@ -369,6 +389,7 @@ impl Forma {
                 }
                 if self.layer_drag.is_some() && response.hovered() { ui.painter().rect_stroke(response.rect, 3.0, egui::Stroke::new(1.0, color::INK), egui::StrokeKind::Inside); }
             }
+            if let Some(id) = clicked { self.select_layer(Some(id), ui.input(|i| i.modifiers.shift)); }
             if ui.input(|i| i.pointer.any_released()) {
                 if let (Some(id), Some(target)) = (self.layer_drag.take(), destination) {
                     if let Some(from) = self.scene.shapes.iter().position(|shape| shape.id == id) {
@@ -888,6 +909,14 @@ impl Forma {
             hits.push((shape.id.clone(), (center, size, angle)));
         }
         // The selected layer's box, resize handles and rotation handle (Electron's selection control).
+        if !self.playing {
+            for (id, (center, size, angle)) in &hits {
+                if self.multi_selected.contains(id) && self.selected.as_deref() != Some(id) {
+                    let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| *center + turn(vec2(x, y) * *size / 2.0, *angle));
+                    painter.add(egui::Shape::closed_line(corners.to_vec(), Stroke::new(1.5, color::SUN)));
+                }
+            }
+        }
         let selected = self.selected.as_deref().and_then(|id| hits.iter().find(|(hit, _)| hit == id)).map(|(_, place)| *place);
         let mut handles = Vec::new();
         let mut rotate_at = None;
@@ -999,20 +1028,28 @@ impl Forma {
         if response.drag_started() || response.clicked() {
             // Where the button went down: by the time a drag starts, the pointer has moved off a small handle.
             if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos()) {
-                let index = |id: &str| self.scene.shapes.iter().position(|s| s.id == id);
                 let to_scene = |p: Pos2| pos2((p.x - canvas.left()) / scale, (p.y - canvas.top()) / scale);
                 self.gesture = None;
-                if let (true, Some(i)) = (on_rotate(p), self.selected.as_deref().and_then(index)) {
+                if let (true, Some(i)) = (on_rotate(p), self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id))) {
                     let center = self.scene.render_pose(&self.scene.shapes[i], self.time);
                     let point = to_scene(p);
                     self.gesture = Some(Gesture::Rotate { index: i, center: pos2(center.x, center.y), last: (point.y - center.y).atan2(point.x - center.x).to_degrees() });
-                } else if let (Some(handle), Some(i)) = (near_handle(p), self.selected.as_deref().and_then(index)) {
+                } else if let (Some(handle), Some(i)) = (near_handle(p), self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id))) {
                     let shape = &self.scene.shapes[i];
                     self.gesture = Some(Gesture::Resize { index: i, handle, start: to_scene(p), pose: self.scene.editable_pose(shape, self.time), angle: self.scene.render_pose(shape, self.time).r });
                 } else {
-                    self.selected = topmost(p);
-                    if let Some(i) = self.selected.as_deref().and_then(index) {
-                        self.gesture = Some(Gesture::Move { index: i, start: to_scene(p), pose: self.scene.editable_pose(&self.scene.shapes[i], self.time) });
+                    let hit = topmost(p);
+                    let extend = ui.input(|i| i.modifiers.shift);
+                    if extend && response.clicked() {
+                        self.select_layer(hit, true);
+                    } else if !hit.as_ref().is_some_and(|id| self.multi_selected.contains(id)) || response.clicked() {
+                        self.select_layer(hit, false);
+                    }
+                    if let Some(i) = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id)) {
+                        let grouped = self.selected.as_ref().is_some_and(|id| self.multi_selected.contains(id));
+                        let mut poses: Vec<_> = self.scene.shapes.iter().enumerate().filter(|(j, shape)| *j == i || (grouped && self.multi_selected.contains(&shape.id))).map(|(j, shape)| (j, self.scene.editable_pose(shape, self.time))).collect();
+                        poses.sort_by_key(|(j, _)| self.scene.shapes[*j].kind == "text" && self.scene.shapes[*j].extra.contains_key("linkId"));
+                        self.gesture = Some(Gesture::Move { start: to_scene(p), poses });
                     }
                 }
                 if response.clicked() {
@@ -1021,13 +1058,15 @@ impl Forma {
             }
         }
         if response.dragged() {
-            if let (Some(gesture), Some(p)) = (self.gesture, response.interact_pointer_pos()) {
+            if let (Some(gesture), Some(p)) = (self.gesture.clone(), response.interact_pointer_pos()) {
                 let point = pos2((p.x - canvas.left()) / scale, (p.y - canvas.top()) / scale);
                 let freeform = ui.input(|i| i.modifiers.shift);
                 match gesture {
-                    Gesture::Move { index, start, pose } => {
-                        let moved = Pose { x: pose.x + point.x - start.x, y: pose.y + point.y - start.y, ..pose };
-                        self.scene.set_pose(index, self.time, moved);
+                    Gesture::Move { start, poses } => {
+                        for (index, pose) in poses {
+                            let moved = Pose { x: pose.x + point.x - start.x, y: pose.y + point.y - start.y, ..pose };
+                            self.scene.set_pose(index, self.time, moved);
+                        }
                     }
                     Gesture::Resize { index, handle, start, pose, angle } => {
                         let resized = resized_pose(pose, angle, handle, (point.x - start.x, point.y - start.y), freeform);
@@ -1721,6 +1760,10 @@ impl CanopyApp for Forma {
             }
             // Electron's clip shortcuts (ui/clips.js), and Delete.
             if !ui.ctx().egui_wants_keyboard_input() {
+                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+                    self.multi_selected = self.scene.shapes.iter().map(|shape| shape.id.clone()).collect();
+                    self.selected = self.multi_selected.last().cloned();
+                }
                 let action = ui.input(|i| {
                     let command = i.modifiers.command;
                     let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy)) || (command && i.key_pressed(egui::Key::C));
