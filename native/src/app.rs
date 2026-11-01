@@ -161,6 +161,10 @@ pub struct Forma {
     notice: Option<String>,
     /// A layer copied with Ctrl+C.
     clipboard: Option<Shape>,
+    /// Where playing a new animation's preview stops.
+    preview_end: Option<f64>,
+    /// Files picked with the Add button, taken in like dropped files on the next frame.
+    pending_import: Vec<std::path::PathBuf>,
     /// The SVG editor's markup for a layer, and its preview (by the markup's hash).
     svg_edit: Option<SvgEdit>,
     svg_preview: Option<(u64, TextureHandle)>,
@@ -204,6 +208,8 @@ impl Forma {
             motion_edit: (0.0, 1.0, motion::Options::default()),
             notice: None,
             clipboard: None,
+            preview_end: None,
+            pending_import: Vec::new(),
             svg_edit: None,
             svg_preview: None,
             suppress_history: false,
@@ -312,6 +318,7 @@ impl Forma {
                 .clicked()
             {
                 self.playing = !self.playing;
+                self.preview_end = None;
                 self.last_tick = Instant::now();
             }
             ui.label(format!("{:.2} / {:.2} s", self.time, self.scene.duration));
@@ -351,12 +358,20 @@ impl Forma {
             ("Rectangle", "rect"),
             ("Triangle", "triangle"),
             ("Diamond", "diamond"),
+            ("Arrow", "arrow"),
         ] {
             if ui.button(format!("+ {label}")).clicked() {
-                let id = self.scene.add_shape(new_id(), kind);
+                let id = self.scene.add_layer(new_id(), kind);
                 self.selected = Some(id);
                 self.edited();
             }
+        }
+        if ui.button("+ Picture, SVG or video…").clicked() {
+            let picked = rfd::FileDialog::new()
+                .set_title("Add pictures, SVG artwork or video")
+                .add_filter("Pictures, SVG and video", &["png", "jpg", "jpeg", "webp", "svg", "mp4", "webm", "ogv"])
+                .pick_files();
+            self.pending_import.extend(picked.unwrap_or_default());
         }
         // With a layer selected that isn't text, new text follows it (Electron's addText).
         let target = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id)).filter(|&i| self.scene.shapes[i].kind != "text");
@@ -612,18 +627,114 @@ impl Forma {
         self.fade_panel(ui, index);
     }
 
+    /// Electron's drop: the layer falls onto where it is from above the canvas, squashes and bounces, over the
+    /// Seconds option (0.4-10 s) from the playhead, then the drop plays once.
+    fn drop_onto_screen(&mut self, index: usize) {
+        let start = (self.time * 100.0).round() / 100.0;
+        let duration = self.motion_options.seconds.clamp(0.4, 10.0);
+        let end = ((start + duration) * 100.0).round() / 100.0;
+        let shape = &self.scene.shapes[index];
+        let linked = shape.kind == "text" && shape.extra.get("linkId").and_then(|v| v.as_str()).is_some_and(|id| !id.is_empty());
+        let occupied = motion::motions(shape).iter().any(|m| m.start_time < end - 0.005 && m.start_time + m.duration > start + 0.005)
+            || shape.keys.iter().any(|k| k.t > start + 0.005 && k.t <= end + 0.005);
+        let landing = self.scene.editable_pose(shape, start);
+        if linked {
+            self.notice = Some("Text that follows a shape drops with its shape".into());
+        } else if occupied {
+            self.notice = Some("Move the playhead to a clear section of this layer first".into());
+        } else if landing.x + landing.w / 2.0 < 0.0 || landing.x - landing.w / 2.0 > self.scene.width || landing.y + landing.h / 2.0 < 0.0 || landing.y - landing.h / 2.0 > self.scene.height {
+            self.notice = Some("Place the item on the canvas where it should land first".into());
+        } else {
+            let above = -landing.h / 2.0 - (self.scene.height * 0.08).max(40.0);
+            let poses = [
+                (0.0, Pose { y: above, ..landing }),
+                (0.18, Pose { y: above + (landing.y - above) * 0.07, ..landing }),
+                (0.6, Pose { y: landing.y + landing.h * 0.09, w: landing.w * 1.13, h: landing.h * 0.82, ..landing }),
+                (0.71, Pose { y: landing.y - landing.h * 0.17, w: landing.w * 0.94, h: landing.h * 1.06, ..landing }),
+                (0.8, Pose { y: landing.y - landing.h * 0.28, ..landing }),
+                (0.91, Pose { y: landing.y + landing.h * 0.04, w: landing.w * 1.06, h: landing.h * 0.93, ..landing }),
+                (1.0, landing),
+            ];
+            let shape = &mut self.scene.shapes[index];
+            shape.keys.retain(|k| k.t < start - 0.005 || k.t > end + 0.005);
+            for (fraction, pose) in poses { shape.edit_pose(((start + duration * fraction) * 100.0).round() / 100.0, pose); }
+            self.scene.duration = self.scene.duration.max(end);
+            self.motion_mode = None;
+            self.motion_draft = None;
+            self.selected_motion = None;
+            self.selected_spin = None;
+            self.playing = false;
+            self.edited();
+            self.notice = Some("Drop animation added".into());
+            self.preview(start, end);
+        }
+    }
+
+    /// Plays from `start` and stops at `end`, as Electron previews a new animation.
+    fn preview(&mut self, start: f64, end: f64) {
+        (self.time, self.preview_end, self.playing, self.last_tick) = (start, Some(end.min(self.scene.duration)), true, Instant::now());
+    }
+
+    /// A 360° spin at the playhead, or over the chosen drawn move (Electron's Add rotation).
+    fn add_spin(&mut self, index: usize) {
+        let chosen = motion::motions(&self.scene.shapes[index]).into_iter().find(|m| Some(&m.id) == self.selected_motion.as_ref());
+        let (start, length) = chosen.map_or((self.time, self.motion_options.seconds), |m| (m.start_time, m.duration));
+        let id = new_id();
+        self.scene.shapes[index].rotation_clips.push(RotationClip { id: id.clone(), start_time: start, duration: length, degrees: 360.0, ease: "linear".into(), extra: Default::default() });
+        self.scene.duration = self.scene.duration.max(start + length);
+        self.selected_spin = Some(id);
+        self.edited();
+    }
+
+    /// A half-second fade out from the playhead that doesn't come back (Electron's Add disappearance).
+    fn add_fade(&mut self, index: usize) {
+        if self.scene.shapes[index].disappear.is_some() {
+            return;
+        }
+        let length = 0.5_f64.min((self.scene.duration - self.time).max(0.0));
+        self.scene.shapes[index].disappear = Some(model::Disappear {
+            start_time: model::hundredths(self.time), duration: model::hundredths(length), reappear_mode: "never".into(),
+            reappear_time: None, trigger_shape_id: None, trigger_clip_id: None, extra: Default::default(),
+        });
+        self.edited();
+    }
+
+    /// Electron's quick animate bar under the canvas: Move, Spin, Fade and Drop for the selected layer, while
+    /// nothing plays or is being drawn.
+    fn quick_bar(&mut self, ui: &mut Ui, area: Rect) {
+        let Some(index) = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id)) else { return };
+        if self.playing || self.motion_mode.is_some() {
+            return;
+        }
+        let bar = Rect::from_center_size(pos2(area.center().x, area.bottom() - 22.0), vec2(area.width().min(420.0), 34.0));
+        ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
+            egui::Frame::new().fill(Color32::from_rgb(31, 37, 48)).corner_radius(17.0).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    let name: String = self.scene.shapes[index].name.chars().take(18).collect();
+                    ui.label(egui::RichText::new(format!("Animate {name}")).font(font::ui(12.0)).color(color::INK_MUTED));
+                    if ui.button("Move").on_hover_text("Draw where it should go").clicked() {
+                        (self.motion_mode, self.motion_draft) = (Some("arrow"), None);
+                    }
+                    if ui.button("Spin").on_hover_text("A full turn from the playhead").clicked() {
+                        self.add_spin(index);
+                    }
+                    if ui.button("Fade").on_hover_text("Fade out from the playhead").clicked() {
+                        self.add_fade(index);
+                    }
+                    if ui.button("Drop").on_hover_text("Fall onto the screen from above").clicked() {
+                        self.drop_onto_screen(index);
+                    }
+                });
+            });
+        });
+    }
+
     /// Electron's rotation animations: spins added at the playhead (or over the chosen move), then retimed.
     fn spin_panel(&mut self, ui: &mut Ui, index: usize) {
         ui.separator();
         ui.label(egui::RichText::new("Spins").font(font::bold(13.0)).color(color::INK));
         if ui.button("Add spin").on_hover_text("360° from the playhead, or over the chosen drawn move").clicked() {
-            let chosen = motion::motions(&self.scene.shapes[index]).into_iter().find(|m| Some(&m.id) == self.selected_motion.as_ref());
-            let (start, length) = chosen.map_or((self.time, self.motion_options.seconds), |m| (m.start_time, m.duration));
-            let id = new_id();
-            self.scene.shapes[index].rotation_clips.push(RotationClip { id: id.clone(), start_time: start, duration: length, degrees: 360.0, ease: "linear".into(), extra: Default::default() });
-            self.scene.duration = self.scene.duration.max(start + length);
-            self.selected_spin = Some(id);
-            self.edited();
+            self.add_spin(index);
         }
         let mut changed = false;
         let shape = &mut self.scene.shapes[index];
@@ -673,12 +784,7 @@ impl Forma {
         ui.label(egui::RichText::new("Fade out and back").font(font::bold(13.0)).color(color::INK));
         let Some(mut d) = self.scene.shapes[index].disappear.clone() else {
             if ui.button("Add fade out").on_hover_text("Fades out from the playhead").clicked() {
-                let length = 0.5_f64.min((self.scene.duration - self.time).max(0.0));
-                self.scene.shapes[index].disappear = Some(model::Disappear {
-                    start_time: model::hundredths(self.time), duration: model::hundredths(length), reappear_mode: "never".into(),
-                    reappear_time: None, trigger_shape_id: None, trigger_clip_id: None, extra: Default::default(),
-                });
-                self.edited();
+                self.add_fade(index);
             }
             return;
         };
@@ -766,45 +872,10 @@ impl Forma {
             }
         });
         if ui.button("Drop onto the screen").clicked() {
-            let start = (self.time * 100.0).round() / 100.0;
-            let duration = self.motion_options.seconds.clamp(0.4, 10.0);
-            let end = ((start + duration) * 100.0).round() / 100.0;
-            let shape = &self.scene.shapes[index];
-            let linked = shape.kind == "text" && shape.extra.get("linkId").and_then(|v| v.as_str()).is_some_and(|id| !id.is_empty());
-            let occupied = motion::motions(shape).iter().any(|m| m.start_time < end - 0.005 && m.start_time + m.duration > start + 0.005)
-                || shape.keys.iter().any(|k| k.t > start + 0.005 && k.t <= end + 0.005);
-            let landing = self.scene.editable_pose(shape, start);
-            if linked {
-                self.notice = Some("Text that follows a shape drops with its shape".into());
-            } else if occupied {
-                self.notice = Some("Move the playhead to a clear section of this layer first".into());
-            } else if landing.x + landing.w / 2.0 < 0.0 || landing.x - landing.w / 2.0 > self.scene.width || landing.y + landing.h / 2.0 < 0.0 || landing.y - landing.h / 2.0 > self.scene.height {
-                self.notice = Some("Place the item on the canvas where it should land first".into());
-            } else {
-                let above = -landing.h / 2.0 - (self.scene.height * 0.08).max(40.0);
-                let poses = [
-                    (0.0, Pose { y: above, ..landing }),
-                    (0.18, Pose { y: above + (landing.y - above) * 0.07, ..landing }),
-                    (0.6, Pose { y: landing.y + landing.h * 0.09, w: landing.w * 1.13, h: landing.h * 0.82, ..landing }),
-                    (0.71, Pose { y: landing.y - landing.h * 0.17, w: landing.w * 0.94, h: landing.h * 1.06, ..landing }),
-                    (0.8, Pose { y: landing.y - landing.h * 0.28, ..landing }),
-                    (0.91, Pose { y: landing.y + landing.h * 0.04, w: landing.w * 1.06, h: landing.h * 0.93, ..landing }),
-                    (1.0, landing),
-                ];
-                let shape = &mut self.scene.shapes[index];
-                shape.keys.retain(|k| k.t < start - 0.005 || k.t > end + 0.005);
-                for (fraction, pose) in poses { shape.edit_pose(((start + duration * fraction) * 100.0).round() / 100.0, pose); }
-                self.scene.duration = self.scene.duration.max(end);
-                self.motion_mode = None;
-                self.motion_draft = None;
-                self.selected_motion = None;
-                self.selected_spin = None;
-                self.playing = false;
-                self.edited();
-                self.notice = Some("Drop animation added".into());
-            }
+            self.drop_onto_screen(index);
         }
         let help = match self.motion_mode {
+
             Some("arrow") => "Drag anywhere on the canvas to set the arrow destination.",
             Some(_) => "Hold and drag on the canvas. The selected shape will follow your mouse.",
             None => "Choose a tool, then drag anywhere on the canvas. The motion begins at the playhead.",
@@ -1126,6 +1197,7 @@ impl Forma {
         if response.drag_stopped() {
             self.gesture = None;
         }
+        self.quick_bar(ui, area);
     }
 
     /// Electron Forma's timeline rows: one per layer (clips sharing a track side by side), each followed by its
@@ -1763,6 +1835,15 @@ impl Forma {
 
 impl CanopyApp for Forma {
     fn ui(&mut self, ui: &mut Ui, host: &mut dyn Host) {
+        if !self.pending_import.is_empty() {
+            let files = std::mem::take(&mut self.pending_import).into_iter().map(SharedFile::new).collect();
+            let receipt = self.receive(files, host);
+            if let Some(note) = receipt.note {
+                host.toast(note);
+            } else if !receipt.skipped.is_empty() {
+                host.toast(format!("Forma can't open {}", receipt.skipped.join(", ")));
+            }
+        }
         if let Some(export) = &self.export {
             match export.result.try_recv() {
                 Ok(Ok(path)) => {
@@ -1832,7 +1913,9 @@ impl CanopyApp for Forma {
             let now = Instant::now();
             self.time += now.duration_since(self.last_tick).as_secs_f64();
             self.last_tick = now;
-            if self.time >= self.scene.duration {
+            if let Some(end) = self.preview_end.filter(|end| self.time >= *end) {
+                (self.time, self.playing, self.preview_end) = (end, false, None);
+            } else if self.time >= self.scene.duration {
                 self.time = 0.0;
             }
             ui.ctx().request_repaint();

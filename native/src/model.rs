@@ -147,6 +147,22 @@ impl Scene {
         id
     }
 
+    /// A shape as Electron's Add buttons make it: 18 % of the scene's shorter side (an arrow wider than tall),
+    /// named by kind and number, in the next of four colors.
+    pub fn add_layer(&mut self, id: String, kind: &str) -> String {
+        let size = (self.width.min(self.height) * 0.18).round();
+        let (w, h) = if kind == "arrow" { (size * 1.55, size * 0.8) } else { (size, size) };
+        let count = self.shapes.len();
+        self.add_shape(id.clone(), kind);
+        let shape = self.shapes.last_mut().unwrap();
+        let mut name = kind.to_owned();
+        name[..1].make_ascii_uppercase();
+        shape.name = format!("{name} {}", count + 1);
+        shape.color = ["#ed795e", "#aaa0ce", "#c3d77f", "#83bfc0"][count % 4].into();
+        (shape.keys[0].w, shape.keys[0].h) = (w, h);
+        id
+    }
+
     pub fn add_text(&mut self, id: String) -> String {
         let font_size = (self.width.min(self.height) * 0.08).clamp(24.0, 320.0).round();
         let text_width = font_size * 4.2;
@@ -914,6 +930,16 @@ mod tests {
         let relinked = scene.render_pose(&scene.shapes[2], 0.0);
         assert!((relinked.x - text.x).abs() < 0.01 && (relinked.y - text.y).abs() < 0.01, "stays put: {relinked:?}");
         assert_eq!(scene.shapes[2].extra["linkId"], "b");
+    }
+
+    #[test]
+    fn added_layers_are_sized_named_and_colored_like_electron() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_layer("a".into(), "rect");
+        scene.add_layer("b".into(), "arrow");
+        let (a, b) = (&scene.shapes[0], &scene.shapes[1]);
+        assert_eq!((a.name.as_str(), a.color.as_str(), a.keys[0].w), ("Rect 1", "#ed795e", 108.0));
+        assert_eq!((b.name.as_str(), b.color.as_str(), b.keys[0].w, b.keys[0].h), ("Arrow 2", "#aaa0ce", 167.4, 86.4));
     }
 
     #[test]
