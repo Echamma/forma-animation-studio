@@ -80,6 +80,19 @@ impl Scene {
         }
         Ok(scene)
     }
+
+    pub fn add_shape(&mut self, id: String, kind: &str) -> String {
+        let (name, color) = match kind {
+            "circle" => ("Circle", "#ed795e"),
+            "triangle" => ("Triangle", "#c3d77f"),
+            "diamond" => ("Diamond", "#aaa0ce"),
+            _ => ("Rectangle", "#aaa0ce"),
+        };
+        self.shapes.push(Shape { id: id.clone(), name: name.into(), kind: kind.into(), color: color.into(), ease: smooth(),
+            keys: vec![Key { t: 0.0, x: self.width / 2.0, y: self.height / 2.0, w: 160.0, h: 160.0, r: 0.0, o: 100.0,
+                ease: None, curve: None, extra: Map::new() }], in_time: None, out_time: None, extra: Map::new() });
+        id
+    }
 }
 
 impl Shape {
@@ -97,6 +110,22 @@ impl Shape {
         let mix = |a: f32, b: f32| a + (b - a) * fraction;
         Pose { x: mix(before.x, after.x), y: mix(before.y, after.y), w: mix(before.w, after.w),
             h: mix(before.h, after.h), r: mix(before.r, after.r), o: mix(before.o, after.o) }
+    }
+
+    /// Edits a pose at the playhead, inserting a keyframe when the playhead sits between keys.
+    pub fn edit_pose(&mut self, t: f64, pose: Pose) {
+        let at = self.keys.iter().position(|key| (key.t - t).abs() < 1e-6);
+        let index = match at {
+            Some(index) => index,
+            None => {
+                let index = self.keys.partition_point(|key| key.t < t);
+                self.keys.insert(index, Key { t, x: pose.x, y: pose.y, w: pose.w, h: pose.h, r: pose.r, o: pose.o,
+                    ease: None, curve: None, extra: Map::new() });
+                index
+            }
+        };
+        let key = &mut self.keys[index];
+        (key.x, key.y, key.w, key.h, key.r, key.o) = (pose.x, pose.y, pose.w.max(1.0), pose.h.max(1.0), pose.r, pose.o.clamp(0.0, 100.0));
     }
 }
 
@@ -144,5 +173,17 @@ mod tests {
         assert!(!shape.visible(3.0, scene.duration));
         assert_eq!(shape.pose(2.0).x, 0.0);
         scene.shapes.push(shape);
+    }
+
+    #[test]
+    fn editing_between_keys_keeps_the_other_poses() {
+        let mut scene = Scene::empty("test".into());
+        let id = scene.add_shape("circle".into(), "circle");
+        let shape = &mut scene.shapes[0];
+        shape.edit_pose(4.0, Pose { x: 700.0, ..shape.pose(4.0) });
+        shape.edit_pose(2.0, Pose { x: 500.0, ..shape.pose(2.0) });
+        assert_eq!(shape.keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![0.0, 2.0, 4.0]);
+        assert_eq!(shape.pose(4.0).x, 700.0);
+        assert_eq!(shape.id, id);
     }
 }

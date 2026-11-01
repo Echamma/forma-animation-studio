@@ -1,0 +1,280 @@
+//! Native Forma scene editor: shape layers, keyframes, timeline and the same project folder as Electron Forma.
+
+use crate::model::{Pose, Scene, Shape};
+use crate::storage;
+use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
+use egui::{Align2, Color32, Rect, Sense, Shape as PaintShape, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn new_id() -> String {
+    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", (n >> 96) as u32, (n >> 80) as u16,
+        (n >> 64) as u16, (n >> 48) as u16, n as u64 & 0xffff_ffff_ffff)
+}
+
+pub struct Forma {
+    place: Place,
+    scene: Scene,
+    selected: Option<String>,
+    time: f64,
+    playing: bool,
+    last_tick: Instant,
+    edited_at: Option<Instant>,
+    show_projects: bool,
+}
+
+impl Forma {
+    pub fn new(place: Place) -> Self {
+        let scene = storage::list(&place).first().and_then(|doc| storage::load_document(&place, &doc.id).ok())
+            .unwrap_or_else(|| Scene::empty(new_id()));
+        Self { place, scene, selected: None, time: 0.0, playing: false, last_tick: Instant::now(), edited_at: None, show_projects: false }
+    }
+
+    fn edited(&mut self) { self.edited_at = Some(Instant::now()); }
+
+    fn open(&mut self, scene: Scene) {
+        let _ = self.save();
+        self.scene = scene;
+        self.selected = None;
+        self.time = 0.0;
+        self.playing = false;
+    }
+
+    fn toolbar(&mut self, ui: &mut Ui, host: &mut dyn Host) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if ui.button("Projects").clicked() { self.show_projects = true; }
+            if ui.button("New").clicked() { self.open(Scene::empty(new_id())); }
+            let name = ui.add(egui::TextEdit::singleline(&mut self.scene.project_name).desired_width(180.0).font(font::bold(14.0)));
+            if name.changed() { self.edited(); }
+            if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
+                self.playing = !self.playing;
+                self.last_tick = Instant::now();
+            }
+            ui.label(format!("{:.2} / {:.2} s", self.time, self.scene.duration));
+            if ui.button("Save").clicked() {
+                match self.save() { Ok(()) => host.toast("Forma project saved".into()), Err(error) => host.toast(error) }
+            }
+        });
+    }
+
+    fn layers(&mut self, ui: &mut Ui) {
+        ui.label(egui::RichText::new("Layers").font(font::bold(14.0)).color(color::INK));
+        ui.add_space(6.0);
+        for (label, kind) in [("Circle", "circle"), ("Rectangle", "rect"), ("Triangle", "triangle"), ("Diamond", "diamond")] {
+            if ui.button(format!("+ {label}")).clicked() {
+                let id = self.scene.add_shape(new_id(), kind);
+                self.selected = Some(id);
+                self.edited();
+            }
+        }
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for shape in &self.scene.shapes {
+                if ui.selectable_label(self.selected.as_deref() == Some(&shape.id), &shape.name).clicked() {
+                    self.selected = Some(shape.id.clone());
+                }
+            }
+        });
+    }
+
+    fn inspector(&mut self, ui: &mut Ui) {
+        ui.label(egui::RichText::new("Layer").font(font::bold(14.0)).color(color::INK));
+        let Some(index) = self.scene.shapes.iter().position(|s| Some(s.id.as_str()) == self.selected.as_deref()) else {
+            ui.label("Select a shape to edit it.");
+            return;
+        };
+        let shape = &mut self.scene.shapes[index];
+        let mut changed = false;
+        changed |= ui.text_edit_singleline(&mut shape.name).changed();
+        ui.label("Fill (hex)");
+        changed |= ui.text_edit_singleline(&mut shape.color).changed();
+        let mut pose = shape.pose(self.time);
+        for (label, value, range) in [
+            ("X", &mut pose.x, -4000.0..=4000.0),
+            ("Y", &mut pose.y, -4000.0..=4000.0),
+            ("Width", &mut pose.w, 1.0..=4000.0),
+            ("Height", &mut pose.h, 1.0..=4000.0),
+            ("Angle", &mut pose.r, -3600.0..=3600.0),
+            ("Opacity", &mut pose.o, 0.0..=100.0),
+        ] {
+            changed |= ui.add(egui::Slider::new(value, range).text(label)).changed();
+        }
+        if changed { shape.edit_pose(self.time, pose); }
+        ui.separator();
+        let added = ui.button("Add keyframe here").clicked();
+        if added { shape.edit_pose(self.time, pose); }
+        ui.label(format!("{} keyframes", shape.keys.len()));
+        if changed || added { self.edited(); }
+    }
+
+    fn canvas(&mut self, ui: &mut Ui) {
+        let area = ui.max_rect().shrink(14.0);
+        let scale = (area.width() / self.scene.width).min(area.height() / self.scene.height).max(0.01);
+        let canvas = Rect::from_center_size(area.center(), vec2(self.scene.width * scale, self.scene.height * scale));
+        let painter = ui.painter();
+        painter.rect_filled(area, 10.0, Color32::from_rgb(24, 29, 37));
+        painter.rect_filled(canvas, 3.0, hex(&self.scene.bg, 255));
+        let mut hits = Vec::new();
+        for shape in &self.scene.shapes {
+            if !shape.visible(self.time, self.scene.duration) { continue; }
+            let pose = shape.pose(self.time);
+            let bounds = paint_shape(painter, canvas, scale, shape, pose);
+            if self.selected.as_deref() == Some(&shape.id) {
+                painter.rect_stroke(bounds.expand(4.0), 3.0, Stroke::new(1.5, color::SUN), StrokeKind::Outside);
+            }
+            hits.push((shape.id.clone(), bounds));
+        }
+        let response = ui.interact(canvas, ui.scope_id().with("forma-canvas"), Sense::click_and_drag());
+        if response.clicked() || response.drag_started() {
+            let pointer = response.interact_pointer_pos();
+            self.selected = pointer.and_then(|p| hits.iter().rev().find(|(_, rect)| rect.contains(p)).map(|(id, _)| id.clone()));
+        }
+        if response.dragged() {
+            let delta = ui.input(|i| i.pointer.delta()) / scale;
+            if delta != egui::Vec2::ZERO {
+                if let Some(shape) = self.scene.shapes.iter_mut().find(|s| Some(s.id.as_str()) == self.selected.as_deref()) {
+                    let mut pose = shape.pose(self.time);
+                    pose.x += delta.x;
+                    pose.y += delta.y;
+                    shape.edit_pose(self.time, pose);
+                    self.edited();
+                }
+            }
+        }
+    }
+
+    fn timeline(&mut self, ui: &mut Ui) {
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 8.0, Color32::from_rgb(31, 37, 48));
+        let left = rect.left() + 130.0;
+        let width = (rect.width() - 150.0).max(1.0);
+        let x = |t: f64| left + width * (t / self.scene.duration).clamp(0.0, 1.0) as f32;
+        for tick in 0..=self.scene.duration.ceil() as usize {
+            let pos = x(tick as f64);
+            ui.painter().line_segment([pos2(pos, rect.top() + 6.0), pos2(pos, rect.bottom())], Stroke::new(0.5, color::HAIRLINE));
+            ui.painter().text(pos2(pos + 3.0, rect.top() + 4.0), Align2::LEFT_TOP, format!("{tick}s"), font::ui(10.0), color::INK_MUTED);
+        }
+        let mut selected = None;
+        for (index, shape) in self.scene.shapes.iter().enumerate() {
+            let y = rect.top() + 29.0 + index as f32 * 30.0;
+            if y + 24.0 > rect.bottom() { break; }
+            let row = Rect::from_min_size(pos2(rect.left() + 5.0, y), vec2(rect.width() - 10.0, 24.0));
+            if ui.interact(row, ui.scope_id().with(("row", &shape.id)), Sense::click()).clicked() { selected = Some(shape.id.clone()); }
+            ui.painter().text(pos2(row.left() + 5.0, y + 12.0), Align2::LEFT_CENTER, &shape.name, font::ui(11.0), color::INK);
+            let bar = Rect::from_min_max(pos2(x(shape.in_time.unwrap_or(0.0)), y + 3.0), pos2(x(shape.out_time.unwrap_or(self.scene.duration)), y + 21.0));
+            ui.painter().rect_filled(bar, 4.0, if self.selected.as_deref() == Some(&shape.id) { color::SUN } else { color::INK_SOFT });
+            for key in &shape.keys { ui.painter().circle_filled(pos2(x(key.t), y + 12.0), 3.0, Color32::WHITE); }
+        }
+        if let Some(id) = selected { self.selected = Some(id); }
+        let play_x = x(self.time);
+        ui.painter().line_segment([pos2(play_x, rect.top()), pos2(play_x, rect.bottom())], Stroke::new(2.0, color::SUN));
+        let ruler = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 25.0));
+        let response = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag());
+        if (response.clicked() || response.dragged()) && response.interact_pointer_pos().is_some() {
+            self.time = (((response.interact_pointer_pos().unwrap().x - left) / width) as f64 * self.scene.duration).clamp(0.0, self.scene.duration);
+            self.playing = false;
+        }
+    }
+
+    fn projects_window(&mut self, ui: &mut Ui) {
+        if !self.show_projects { return; }
+        let mut opened = None;
+        let modal = egui::Modal::new(ui.scope_id().with("forma-projects")).show(ui.ctx(), |ui| {
+            ui.set_width(350.0);
+            ui.heading("Forma projects");
+            for doc in storage::list(&self.place) {
+                if ui.button(format!("{}  ·  {}", doc.name, doc.detail)).clicked() { opened = Some(doc.id); }
+            }
+        });
+        if let Some(id) = opened {
+            if let Ok(scene) = storage::load_document(&self.place, &id) { self.open(scene); }
+            self.show_projects = false;
+        } else if modal.should_close() { self.show_projects = false; }
+    }
+}
+
+impl CanopyApp for Forma {
+    fn ui(&mut self, ui: &mut Ui, host: &mut dyn Host) {
+        if self.playing {
+            let now = Instant::now();
+            self.time += now.duration_since(self.last_tick).as_secs_f64();
+            self.last_tick = now;
+            if self.time >= self.scene.duration { self.time = 0.0; }
+            ui.ctx().request_repaint();
+        }
+        if self.edited_at.is_some_and(|at| at.elapsed() > Duration::from_millis(800)) {
+            if let Err(error) = self.save() { host.toast(format!("Forma couldn't save: {error}")); }
+        } else if self.edited_at.is_some() { ui.ctx().request_repaint_after(Duration::from_millis(850)); }
+        let rect = ui.max_rect();
+        let top = Rect::from_min_size(rect.min, vec2(rect.width(), 43.0));
+        ui.scope_builder(UiBuilder::new().max_rect(top.shrink2(vec2(7.0, 4.0))), |ui| self.toolbar(ui, host));
+        let timeline_h = (rect.height() * 0.28).clamp(150.0, 230.0);
+        let middle = Rect::from_min_max(pos2(rect.left(), top.bottom() + 4.0), pos2(rect.right(), rect.bottom() - timeline_h - 6.0));
+        let left = Rect::from_min_size(middle.min, vec2(170.0, middle.height()));
+        let right = Rect::from_min_max(pos2(middle.right() - 230.0, middle.top()), middle.max);
+        let canvas = Rect::from_min_max(pos2(left.right() + 5.0, middle.top()), pos2(right.left() - 5.0, middle.bottom()));
+        ui.painter().rect_filled(left, 8.0, Color32::from_rgb(31, 37, 48));
+        ui.painter().rect_filled(right, 8.0, Color32::from_rgb(31, 37, 48));
+        ui.scope_builder(UiBuilder::new().max_rect(left.shrink(8.0)), |ui| self.layers(ui));
+        ui.scope_builder(UiBuilder::new().max_rect(canvas), |ui| self.canvas(ui));
+        ui.scope_builder(UiBuilder::new().max_rect(right.shrink(8.0)), |ui| self.inspector(ui));
+        let timeline = Rect::from_min_max(pos2(rect.left(), middle.bottom() + 6.0), rect.max);
+        ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| self.timeline(ui));
+        self.projects_window(ui);
+    }
+
+    fn receive(&mut self, files: Vec<SharedFile>, host: &mut dyn Host) -> Receipt {
+        let mut receipt = Receipt::default();
+        for file in files {
+            match storage::load(&file.path) {
+                Ok(scene) => { self.open(scene); self.edited(); receipt.accepted += 1; }
+                Err(_) => receipt.skipped.push(file.name),
+            }
+        }
+        if receipt.accepted > 0 { host.toast("Opened Forma project".into()); }
+        receipt
+    }
+
+    fn open_document(&mut self, id: &str, host: &mut dyn Host) {
+        match storage::load_document(&self.place, id) { Ok(scene) => self.open(scene), Err(error) => host.toast(error) }
+    }
+
+    fn save(&mut self) -> Result<(), String> {
+        self.edited_at = None;
+        storage::save(&self.place, &self.scene)
+    }
+
+    fn title(&self) -> String { self.scene.project_name.clone() }
+}
+
+fn hex(value: &str, alpha: u8) -> Color32 {
+    let bytes = value.as_bytes();
+    if bytes.len() == 7 && bytes[0] == b'#' {
+        let channel = |i| u8::from_str_radix(&value[i..i + 2], 16).unwrap_or(0);
+        Color32::from_rgba_unmultiplied(channel(1), channel(3), channel(5), alpha)
+    } else { Color32::from_rgba_unmultiplied(170, 160, 206, alpha) }
+}
+
+fn paint_shape(painter: &egui::Painter, canvas: Rect, scale: f32, shape: &Shape, pose: Pose) -> Rect {
+    let center = pos2(canvas.left() + pose.x * scale, canvas.top() + pose.y * scale);
+    let size = vec2(pose.w * scale, pose.h * scale);
+    let bounds = Rect::from_center_size(center, size);
+    let fill = hex(&shape.color, (pose.o * 2.55).round() as u8);
+    let angle = pose.r.to_radians();
+    let point = |x: f32, y: f32| pos2(center.x + x * angle.cos() - y * angle.sin(), center.y + x * angle.sin() + y * angle.cos());
+    let (w, h) = (size.x / 2.0, size.y / 2.0);
+    match shape.kind.as_str() {
+        "circle" => { painter.add(PaintShape::circle_filled(center, w.min(h), fill)); }
+        "triangle" => { painter.add(PaintShape::convex_polygon(vec![point(0.0, -h), point(w, h), point(-w, h)], fill, Stroke::NONE)); }
+        "diamond" => { painter.add(PaintShape::convex_polygon(vec![point(0.0, -h), point(w, 0.0), point(0.0, h), point(-w, 0.0)], fill, Stroke::NONE)); }
+        "arrow" => { painter.add(PaintShape::convex_polygon(vec![point(-w, -h * 0.18), point(w * 0.12, -h * 0.18), point(w * 0.12, -h), point(w, 0.0), point(w * 0.12, h), point(w * 0.12, h * 0.18), point(-w, h * 0.18)], fill, Stroke::NONE)); }
+        "text" => { painter.text(center, Align2::CENTER_CENTER, shape.extra.get("text").and_then(|v| v.as_str()).unwrap_or("Text"), font::bold(size.y.min(80.0)), fill); }
+        "rect" => { painter.add(PaintShape::convex_polygon(vec![point(-w, -h), point(w, -h), point(w, h), point(-w, h)], fill, Stroke::NONE)); }
+        _ => {
+            painter.rect_filled(bounds, 3.0, fill);
+            painter.text(center, Align2::CENTER_CENTER, format!("{} layer", shape.kind), font::ui(12.0), Color32::BLACK);
+        }
+    }
+    bounds
+}
