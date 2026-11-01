@@ -214,6 +214,11 @@ impl Forma {
                 self.edited();
             }
         }
+        if ui.button("+ Text").clicked() {
+            let id = self.scene.add_text(new_id());
+            self.selected = Some(id);
+            self.edited();
+        }
         ui.separator();
         if self.selected.is_some() {
             if ui.button("Duplicate selected").clicked() {
@@ -305,6 +310,14 @@ impl Forma {
         let shape = &mut self.scene.shapes[index];
         let mut changed = false;
         changed |= ui.text_edit_singleline(&mut shape.name).changed();
+        if shape.kind == "text" {
+            ui.label("Text");
+            let mut content = shape.extra.get("text").and_then(|value| value.as_str()).unwrap_or("").to_owned();
+            if ui.add(egui::TextEdit::multiline(&mut content).desired_rows(3)).changed() {
+                shape.extra.insert("text".into(), content.into());
+                changed = true;
+            }
+        }
         ui.label("Fill (hex)");
         changed |= ui.text_edit_singleline(&mut shape.color).changed();
         let mut pose = shape.pose(self.time);

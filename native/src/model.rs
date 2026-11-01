@@ -140,6 +140,24 @@ impl Scene {
         id
     }
 
+    pub fn add_text(&mut self, id: String) -> String {
+        let font_size = (self.width.min(self.height) * 0.08).clamp(24.0, 320.0).round();
+        let text_width = font_size * 4.2;
+        self.add_shape(id.clone(), "text");
+        let shape = self.shapes.last_mut().unwrap();
+        shape.name = "Your text".into();
+        shape.color = "#1F3D2B".into();
+        shape.keys[0].w = text_width;
+        shape.keys[0].h = font_size;
+        shape.extra.insert("text".into(), "Your text".into());
+        shape.extra.insert("linkId".into(), "".into());
+        shape.extra.insert("offsetX".into(), 0.into());
+        shape.extra.insert("offsetY".into(), 0.into());
+        shape.extra.insert("textWidth".into(), serde_json::json!(text_width));
+        shape.extra.insert("fontSize".into(), serde_json::json!(font_size));
+        id
+    }
+
     pub fn resize(&mut self, width: f32, height: f32) {
         let (sx, sy) = (width / self.width, height / self.height);
         for shape in &mut self.shapes {
@@ -342,5 +360,18 @@ mod tests {
         scene.resize(1920.0, 1200.0);
         assert_eq!((scene.shapes[0].keys[0].x, scene.shapes[0].keys[0].w), (960.0, 320.0));
         assert_eq!((scene.width, scene.height), (1920.0, 1200.0));
+    }
+
+    #[test]
+    fn new_text_has_the_electron_fields_and_round_trips() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_text("words".into());
+        let bytes = serde_json::to_vec(&scene).unwrap();
+        let restored = Scene::read(&bytes).unwrap();
+        let text = &restored.shapes[0];
+        assert_eq!(text.kind, "text");
+        assert_eq!(text.extra["text"], "Your text");
+        assert!(text.extra["textWidth"].as_f64().unwrap() > 0.0);
+        assert!(text.extra["fontSize"].as_f64().unwrap() > 0.0);
     }
 }
