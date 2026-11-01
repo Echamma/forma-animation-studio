@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+  "-C", "dlltool=C:\\Users\\elias\\AppData\\Local\\canopy-toolchain\\dlltool.exe",
+  "-C", "linker=rust-lld",
+  "-C", "linker-flavor=ld.lld",
+]

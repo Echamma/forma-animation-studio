@@ -1,0 +1,24 @@
+[package]
+name = "forma-native"
+description = "Forma's native animation editor"
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+canopy-ui = { path = "../../canopy/native/crates/canopy-ui" }
+egui = "0.37.0"
+eframe = "0.37.0"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+strip = true
+lto = "thin"
