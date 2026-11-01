@@ -104,7 +104,7 @@ pub struct Key {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pose {
     pub x: f32, pub y: f32, pub w: f32, pub h: f32, pub r: f32, pub o: f32,
 }

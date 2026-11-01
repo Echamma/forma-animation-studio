@@ -6,6 +6,7 @@ pub mod archive;
 pub mod assets;
 pub mod media;
 pub mod model;
+pub mod motion;
 pub mod render;
 pub mod storage;
 pub mod svg;

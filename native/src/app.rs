@@ -4,6 +4,7 @@ use crate::animated_svg;
 use crate::archive;
 use crate::assets;
 use crate::model::{self, HANDLES, Pose, RotationClip, Scene, Shape, resized_pose};
+use crate::motion;
 use crate::render;
 use crate::storage;
 use crate::video;
@@ -123,6 +124,15 @@ pub struct Forma {
     gesture: Option<Gesture>,
     /// A drag on the timeline.
     timeline_drag: Option<TimelineDrag>,
+    /// Drawing a move: the tool ("arrow" or "path"), its options, and what's drawn so far (from the layer's pose).
+    motion_mode: Option<&'static str>,
+    motion_options: motion::Options,
+    motion_draft: Option<(Pose, Vec<motion::Point>)>,
+    /// The move chosen in the inspector, and its fields being edited (start, length, options).
+    selected_motion: Option<String>,
+    motion_edit: (f64, f64, motion::Options),
+    /// A message for the next toast.
+    notice: Option<String>,
     suppress_history: bool,
     export: Option<video::Export>,
 }
@@ -153,6 +163,12 @@ impl Forma {
             recording_drag: false,
             gesture: None,
             timeline_drag: None,
+            motion_mode: None,
+            motion_options: motion::Options::default(),
+            motion_draft: None,
+            selected_motion: None,
+            motion_edit: (0.0, 1.0, motion::Options::default()),
+            notice: None,
             suppress_history: false,
             export: None,
         }
@@ -322,7 +338,7 @@ impl Forma {
                 self.edited();
             }
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("forma-layers").show(ui, |ui| {
             for shape in &self.scene.shapes {
                 if ui
                     .selectable_label(self.selected.as_deref() == Some(&shape.id), &shape.name)
@@ -380,6 +396,7 @@ impl Forma {
             }
             return;
         };
+        let mut pose = self.scene.editable_pose(&self.scene.shapes[index], self.time);
         let shape = &mut self.scene.shapes[index];
         let mut changed = false;
         changed |= ui.text_edit_singleline(&mut shape.name).changed();
@@ -393,7 +410,7 @@ impl Forma {
         }
         ui.label("Fill (hex)");
         changed |= ui.text_edit_singleline(&mut shape.color).changed();
-        let mut pose = shape.pose(self.time);
+        let mut posed = false;
         for (label, value, range) in [
             ("X", &mut pose.x, -4000.0..=4000.0),
             ("Y", &mut pose.y, -4000.0..=4000.0),
@@ -402,18 +419,17 @@ impl Forma {
             ("Angle", &mut pose.r, -3600.0..=3600.0),
             ("Opacity", &mut pose.o, 0.0..=100.0),
         ] {
-            changed |= ui
+            posed |= ui
                 .add(egui::Slider::new(value, range).text(label))
                 .changed();
         }
-        if changed {
-            shape.edit_pose(self.time, pose);
-        }
         ui.separator();
         let added = ui.button("Add keyframe here").clicked();
-        if added {
-            shape.edit_pose(self.time, pose);
+        if posed || added {
+            self.scene.set_pose(index, self.time, pose);
+            changed = true;
         }
+        let shape = &mut self.scene.shapes[index];
         ui.label(format!("{} keyframes", shape.keys.len()));
         let mut animated = false;
         ui.horizontal(|ui| {
@@ -472,6 +488,86 @@ impl Forma {
         if changed || added || animated {
             self.edited();
         }
+        self.motion_panel(ui, index);
+    }
+
+    /// Electron's drawn moves: draw an arrow or record a path on the canvas from the playhead, then retime, rescale
+    /// or delete it.
+    fn motion_panel(&mut self, ui: &mut Ui, index: usize) {
+        ui.separator();
+        ui.label(egui::RichText::new("Draw a move").font(font::bold(13.0)).color(color::INK));
+        ui.horizontal(|ui| {
+            for (label, kind) in [("Draw arrow", "arrow"), ("Record path", "path")] {
+                if ui.selectable_label(self.motion_mode == Some(kind), label).clicked() {
+                    self.motion_mode = if self.motion_mode == Some(kind) { None } else { Some(kind) };
+                    self.motion_draft = None;
+                    self.playing = false;
+                }
+            }
+        });
+        let help = match self.motion_mode {
+            Some("arrow") => "Drag anywhere on the canvas to set the arrow destination.",
+            Some(_) => "Hold and drag on the canvas. The selected shape will follow your mouse.",
+            None => "Choose a tool, then drag anywhere on the canvas. The motion begins at the playhead.",
+        };
+        ui.label(egui::RichText::new(help).font(font::ui(11.0)).color(color::INK_MUTED));
+        let options = &mut self.motion_options;
+        egui::Grid::new("forma-motion-options").num_columns(2).show(ui, |ui| {
+            ui.label("Seconds");
+            ui.add(egui::DragValue::new(&mut options.seconds).range(0.1..=120.0).speed(0.1).fixed_decimals(1));
+            ui.end_row();
+            ui.label("Distance %");
+            ui.add(egui::DragValue::new(&mut options.distance).range(0.0..=500.0).speed(5.0));
+            ui.end_row();
+            ui.label("Spin °");
+            ui.add(egui::DragValue::new(&mut options.spin).range(-10000.0..=10000.0).speed(5.0));
+            ui.end_row();
+        });
+        ui.checkbox(&mut options.face, "Turn to face where it's going");
+        let list = motion::motions(&self.scene.shapes[index]);
+        for (i, m) in list.iter().enumerate() {
+            let name = format!("{} {} · {:.1}–{:.1} s · {}%", if m.kind == "path" { "Mouse path" } else { "Arrow move" }, i + 1, m.start_time, m.start_time + m.duration, m.distance);
+            if ui.selectable_label(self.selected_motion.as_deref() == Some(&m.id), name).clicked() {
+                self.selected_motion = Some(m.id.clone());
+                self.motion_edit = (m.start_time, m.duration, motion::Options { seconds: m.duration, distance: m.distance, spin: m.spin, face: m.face });
+                (self.time, self.playing) = (m.start_time, false);
+            }
+        }
+        let Some(id) = self.selected_motion.clone().filter(|id| list.iter().any(|m| &m.id == id)) else { return };
+        let (start, length, options) = &mut self.motion_edit;
+        egui::Grid::new("forma-motion-edit").num_columns(2).show(ui, |ui| {
+            ui.label("Starts at (s)");
+            ui.add(egui::DragValue::new(start).range(0.0..=3600.0).speed(0.01).fixed_decimals(2));
+            ui.end_row();
+            ui.label("Length (s)");
+            ui.add(egui::DragValue::new(length).range(0.1..=3600.0).speed(0.01).fixed_decimals(2));
+            ui.end_row();
+            ui.label("Distance %");
+            ui.add(egui::DragValue::new(&mut options.distance).range(0.0..=500.0).speed(5.0));
+            ui.end_row();
+            ui.label("Spin °");
+            ui.add(egui::DragValue::new(&mut options.spin).range(-10000.0..=10000.0).speed(5.0));
+            ui.end_row();
+        });
+        ui.checkbox(&mut options.face, "Turn to face where it's going");
+        let (start, length, options) = self.motion_edit;
+        ui.horizontal(|ui| {
+            if ui.button("Update").clicked() {
+                match motion::edit(&mut self.scene, index, &id, start, length, options) {
+                    Ok(()) => {
+                        (self.time, self.playing) = (start, false);
+                        self.edited();
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
+            if ui.button("Delete").clicked() {
+                motion::remove(&mut self.scene, index, &id);
+                self.selected_motion = None;
+                self.time = start;
+                self.edited();
+            }
+        });
     }
 
     fn canvas(&mut self, ui: &mut Ui) {
@@ -581,6 +677,63 @@ impl Forma {
             ui.scope_id().with("forma-canvas"),
             Sense::click_and_drag(),
         );
+        let to_screen = |p: motion::Point| pos2(canvas.left() + p.x * scale, canvas.top() + p.y * scale);
+        // The selected move's path, and one being drawn.
+        if let Some(m) = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().find(|s| s.id == id))
+            .and_then(|s| motion::motions(s).into_iter().find(|m| Some(&m.id) == self.selected_motion.as_ref()))
+        {
+            let points: Vec<Pos2> = motion::scaled_points(&m).into_iter().map(to_screen).collect();
+            painter.add(egui::Shape::line(points, Stroke::new(2.0, color::SUN.gamma_multiply(0.7))));
+        }
+        if let Some((start, points)) = &self.motion_draft {
+            let mut line = vec![to_screen(motion::Point { x: start.x, y: start.y })];
+            line.extend(points.iter().map(|p| to_screen(*p)));
+            if self.motion_mode == Some("arrow") {
+                line = vec![line[0], *line.last().unwrap()];
+            }
+            painter.add(egui::Shape::line(line.clone(), Stroke::new(2.5, color::SUN)));
+            if let [.., a, b] = line[..] {
+                let back = (a - b).normalized() * 12.0;
+                let side = vec2(-back.y, back.x) * 0.5;
+                painter.add(egui::Shape::convex_polygon(vec![b, b + back + side, b + back - side], color::SUN, Stroke::NONE));
+            }
+        }
+        if let Some(kind) = self.motion_mode {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            let to_scene = |p: Pos2| motion::Point { x: (p.x - canvas.left()) / scale, y: (p.y - canvas.top()) / scale };
+            let index = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id));
+            if let (true, Some(index), Some(p)) = (response.drag_started(), index, ui.input(|i| i.pointer.press_origin())) {
+                self.motion_draft = Some((self.scene.editable_pose(&self.scene.shapes[index], self.time), vec![to_scene(p)]));
+            }
+            if let (true, Some((_, points)), Some(p)) = (response.dragged(), self.motion_draft.as_mut(), response.interact_pointer_pos()) {
+                let p = to_scene(p);
+                let last = *points.last().unwrap();
+                if kind == "arrow" {
+                    *points.last_mut().unwrap() = p;
+                } else if (p.x - last.x).hypot(p.y - last.y) > 3.0 {
+                    points.push(p);
+                }
+            }
+            if response.drag_stopped() {
+                if let (Some((start, mut points)), Some(index)) = (self.motion_draft.take(), index) {
+                    if kind == "path" {
+                        points.insert(0, motion::Point { x: start.x, y: start.y });
+                    }
+                    match motion::draw(&mut self.scene, index, kind, start, &points, self.time, self.motion_options, new_id()) {
+                        Ok(id) => {
+                            let m = motion::motions(&self.scene.shapes[index]).into_iter().find(|m| m.id == id).unwrap();
+                            self.motion_edit = (m.start_time, m.duration, motion::Options { seconds: m.duration, ..self.motion_options });
+                            self.selected_motion = Some(id);
+                            self.time = m.start_time + m.duration;
+                            self.edited();
+                        }
+                        Err(error) => self.notice = Some(error),
+                    }
+                    self.motion_mode = None;
+                }
+            }
+            return;
+        }
         let near_handle = |p: Pos2| {
             handles.iter().find(|(_, at, reach)| {
                 let d = local(p, (*at, Vec2::ZERO, selected.map_or(0.0, |s| s.2)));
@@ -709,7 +862,7 @@ impl Forma {
         let rows = self.rows();
         let area = Rect::from_min_max(pos2(rect.left(), rect.top() + 27.0), rect.max);
         ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("forma-timeline").auto_shrink(false).show(ui, |ui| {
                 for row in &rows {
                     let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
                     self.timeline_row(ui, row, line, &x, width);
@@ -1212,8 +1365,11 @@ impl CanopyApp for Forma {
         });
         ui.scope_builder(UiBuilder::new().max_rect(canvas), |ui| self.canvas(ui));
         ui.scope_builder(UiBuilder::new().max_rect(right.shrink(8.0)), |ui| {
-            self.inspector(ui)
+            egui::ScrollArea::vertical().id_salt("forma-inspector").show(ui, |ui| self.inspector(ui));
         });
+        if let Some(notice) = self.notice.take() {
+            host.toast(notice);
+        }
         let timeline = Rect::from_min_max(pos2(rect.left(), middle.bottom() + 6.0), rect.max);
         ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| self.timeline(ui));
         self.projects_window(ui);
