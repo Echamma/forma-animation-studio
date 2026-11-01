@@ -342,6 +342,161 @@ impl Scene {
     }
 }
 
+impl Scene {
+    /// The next free numbered name for copies of `name` ("Pose" → "Pose 2", "Pose 2" → "Pose 3"), as Electron numbers
+    /// clips.
+    fn numbered_name(&self, name: &str) -> String {
+        let base: String = strip_number(name).chars().take(90).collect();
+        let highest = self.shapes.iter().filter_map(|s| s.name.strip_prefix(&base)?.strip_prefix(' ')?.parse::<u32>().ok()).fold(1, u32::max);
+        format!("{base} {}", highest + 1)
+    }
+
+    fn track_of(&mut self, index: usize, id: impl FnOnce() -> String) -> String {
+        let shape = &mut self.shapes[index];
+        match shape.extra.get("trackId").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+            Some(track) => track.to_owned(),
+            None => {
+                let track = id();
+                shape.extra.insert("trackId".into(), track.clone().into());
+                track
+            }
+        }
+    }
+
+    /// Cuts a clip in two at `t`; both halves keep the whole animation, so nothing changes on screen (Electron's
+    /// `splitAt`). Returns the second half's index.
+    pub fn split_at(&mut self, index: usize, t: f64, id: String, track: String) -> Result<usize, String> {
+        if is_linked(&self.shapes[index]) {
+            return Err("Linked text follows its shape; split the shape instead".into());
+        }
+        let t = hundredths(t);
+        let shape = &self.shapes[index];
+        let (start, end) = (shape.clip_start(), shape.out_time.unwrap_or(self.duration));
+        if t < start + MIN_CLIP || t > end - MIN_CLIP {
+            return Err("Move the playhead inside the clip to split it".into());
+        }
+        let track = self.track_of(index, || track);
+        let mut second = self.shapes[index].clone();
+        (second.id, second.name, second.in_time) = (id, self.numbered_name(&self.shapes[index].name), Some(t));
+        second.extra.insert("trackId".into(), track.into());
+        let first = &mut self.shapes[index];
+        first.out_time = Some(t);
+        if first.kind == "video" {
+            let media_start = first.extra.get("mediaStart").and_then(Value::as_f64).unwrap_or(0.0);
+            second.extra.insert("mediaStart".into(), serde_json::json!(hundredths(media_start + t - start)));
+        }
+        self.shapes.insert(index + 1, second);
+        Ok(index + 1)
+    }
+
+    /// A still copy of `template` (the clip itself when `None`) right after the clip on its track, where the clip ends,
+    /// for the next pose of a stop-motion sequence; later clips on the track move over to make room (Electron's
+    /// `continueAfter`). A clip without an end first ends at the playhead, or after a second. Returns the copy's index.
+    pub fn continue_after(&mut self, index: usize, template: Option<&Shape>, playhead: f64, id: String, track: String) -> Result<usize, String> {
+        if is_linked(&self.shapes[index]) || template.is_some_and(is_linked) {
+            return Err("Linked text follows its shape; continue the shape instead".into());
+        }
+        let start = self.shapes[index].clip_start();
+        if self.shapes[index].out_time.is_none() {
+            let end = if playhead > start + MIN_CLIP && playhead < self.duration { playhead } else { start + 1.0 };
+            self.shapes[index].out_time = Some(hundredths(end));
+        }
+        let end = self.shapes[index].out_time.unwrap();
+        let length = hundredths(end - start);
+        let track = self.track_of(index, || track);
+        let later: Vec<usize> = (0..self.shapes.len()).filter(|&i| i != index && self.shapes[i].extra.get("trackId").and_then(Value::as_str) == Some(track.as_str()) && self.shapes[i].clip_start() >= end - 1e-6).collect();
+        for i in later {
+            self.shift_layer(i, length);
+        }
+        let source = &self.shapes[index];
+        let ending = still_pose(source, end);
+        let template = template.unwrap_or(source);
+        let same = template.id == source.id;
+        let mut copy = template.clone();
+        let pose = if same { ending } else { Pose { x: ending.x, y: ending.y, r: ending.r, ..still_pose(template, template.clip_start()) } };
+        copy.id = id;
+        copy.name = self.numbered_name(&template.name);
+        copy.extra.insert("trackId".into(), track.into());
+        (copy.in_time, copy.out_time) = (Some(end), Some(hundredths(end + length)));
+        copy.keys = vec![Key { t: end, x: pose.x, y: pose.y, w: pose.w, h: pose.h, r: pose.r, o: pose.o, ease: None, curve: None, extra: Map::new() }];
+        copy.color = if same { source.color_at(end) } else { template.color_at(template.clip_start()) };
+        copy.color_keys.clear();
+        if !same {
+            copy.base_rotation = source.base_rotation;
+        }
+        copy.extra.remove("motions");
+        copy.rotation_clips.clear();
+        copy.disappear = None;
+        if copy.kind == "video" {
+            let media_start = |s: &Shape| s.extra.get("mediaStart").and_then(Value::as_f64).unwrap_or(0.0);
+            let next = if same { hundredths(media_start(source) + length) } else { media_start(template) };
+            if next == 0.0 { copy.extra.remove("mediaStart"); } else { copy.extra.insert("mediaStart".into(), serde_json::json!(next)); }
+        }
+        self.duration = self.duration.max(copy.out_time.unwrap());
+        self.shapes.insert(index + 1, copy);
+        Ok(index + 1)
+    }
+
+    /// An independent copy at the same time, nudged so it doesn't hide the original (Electron's `duplicateLayer`).
+    /// Returns its index.
+    pub fn duplicate_layer(&mut self, index: usize, id: String) -> usize {
+        let copy = self.nudged_copy(&self.shapes[index], id);
+        self.duration = self.duration.max(copy.latest_time());
+        self.shapes.insert(index + 1, copy);
+        index + 1
+    }
+
+    /// A copied layer pasted on top, nudged like a duplicate (Electron duplicates its clipboard). Returns its index.
+    pub fn paste_layer(&mut self, layer: &Shape, id: String) -> usize {
+        let copy = self.nudged_copy(layer, id);
+        self.duration = self.duration.max(copy.latest_time());
+        self.shapes.push(copy);
+        self.shapes.len() - 1
+    }
+
+    fn nudged_copy(&self, layer: &Shape, id: String) -> Shape {
+        const NUDGE: f32 = 20.0;
+        let mut copy = layer.clone();
+        (copy.id, copy.name) = (id, self.numbered_name(&copy.name));
+        copy.extra.remove("trackId");
+        if is_linked(&copy) {
+            let offset = copy.extra.get("offsetX").and_then(Value::as_f64).unwrap_or(0.0) + NUDGE as f64;
+            copy.extra.insert("offsetX".into(), serde_json::json!(offset));
+        } else {
+            for key in &mut copy.keys {
+                (key.x, key.y) = (key.x + NUDGE, key.y + NUDGE);
+            }
+            let nudge = |p: &mut Value| {
+                for axis in ["x", "y"] {
+                    if let Some(v) = p.get(axis).and_then(Value::as_f64) { p[axis] = serde_json::json!(v + NUDGE as f64); }
+                }
+            };
+            for m in copy.extra.get_mut("motions").and_then(Value::as_array_mut).into_iter().flatten() {
+                if let Some(start) = m.get_mut("startPose") { nudge(start) }
+                for list in ["sourcePoints", "baseKeys"] {
+                    for p in m.get_mut(list).and_then(Value::as_array_mut).into_iter().flatten() { nudge(p) }
+                }
+            }
+        }
+        copy
+    }
+}
+
+/// A name without a trailing number (Electron's `/ \d+$/`).
+fn strip_number(name: &str) -> &str {
+    match name.rsplit_once(' ') {
+        Some((base, number)) if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => name,
+    }
+}
+
+/// The pose a layer shows at `t` as keyframe values: rotation clips baked in, base rotation kept apart.
+fn still_pose(shape: &Shape, t: f64) -> Pose {
+    let mut pose = shape.pose(t);
+    pose.r += shape.rotation_at(t);
+    pose
+}
+
 /// A drawn move's start and length (Electron keeps them in `motions`, which Forma native doesn't edit yet).
 pub fn motions(shape: &Shape) -> impl Iterator<Item = (&Value, f64, f64)> {
     shape.extra.get("motions").and_then(Value::as_array).into_iter().flatten().filter_map(|m| {
@@ -638,6 +793,45 @@ mod tests {
         scene.trim_clip(0, 0.0, None).unwrap();
         assert_eq!((scene.shapes[0].in_time, scene.shapes[0].out_time), (Some(0.0), None));
         assert_eq!(scene.shapes[0].keys[0].t, 0.0);
+    }
+
+    #[test]
+    fn splitting_makes_two_clips_on_one_track_that_look_the_same() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "rect");
+        scene.shapes[0].name = "Pose".into();
+        assert!(scene.split_at(0, 0.01, "b".into(), "track".into()).is_err(), "too close to the start");
+        let second = scene.split_at(0, 2.0, "b".into(), "track".into()).unwrap();
+        let (a, b) = (&scene.shapes[0], &scene.shapes[second]);
+        assert_eq!((a.out_time, b.in_time, b.out_time), (Some(2.0), Some(2.0), None));
+        assert_eq!((b.name.as_str(), b.extra["trackId"].as_str(), a.extra["trackId"].as_str()), ("Pose 2", Some("track"), Some("track")));
+        assert_eq!(a.keys, b.keys);
+    }
+
+    #[test]
+    fn the_next_pose_starts_where_the_clip_ends_and_pushes_later_clips() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "rect");
+        scene.shapes[0].name = "Pose 1".into();
+        let shape = &mut scene.shapes[0];
+        shape.edit_pose(1.0, Pose { x: 700.0, ..shape.pose(0.0) });
+        let next = scene.continue_after(0, None, 1.0, "b".into(), "track".into()).unwrap();
+        let copy = &scene.shapes[next];
+        assert_eq!((copy.name.as_str(), copy.in_time, copy.out_time), ("Pose 2", Some(1.0), Some(2.0)));
+        assert_eq!((copy.keys.len(), copy.keys[0].x), (1, 700.0), "a still copy of where it ended");
+        // Another next pose after the first one pushes the second along.
+        scene.continue_after(0, None, 1.0, "c".into(), "unused".into()).unwrap();
+        assert_eq!(scene.shapes.iter().map(|s| (s.name.as_str(), s.clip_start())).collect::<Vec<_>>(), vec![("Pose 1", 0.0), ("Pose 3", 1.0), ("Pose 2", 2.0)]);
+    }
+
+    #[test]
+    fn duplicates_are_nudged_and_numbered() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "circle");
+        let copy = scene.duplicate_layer(0, "b".into());
+        assert_eq!((scene.shapes[copy].name.as_str(), scene.shapes[copy].keys[0].x), ("Circle 2", 500.0));
+        let third = scene.duplicate_layer(0, "c".into());
+        assert_eq!(scene.shapes[third].name, "Circle 3");
     }
 
     #[test]

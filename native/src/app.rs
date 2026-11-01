@@ -25,6 +25,18 @@ enum Gesture {
     Rotate { index: usize, center: Pos2, last: f32 },
 }
 
+/// Electron's clip menu and shortcuts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipAction {
+    Next,
+    PasteAfter,
+    Paste,
+    Split,
+    Duplicate,
+    Copy,
+    Delete,
+}
+
 /// A timeline row (see `Forma::rows`).
 enum Row {
     Layer { name: String, clips: Vec<usize> },
@@ -135,6 +147,8 @@ pub struct Forma {
     motion_edit: (f64, f64, motion::Options),
     /// A message for the next toast.
     notice: Option<String>,
+    /// A layer copied with Ctrl+C.
+    clipboard: Option<Shape>,
     suppress_history: bool,
     export: Option<video::Export>,
 }
@@ -172,6 +186,7 @@ impl Forma {
             selected_spin: None,
             motion_edit: (0.0, 1.0, motion::Options::default()),
             notice: None,
+            clipboard: None,
             suppress_history: false,
             export: None,
         }
@@ -313,32 +328,11 @@ impl Forma {
         }
         ui.separator();
         if self.selected.is_some() {
-            if ui.button("Duplicate selected").clicked() {
-                if let Some(shape) = self
-                    .scene
-                    .shapes
-                    .iter()
-                    .find(|s| Some(s.id.as_str()) == self.selected.as_deref())
-                    .cloned()
-                {
-                    let mut copy = shape;
-                    copy.id = new_id();
-                    copy.name = format!("{} copy", copy.name);
-                    for key in &mut copy.keys {
-                        key.x += 20.0;
-                        key.y += 20.0;
-                    }
-                    self.selected = Some(copy.id.clone());
-                    self.scene.shapes.push(copy);
-                    self.edited();
-                }
+            if ui.button("Duplicate selected").on_hover_text("Ctrl+D").clicked() {
+                self.clip_action(ClipAction::Duplicate);
             }
-            if ui.button("Delete selected").clicked() {
-                self.scene
-                    .shapes
-                    .retain(|shape| Some(shape.id.as_str()) != self.selected.as_deref());
-                self.selected = None;
-                self.edited();
+            if ui.button("Delete selected").on_hover_text("Delete").clicked() {
+                self.clip_action(ClipAction::Delete);
             }
         }
         egui::ScrollArea::vertical().id_salt("forma-layers").show(ui, |ui| {
@@ -1156,9 +1150,26 @@ impl Forma {
             ui.ctx().set_cursor_icon(if edge { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Grab });
         }
         self.timeline_gesture(ui, &response, index, span, Part::Clip, width);
-        if response.clicked() {
+        if response.clicked() || response.secondary_clicked() {
             self.select_clip(index);
         }
+        response.context_menu(|ui| {
+            for (label, action, keys) in [
+                ("Next pose after this", ClipAction::Next, ""),
+                ("Paste copied layer after", ClipAction::PasteAfter, "Ctrl+Shift+V"),
+                ("Split at playhead", ClipAction::Split, "S"),
+                ("Duplicate", ClipAction::Duplicate, "Ctrl+D"),
+                ("Copy", ClipAction::Copy, "Ctrl+C"),
+                ("Delete clip", ClipAction::Delete, "Delete"),
+            ] {
+                let enabled = action != ClipAction::PasteAfter || self.clipboard.is_some();
+                if ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(keys)).clicked() {
+                    self.select_clip(index);
+                    self.clip_action(action);
+                    ui.close();
+                }
+            }
+        });
         // Keyframes inside the clip: click to go to one, right-click to move, ease or delete it.
         let shape = &self.scene.shapes[index];
         let keys: Vec<(usize, f64)> = shape.keys.iter().enumerate().map(|(i, k)| (i, k.t)).filter(|(_, t)| *t >= start - 1e-6 && *t <= end + 1e-6).collect();
@@ -1194,6 +1205,53 @@ impl Forma {
                     ui.close();
                 }
             });
+        }
+    }
+
+    /// Electron's clip actions, on the selected layer: they report problems as a toast.
+    fn clip_action(&mut self, action: ClipAction) {
+        if action == ClipAction::Paste {
+            if let Some(copied) = self.clipboard.clone() {
+                let index = self.scene.paste_layer(&copied, new_id());
+                self.selected = Some(self.scene.shapes[index].id.clone());
+                self.edited();
+            }
+            return;
+        }
+        let Some(index) = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id)) else {
+            self.notice = Some("Select a clip first".into());
+            return;
+        };
+        self.playing = false;
+        let result = match action {
+            ClipAction::Next => self.scene.continue_after(index, None, self.time, new_id(), new_id()).map(|i| (i, "added — drag it to its next position")),
+            ClipAction::PasteAfter => match self.clipboard.clone() {
+                Some(template) => self.scene.continue_after(index, Some(&template), self.time, new_id(), new_id()).map(|i| (i, "added — drag it to its next position")),
+                None => Err("Copy a layer first (Ctrl+C)".into()),
+            },
+            ClipAction::Split => self.scene.split_at(index, self.time, new_id(), new_id()).map(|i| (i, "split off")),
+            ClipAction::Duplicate | ClipAction::Paste => Ok((self.scene.duplicate_layer(index, new_id()), "added")),
+            ClipAction::Copy => {
+                self.clipboard = Some(self.scene.shapes[index].clone());
+                self.notice = Some(format!("{} copied", self.scene.shapes[index].name));
+                return;
+            }
+            ClipAction::Delete => {
+                let gone = self.scene.shapes.remove(index);
+                self.selected = None;
+                self.notice = Some(format!("{} deleted", gone.name));
+                self.edited();
+                return;
+            }
+        };
+        match result {
+            Ok((index, done)) => {
+                let shape = &self.scene.shapes[index];
+                self.notice = Some(format!("{} {done} at {:.2} s", shape.name, shape.clip_start()));
+                (self.selected, self.time) = (Some(shape.id.clone()), shape.clip_start());
+                self.edited();
+            }
+            Err(error) => self.notice = Some(error),
         }
     }
 
@@ -1503,6 +1561,32 @@ impl CanopyApp for Forma {
                 self.undo();
             } else if redo {
                 self.redo();
+            }
+            // Electron's clip shortcuts (ui/clips.js), and Delete.
+            if !ui.ctx().egui_wants_keyboard_input() {
+                let action = ui.input(|i| {
+                    let command = i.modifiers.command;
+                    let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy)) || (command && i.key_pressed(egui::Key::C));
+                    let paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))) || (command && i.key_pressed(egui::Key::V));
+                    if copy {
+                        Some(ClipAction::Copy)
+                    } else if paste && i.modifiers.shift {
+                        Some(ClipAction::PasteAfter)
+                    } else if paste {
+                        Some(ClipAction::Paste)
+                    } else if command && !i.modifiers.shift && i.key_pressed(egui::Key::D) {
+                        Some(ClipAction::Duplicate)
+                    } else if !command && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(egui::Key::S) {
+                        Some(ClipAction::Split)
+                    } else if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+                        Some(ClipAction::Delete)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(action) = action {
+                    self.clip_action(action);
+                }
             }
         }
         if self.playing {
