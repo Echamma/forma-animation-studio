@@ -407,12 +407,13 @@ impl Forma {
     fn scene_settings(&mut self, ui: &mut Ui) {
         egui::CollapsingHeader::new("Scene settings").id_salt("forma-scene-settings").show(ui, |ui| {
             let (mut width, mut height) = (self.scene.width as u32, self.scene.height as u32);
-            ui.horizontal(|ui| {
+            // Wrapped: the inspector is narrower than the three sizes side by side.
+            ui.horizontal_wrapped(|ui| {
                 for (label, w, h) in [("Landscape", 960, 600), ("Portrait", 1080, 1920), ("Square", 1080, 1080)] {
                     if ui.selectable_label(width == w && height == h, label).clicked() { (width, height) = (w, h); }
                 }
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Width");
                 ui.add(egui::DragValue::new(&mut width).range(64..=4096).speed(1));
                 ui.label("Height");
@@ -423,7 +424,7 @@ impl Forma {
                 self.edited();
             }
             ui.label("Background (hex)");
-            if ui.text_edit_singleline(&mut self.scene.bg).changed() { self.edited(); }
+            if ui.add(egui::TextEdit::singleline(&mut self.scene.bg).desired_width(ui.available_width())).changed() { self.edited(); }
             let min_duration = self.scene.minimum_duration();
             if ui.add(egui::Slider::new(&mut self.scene.duration, min_duration..=120.0_f64.max(min_duration)).text("Length").suffix(" s")).changed() {
                 self.time = self.time.min(self.scene.duration);
@@ -910,7 +911,8 @@ impl Forma {
                 }
             }
         }
-        let painter = ui.painter();
+        // Selection handles can reach past the canvas, but not over the toolbar or the panels.
+        let painter = ui.painter().with_clip_rect(ui.max_rect());
         painter.rect_filled(area, 10.0, Color32::from_rgb(24, 29, 37));
         match &self.preview {
             Some((texture, ..)) => painter.image(
