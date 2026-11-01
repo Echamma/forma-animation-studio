@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Scene {
     pub version: u32,
@@ -18,7 +18,7 @@ pub struct Scene {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Shape {
     pub id: String,
@@ -45,7 +45,7 @@ pub struct Shape {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RotationClip {
     pub id: String,
@@ -57,7 +57,7 @@ pub struct RotationClip {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Disappear {
     pub start_time: f64,
@@ -73,7 +73,7 @@ pub struct Disappear {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ColorKey {
     pub t: f64,
     pub color: String,
@@ -83,7 +83,7 @@ pub struct ColorKey {
 
 fn smooth() -> String { "smooth".into() }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Key {
     pub t: f64,
     pub x: f32,

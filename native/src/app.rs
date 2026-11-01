@@ -25,6 +25,10 @@ pub struct Forma {
     show_projects: bool,
     textures: HashMap<String, TextureHandle>,
     failed_assets: HashSet<String>,
+    undo: Vec<Scene>,
+    redo: Vec<Scene>,
+    recording_drag: bool,
+    suppress_history: bool,
 }
 
 impl Forma {
@@ -32,7 +36,7 @@ impl Forma {
         let scene = storage::list(&place).first().and_then(|doc| storage::load_document(&place, &doc.id).ok())
             .unwrap_or_else(|| Scene::empty(new_id()));
         Self { place, scene, selected: None, time: 0.0, playing: false, last_tick: Instant::now(), edited_at: None, show_projects: false,
-            textures: HashMap::new(), failed_assets: HashSet::new() }
+            textures: HashMap::new(), failed_assets: HashSet::new(), undo: Vec::new(), redo: Vec::new(), recording_drag: false, suppress_history: false }
     }
 
     fn edited(&mut self) { self.edited_at = Some(Instant::now()); }
@@ -45,6 +49,27 @@ impl Forma {
         self.playing = false;
         self.textures.clear();
         self.failed_assets.clear();
+        self.undo.clear();
+        self.redo.clear();
+        self.suppress_history = true;
+    }
+
+    fn undo(&mut self) {
+        if let Some(scene) = self.undo.pop() {
+            self.redo.push(std::mem::replace(&mut self.scene, scene));
+            self.suppress_history = true;
+            self.playing = false;
+            self.edited();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(scene) = self.redo.pop() {
+            self.undo.push(std::mem::replace(&mut self.scene, scene));
+            self.suppress_history = true;
+            self.playing = false;
+            self.edited();
+        }
     }
 
     fn toolbar(&mut self, ui: &mut Ui, host: &mut dyn Host) {
@@ -52,6 +77,8 @@ impl Forma {
             ui.spacing_mut().item_spacing.x = 8.0;
             if ui.button("Projects").clicked() { self.show_projects = true; }
             if ui.button("New").clicked() { self.open(Scene::empty(new_id())); }
+            if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo")).clicked() { self.undo(); }
+            if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo")).clicked() { self.redo(); }
             let name = ui.add(egui::TextEdit::singleline(&mut self.scene.project_name).desired_width(180.0).font(font::bold(14.0)));
             if name.changed() { self.edited(); }
             if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
@@ -76,6 +103,24 @@ impl Forma {
             }
         }
         ui.separator();
+        if self.selected.is_some() {
+            if ui.button("Duplicate selected").clicked() {
+                if let Some(shape) = self.scene.shapes.iter().find(|s| Some(s.id.as_str()) == self.selected.as_deref()).cloned() {
+                    let mut copy = shape;
+                    copy.id = new_id();
+                    copy.name = format!("{} copy", copy.name);
+                    for key in &mut copy.keys { key.x += 20.0; key.y += 20.0; }
+                    self.selected = Some(copy.id.clone());
+                    self.scene.shapes.push(copy);
+                    self.edited();
+                }
+            }
+            if ui.button("Delete selected").clicked() {
+                self.scene.shapes.retain(|shape| Some(shape.id.as_str()) != self.selected.as_deref());
+                self.selected = None;
+                self.edited();
+            }
+        }
         egui::ScrollArea::vertical().show(ui, |ui| {
             for shape in &self.scene.shapes {
                 if ui.selectable_label(self.selected.as_deref() == Some(&shape.id), &shape.name).clicked() {
@@ -212,6 +257,12 @@ impl Forma {
 
 impl CanopyApp for Forma {
     fn ui(&mut self, ui: &mut Ui, host: &mut dyn Host) {
+        let before = self.scene.clone();
+        if host.focused() {
+            let undo = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift);
+            let redo = ui.input(|i| i.modifiers.command && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z))));
+            if undo { self.undo(); } else if redo { self.redo(); }
+        }
         if self.playing {
             let now = Instant::now();
             self.time += now.duration_since(self.last_tick).as_secs_f64();
@@ -238,6 +289,17 @@ impl CanopyApp for Forma {
         let timeline = Rect::from_min_max(pos2(rect.left(), middle.bottom() + 6.0), rect.max);
         ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| self.timeline(ui));
         self.projects_window(ui);
+        if !self.suppress_history && self.scene != before {
+            let dragging = ui.input(|i| i.pointer.any_down());
+            if !self.recording_drag || !dragging {
+                self.undo.push(before);
+                if self.undo.len() > 100 { self.undo.remove(0); }
+                self.redo.clear();
+            }
+            self.recording_drag = dragging;
+            self.edited();
+        } else if !ui.input(|i| i.pointer.any_down()) { self.recording_drag = false; }
+        self.suppress_history = false;
     }
 
     fn receive(&mut self, files: Vec<SharedFile>, host: &mut dyn Host) -> Receipt {
