@@ -3,6 +3,7 @@
 use crate::model::{Pose, RotationClip, Scene, Shape};
 use crate::assets;
 use crate::storage;
+use crate::render;
 use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
 use egui::{Align2, Color32, Rect, Sense, Shape as PaintShape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, UiBuilder, pos2, vec2};
 use std::collections::{HashMap, HashSet};
@@ -88,6 +89,15 @@ impl Forma {
             ui.label(format!("{:.2} / {:.2} s", self.time, self.scene.duration));
             if ui.button("Save").clicked() {
                 match self.save() { Ok(()) => host.toast("Forma project saved".into()), Err(error) => host.toast(error) }
+            }
+            if ui.button("PNG").on_hover_text("Export this frame into Files").clicked() {
+                let _ = std::fs::create_dir_all(&self.place.exports_dir);
+                let name = canopy_ui::canopy_core::files::unique_name(&self.place.exports_dir, &format!("{}.png", self.scene.project_name));
+                let path = self.place.exports_dir.join(name);
+                match render::save_png(&self.scene, &self.place, self.time, &path) {
+                    Ok(()) => host.exported(path),
+                    Err(error) => host.toast(error),
+                }
             }
         });
     }
