@@ -1,5 +1,6 @@
 //! Native Forma scene editor: shape layers, keyframes, timeline and the same project folder as Electron Forma.
 
+use crate::animated_svg;
 use crate::archive;
 use crate::assets;
 use crate::model::{Pose, RotationClip, Scene};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExportKind {
     Video,
+    Svg,
     Picture,
     Project,
 }
@@ -613,6 +615,7 @@ impl Forma {
             ui.add_space(6.0);
             for (kind, title, detail) in [
                 (ExportKind::Video, "Video", "MP4 or WebM, with sound. Plays anywhere."),
+                (ExportKind::Svg, "Animated SVG", "A small looping file for websites."),
                 (ExportKind::Picture, "Picture", "A PNG of the frame at the playhead."),
                 (ExportKind::Project, "Project file", "Everything, to open in Forma elsewhere."),
             ] {
@@ -653,6 +656,10 @@ impl Forma {
                     let sound = if scene.shapes.iter().any(|s| s.kind == "video") { "  ·  Includes sound" } else { "" };
                     format!("{:.1} seconds · {} frames{sound}", scene.duration, self.video_settings.frames(scene))
                 }
+                ExportKind::Svg => {
+                    let video = if scene.shapes.iter().any(|s| s.kind == "video") { "  ·  Video layers show their first frame." } else { "" };
+                    format!("{:.1} seconds, looping{video}", scene.duration)
+                }
                 ExportKind::Picture => format!("The frame at {:.2} s · {} × {}", self.time, scene.width, scene.height),
                 ExportKind::Project => {
                     let n = scene.shapes.len();
@@ -663,6 +670,7 @@ impl Forma {
             ui.add_space(6.0);
             let label = match self.export_kind {
                 ExportKind::Video => "Export video",
+                ExportKind::Svg => "Export SVG",
                 ExportKind::Picture => "Save picture",
                 ExportKind::Project => "Save project file",
             };
@@ -680,6 +688,7 @@ impl Forma {
     fn export(&mut self, host: &mut dyn Host, ctx: &egui::Context) {
         let extension = match self.export_kind {
             ExportKind::Video => self.video_settings.extension(),
+            ExportKind::Svg => "svg",
             ExportKind::Picture => "png",
             ExportKind::Project => "forma",
         };
@@ -699,6 +708,9 @@ impl Forma {
                 }
                 Err(error) => Err(error),
             },
+            ExportKind::Svg => animated_svg::animated(&self.scene, &self.place)
+                .and_then(|svg| std::fs::write(&path, svg).map_err(|e| e.to_string()))
+                .map(|_| path),
             ExportKind::Picture => render::save_png(&self.scene, &self.place, self.time, &path).map(|_| path),
             ExportKind::Project => archive::pack(&self.scene, &self.place, &path).map(|_| path),
         };

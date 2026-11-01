@@ -1,0 +1,10 @@
+{"version":1,"projectId":"0a1b2c3d-0000-4000-8000-0000000000aa","projectName":"Animated","width":960,"height":600,"duration":4,"bg":"#f4f0e8","shapes":[
+{"id":"c","name":"Circle","type":"circle","color":"#ed795e","ease":"smooth","blur":3,"keys":[{"t":0,"x":200,"y":300,"w":160,"h":160,"r":0,"o":100},{"t":1.5,"x":600,"y":250,"w":200,"h":120,"r":30,"o":60},{"t":3,"x":700,"y":400,"w":160,"h":160,"r":0,"o":100,"ease":"linear"}],
+ "rotationClips":[{"id":"spin","startTime":0.5,"duration":1,"degrees":180,"ease":"smooth"}],
+ "colorKeys":[{"t":0,"color":"#ed795e"},{"t":2,"color":"#3a7bd5"}]},
+{"id":"r","name":"Box","type":"rect","color":"#2b2b2b","ease":"linear","inTime":0.5,"outTime":3.5,"keys":[{"t":0.5,"x":480,"y":500,"w":300,"h":40,"r":-6,"o":100},{"t":3,"x":480,"y":450,"w":300,"h":40,"r":6,"o":100}],
+ "disappear":{"startTime":1,"duration":0.5,"reappearMode":"clip","triggerShapeId":"c","triggerClipId":"spin"}},
+{"id":"h","name":"Hold","type":"triangle","color":"#c3d77f","ease":"hold","keys":[{"t":0,"x":100,"y":100,"w":80,"h":80,"r":0,"o":100},{"t":2,"x":300,"y":100,"w":80,"h":80,"r":0,"o":100}]},
+{"id":"t","name":"Label","type":"text","color":"#ffffff","ease":"smooth","text":"Fish & <chips>","linkId":"c","offsetX":0,"offsetY":0,"textWidth":120,"fontSize":40,"linkBase":{"w":160,"h":160},"keys":[{"t":0,"x":200,"y":300,"w":120,"h":40,"r":0,"o":100}]},
+{"id":"a","name":"Arrow","type":"arrow","color":"#aaa0ce","ease":"ease-out","keys":[{"t":0,"x":800,"y":100,"w":120,"h":60,"r":0,"o":0},{"t":1,"x":820,"y":120,"w":120,"h":60,"r":45,"o":100,"ease":"custom","curve":[0.2,1.4,0.6,1]},{"t":2.5,"x":860,"y":160,"w":120,"h":60,"r":90,"o":100}]}
+]}

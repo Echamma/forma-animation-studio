@@ -220,7 +220,15 @@ impl Scene {
         if !shape.visible(t, self.duration) { return 0.0; }
         let Some(d) = &shape.disappear else { return 1.0 };
         if t < d.start_time { return 1.0; }
-        let reappear = match d.reappear_mode.as_str() {
+        if t >= self.reappear_at(shape) { return 1.0; }
+        if d.duration <= 0.0 || t >= d.start_time + d.duration { return 0.0; }
+        (1.0 - (t - d.start_time) / d.duration) as f32
+    }
+
+    /// When a layer that disappears comes back (Electron's `reappearAt`); never is infinity.
+    pub fn reappear_at(&self, shape: &Shape) -> f64 {
+        let Some(d) = &shape.disappear else { return f64::INFINITY };
+        match d.reappear_mode.as_str() {
             "time" => d.reappear_time.unwrap_or(f64::INFINITY),
             // With another layer's animation: when it ends, but never before this one has finished disappearing.
             "clip" => self.shapes.iter().find(|s| Some(&s.id) == d.trigger_shape_id.as_ref() && s.id != shape.id).and_then(|target| {
@@ -232,10 +240,7 @@ impl Scene {
                 motions.or_else(|| target.rotation_clips.iter().find(|c| c.id == clip).map(|c| c.start_time + c.duration))
             }).map_or(f64::INFINITY, |end| end.max(d.start_time + d.duration)),
             _ => f64::INFINITY,
-        };
-        if t >= reappear { return 1.0; }
-        if d.duration <= 0.0 || t >= d.start_time + d.duration { return 0.0; }
-        (1.0 - (t - d.start_time) / d.duration) as f32
+        }
     }
 }
 
