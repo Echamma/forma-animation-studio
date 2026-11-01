@@ -7,6 +7,7 @@ use crate::model::{self, HANDLES, Pose, RotationClip, Scene, Shape, resized_pose
 use crate::motion;
 use crate::render;
 use crate::storage;
+use crate::svg;
 use crate::video;
 use crate::videos::Videos;
 use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
@@ -23,6 +24,14 @@ enum Gesture {
     Move { index: usize, start: Pos2, pose: Pose },
     Resize { index: usize, handle: (i8, i8), start: Pos2, pose: Pose, angle: f32 },
     Rotate { index: usize, center: Pos2, last: f32 },
+}
+
+/// The SVG editor's state: which layer, its markup being edited, the recolor color and a message.
+struct SvgEdit {
+    id: String,
+    source: String,
+    color: [u8; 3],
+    status: String,
 }
 
 /// Electron's clip menu and shortcuts.
@@ -149,6 +158,9 @@ pub struct Forma {
     notice: Option<String>,
     /// A layer copied with Ctrl+C.
     clipboard: Option<Shape>,
+    /// The SVG editor's markup for a layer, and its preview (by the markup's hash).
+    svg_edit: Option<SvgEdit>,
+    svg_preview: Option<(u64, TextureHandle)>,
     suppress_history: bool,
     export: Option<video::Export>,
 }
@@ -187,6 +199,8 @@ impl Forma {
             motion_edit: (0.0, 1.0, motion::Options::default()),
             notice: None,
             clipboard: None,
+            svg_edit: None,
+            svg_preview: None,
             suppress_history: false,
             export: None,
         }
@@ -428,6 +442,11 @@ impl Forma {
                 self.scene.link_text(index, target, self.time);
                 changed = true;
             }
+        }
+        let shape = &mut self.scene.shapes[index];
+        if shape.kind == "svg" && ui.button("Edit SVG…").on_hover_text("Change its markup or recolor it").clicked() {
+            let source = assets::svg_source(shape, &self.place).ok().flatten().unwrap_or_default();
+            self.svg_edit = Some(SvgEdit { id: shape.id.clone(), source, color: [0x1f, 0x3d, 0x2b], status: String::new() });
         }
         let shape = &mut self.scene.shapes[index];
         // The fill: with "Animate color" on, picking a color sets a color keyframe at the playhead (as in Electron).
@@ -1523,6 +1542,68 @@ impl Forma {
         }
     }
 
+    /// Electron's SVG editor: the markup, a preview, recoloring the whole artwork, and applying it to the layer.
+    fn svg_window(&mut self, ui: &mut Ui) {
+        let Some(edit) = &mut self.svg_edit else { return };
+        let mut apply = false;
+        let modal = egui::Modal::new(ui.scope_id().with("forma-svg")).show(ui.ctx(), |ui| {
+            ui.set_width(520.0);
+            ui.label(egui::RichText::new("Edit SVG").font(font::bold(18.0)).color(color::INK));
+            let tree = svg::parse(&edit.source);
+            // The preview is drawn again only when the markup changes.
+            let hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                edit.source.hash(&mut hasher);
+                hasher.finish()
+            };
+            if self.svg_preview.as_ref().is_none_or(|(h, _)| *h != hash) {
+                self.svg_preview = tree.as_ref().ok().and_then(|tree| {
+                    let (w, h) = svg::size(tree);
+                    let fit = (480.0 / w).min(180.0 / h);
+                    let pixmap = svg::rasterize(tree, (w * fit).max(1.0) as u32, (h * fit).max(1.0) as u32)?;
+                    let image = egui::ColorImage::from_rgba_premultiplied([pixmap.width() as usize, pixmap.height() as usize], pixmap.data());
+                    Some((hash, ui.ctx().load_texture("forma-svg-preview", image, TextureOptions::LINEAR)))
+                });
+            }
+            match (&tree, &self.svg_preview) {
+                (Ok(_), Some((_, texture))) => {
+                    ui.add(egui::Image::new(texture).max_size(vec2(480.0, 180.0)));
+                }
+                _ => {
+                    ui.label(egui::RichText::new("Fix the SVG markup to preview it.").color(color::INK_MUTED));
+                }
+            }
+            egui::ScrollArea::vertical().id_salt("forma-svg-source").max_height(200.0).show(ui, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut edit.source).code_editor().desired_width(f32::INFINITY).desired_rows(8));
+            });
+            ui.horizontal(|ui| {
+                egui::color_picker::color_edit_button_srgb(ui, &mut edit.color);
+                if ui.button("Recolor").on_hover_text("Paint every fill and stroke this color").clicked() {
+                    let color = format!("#{:02x}{:02x}{:02x}", edit.color[0], edit.color[1], edit.color[2]);
+                    match svg::recolor(&edit.source, &color) {
+                        Ok(source) => (edit.source, edit.status) = (source, "Artwork recolored. Apply the changes to update the layer.".into()),
+                        Err(error) => edit.status = error,
+                    }
+                }
+            });
+            if !edit.status.is_empty() {
+                ui.label(egui::RichText::new(&edit.status).color(color::INK_MUTED));
+            }
+            apply = ui.add_enabled(tree.is_ok(), egui::Button::new("Apply")).clicked();
+        });
+        if apply {
+            let edit = self.svg_edit.take().unwrap();
+            if let Some(shape) = self.scene.shapes.iter_mut().find(|s| s.id == edit.id) {
+                shape.extra.remove("svgSourceRef");
+                shape.extra.insert("svgSource".into(), edit.source.into());
+                self.edited();
+            }
+        } else if modal.should_close() {
+            self.svg_edit = None;
+        }
+    }
+
     fn projects_window(&mut self, ui: &mut Ui) {
         if !self.show_projects {
             return;
@@ -1668,6 +1749,7 @@ impl CanopyApp for Forma {
         ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| self.timeline(ui));
         self.projects_window(ui);
         self.export_window(ui, host);
+        self.svg_window(ui);
         if !self.suppress_history && self.scene != before {
             let dragging = ui.input(|i| i.pointer.any_down());
             if !self.recording_drag || !dragging {
