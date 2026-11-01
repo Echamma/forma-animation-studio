@@ -213,9 +213,36 @@ impl Scene {
 
     pub fn resize(&mut self, width: f32, height: f32) {
         let (sx, sy) = (width / self.width, height / self.height);
+        let scale = sx.min(sy);
         for shape in &mut self.shapes {
             for key in &mut shape.keys {
-                key.x *= sx; key.y *= sy; key.w *= sx; key.h *= sy;
+                key.x *= sx; key.y *= sy; key.w *= scale; key.h *= scale;
+            }
+            let scaled_field = |value: &mut Value, name: &str, factor: f32| {
+                if let Some(number) = value.get(name).and_then(Value::as_f64) {
+                    value[name] = serde_json::json!(number * factor as f64);
+                }
+            };
+            if shape.kind == "text" {
+                for field in ["offsetX", "offsetY", "textWidth", "fontSize"] {
+                    if let Some(number) = shape.extra.get(field).and_then(Value::as_f64) {
+                        shape.extra.insert(field.into(), serde_json::json!(number * scale as f64));
+                    }
+                }
+                if let Some(base) = shape.extra.get_mut("linkBase") {
+                    scaled_field(base, "w", scale); scaled_field(base, "h", scale);
+                }
+            }
+            for motion in shape.extra.get_mut("motions").and_then(Value::as_array_mut).into_iter().flatten() {
+                if let Some(start) = motion.get_mut("startPose") {
+                    for (field, factor) in [("x", sx), ("y", sy), ("w", scale), ("h", scale)] { scaled_field(start, field, factor); }
+                }
+                for point in motion.get_mut("sourcePoints").and_then(Value::as_array_mut).into_iter().flatten() {
+                    scaled_field(point, "x", sx); scaled_field(point, "y", sy);
+                }
+                for key in motion.get_mut("baseKeys").and_then(Value::as_array_mut).into_iter().flatten() {
+                    for (field, factor) in [("x", sx), ("y", sy), ("w", scale), ("h", scale)] { scaled_field(key, field, factor); }
+                }
             }
         }
         self.width = width;
@@ -893,9 +920,13 @@ mod tests {
     fn resizing_keeps_shape_positions_proportional() {
         let mut scene = Scene::empty("test".into());
         scene.add_shape("a".into(), "circle");
-        scene.resize(1920.0, 1200.0);
-        assert_eq!((scene.shapes[0].keys[0].x, scene.shapes[0].keys[0].w), (960.0, 320.0));
-        assert_eq!((scene.width, scene.height), (1920.0, 1200.0));
+        scene.shapes[0].extra.insert("motions".into(), serde_json::json!([{"startPose":{"x":480.0,"y":300.0,"w":160.0,"h":160.0},"sourcePoints":[{"x":480.0,"y":300.0}],"baseKeys":[{"x":480.0,"y":300.0,"w":160.0,"h":160.0}]}]));
+        scene.resize(1080.0, 1920.0);
+        let shape = &scene.shapes[0];
+        assert_eq!((shape.keys[0].x, shape.keys[0].y, shape.keys[0].w), (540.0, 960.0, 180.0));
+        assert_eq!(shape.extra["motions"][0]["startPose"]["w"], 180.0);
+        assert!((shape.extra["motions"][0]["sourcePoints"][0]["y"].as_f64().unwrap() - 960.0).abs() < 0.001);
+        assert_eq!((scene.width, scene.height), (1080.0, 1920.0));
     }
 
     #[test]

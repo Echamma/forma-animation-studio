@@ -404,7 +404,36 @@ impl Forma {
         });
     }
 
+    fn scene_settings(&mut self, ui: &mut Ui) {
+        egui::CollapsingHeader::new("Scene settings").id_salt("forma-scene-settings").show(ui, |ui| {
+            let (mut width, mut height) = (self.scene.width as u32, self.scene.height as u32);
+            ui.horizontal(|ui| {
+                for (label, w, h) in [("Landscape", 960, 600), ("Portrait", 1080, 1920), ("Square", 1080, 1080)] {
+                    if ui.selectable_label(width == w && height == h, label).clicked() { (width, height) = (w, h); }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Width");
+                ui.add(egui::DragValue::new(&mut width).range(64..=4096).speed(1));
+                ui.label("Height");
+                ui.add(egui::DragValue::new(&mut height).range(64..=4096).speed(1));
+            });
+            if width as f32 != self.scene.width || height as f32 != self.scene.height {
+                self.scene.resize(width as f32, height as f32);
+                self.edited();
+            }
+            ui.label("Background (hex)");
+            if ui.text_edit_singleline(&mut self.scene.bg).changed() { self.edited(); }
+            let min_duration = self.scene.minimum_duration();
+            if ui.add(egui::Slider::new(&mut self.scene.duration, min_duration..=120.0_f64.max(min_duration)).text("Length").suffix(" s")).changed() {
+                self.time = self.time.min(self.scene.duration);
+                self.edited();
+            }
+        });
+    }
+
     fn inspector(&mut self, ui: &mut Ui) {
+        self.scene_settings(ui);
         ui.label(
             egui::RichText::new("Layer")
                 .font(font::bold(14.0))
@@ -417,37 +446,6 @@ impl Forma {
             .position(|s| Some(s.id.as_str()) == self.selected.as_deref())
         else {
             ui.label("Select a shape to edit it.");
-            ui.separator();
-            ui.label(egui::RichText::new("Scene").font(font::bold(14.0)));
-            let portrait = self.scene.height > self.scene.width;
-            ui.horizontal(|ui| {
-                if ui.selectable_label(!portrait, "Landscape").clicked() && portrait {
-                    self.scene.resize(960.0, 600.0);
-                    self.edited();
-                }
-                if ui.selectable_label(portrait, "Portrait").clicked() && !portrait {
-                    self.scene.resize(1080.0, 1920.0);
-                    self.edited();
-                }
-            });
-            ui.label("Background (hex)");
-            if ui.text_edit_singleline(&mut self.scene.bg).changed() {
-                self.edited();
-            }
-            let min_duration = self.scene.minimum_duration();
-            if ui
-                .add(
-                    egui::Slider::new(
-                        &mut self.scene.duration,
-                        min_duration..=120.0_f64.max(min_duration),
-                    )
-                    .text("Length")
-                    .suffix(" s"),
-                )
-                .changed()
-            {
-                self.edited();
-            }
             return;
         };
         let mut pose = self.scene.editable_pose(&self.scene.shapes[index], self.time);
