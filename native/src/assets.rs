@@ -10,7 +10,7 @@ use std::path::Path;
 const PREFIX: &str = "forma-asset://media/";
 
 /// A media field's value: inline, or saved once under `assets/` with its token in `<field>Ref` (Electron's packScene).
-fn stored(shape: &Shape, field: &str, place: &Place) -> Result<Option<String>, String> {
+pub fn stored(shape: &Shape, field: &str, place: &Place) -> Result<Option<String>, String> {
     if let Some(value) = shape.extra.get(field).and_then(|v| v.as_str()) { return Ok(Some(value.to_owned())); }
     let Some(token) = shape.extra.get(&format!("{field}Ref")).and_then(|v| v.as_str()) else { return Ok(None) };
     if !valid_uuid(token) { return Err("Invalid Forma media reference".into()); }
@@ -59,13 +59,34 @@ pub fn import_picture(path: &Path, place: &Place) -> Result<(String, u32, u32), 
     let extension = match extension.as_str() { "png" => "png", "jpg" | "jpeg" => "jpg", "webp" => "webp", _ => return Err("Use PNG, JPEG or WebP pictures".into()) };
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let (width, height) = image::image_dimensions(path).map_err(|e| e.to_string())?;
-    let hash = Sha256::digest(&bytes);
-    let name = format!("{hash:x}.{extension}");
+    Ok((store(&bytes, extension, place)?, width, height))
+}
+
+/// Puts media in the library under the hash of its bytes (as Electron's storeMedia does) and returns its URL.
+pub fn store(bytes: &[u8], extension: &str, place: &Place) -> Result<String, String> {
+    let name = format!("{:x}.{extension}", Sha256::digest(bytes));
+    if !valid_media_name(&name) { return Err(format!("Forma can't keep .{extension} media")); }
     let directory = place.data_dir.join("media");
     std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     let destination = directory.join(&name);
     if !destination.exists() { std::fs::write(destination, bytes).map_err(|e| e.to_string())?; }
-    Ok((format!("{PREFIX}{name}"), width, height))
+    Ok(format!("{PREFIX}{name}"))
+}
+
+/// The bytes a media URL points at (the library or an embedded data URL) and their file extension.
+pub fn media_bytes(value: &str, place: &Place) -> Result<(Vec<u8>, String), String> {
+    if let Some(name) = value.strip_prefix(PREFIX) {
+        if !valid_media_name(name) { return Err("Invalid Forma media name".into()); }
+        let bytes = std::fs::read(place.data_dir.join("media").join(name)).map_err(|e| format!("{name}: {e}"))?;
+        return Ok((bytes, name.rsplit_once('.').map_or("bin", |(_, ext)| ext).to_owned()));
+    }
+    let (head, encoded) = value.strip_prefix("data:").and_then(|v| v.split_once(',')).ok_or("Unknown media")?;
+    let extension = match head.split(';').next().unwrap_or("") {
+        "image/png" => "png", "image/jpeg" => "jpg", "image/webp" => "webp", "video/mp4" => "mp4", "video/webm" => "webm", "video/ogg" => "ogv",
+        _ => "bin",
+    };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|e| e.to_string())?;
+    Ok((bytes, extension.to_owned()))
 }
 
 /// What a media layer shows, so the editor can tell when it changes.

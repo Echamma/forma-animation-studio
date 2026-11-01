@@ -20,6 +20,7 @@ base64 = "0.22.1"
 sha2 = "0.10.9"
 ttf-parser = "0.25.1"
 resvg = "0.45.1"
+zip = { version = "9.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std"] }
 
 [profile.dev.package."*"]

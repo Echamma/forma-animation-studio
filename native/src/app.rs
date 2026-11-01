@@ -1,5 +1,6 @@
 //! Native Forma scene editor: shape layers, keyframes, timeline and the same project folder as Electron Forma.
 
+use crate::archive;
 use crate::assets;
 use crate::model::{Pose, RotationClip, Scene};
 use crate::render;
@@ -198,6 +199,22 @@ impl Forma {
                         Ok(export) => self.export = Some(export),
                         Err(error) => host.toast(error),
                     }
+                }
+            }
+            if ui
+                .button(".forma")
+                .on_hover_text("Save the project with its pictures and videos as one file in Files")
+                .clicked()
+            {
+                let _ = std::fs::create_dir_all(&self.place.exports_dir);
+                let name = canopy_ui::canopy_core::files::unique_name(
+                    &self.place.exports_dir,
+                    &format!("{}.forma", self.scene.project_name),
+                );
+                let path = self.place.exports_dir.join(name);
+                match archive::pack(&self.scene, &self.place, &path) {
+                    Ok(()) => host.exported(path),
+                    Err(error) => host.toast(error),
                 }
             }
             if let Some(export) = &self.export {
@@ -740,14 +757,25 @@ impl CanopyApp for Forma {
     fn receive(&mut self, files: Vec<SharedFile>, host: &mut dyn Host) -> Receipt {
         let mut receipt = Receipt::default();
         for file in files {
-            if file.name.to_lowercase().ends_with(".json") {
-                match storage::load(&file.path) {
-                    Ok(scene) => {
+            let lower = file.name.to_lowercase();
+            if lower.ends_with(".json") || lower.ends_with(".forma") {
+                let read = if lower.ends_with(".forma") { archive::unpack(&file.path, &self.place) } else { storage::load(&file.path) };
+                match read {
+                    // Like Electron Forma, an opened file becomes a project of its own: saving it never replaces another.
+                    Ok(mut scene) => {
+                        scene.project_id = new_id();
+                        scene.project_name = match scene.project_name.trim() {
+                            "" => file.name.rsplit_once('.').map_or(file.name.as_str(), |(stem, _)| stem).to_owned(),
+                            name => name.to_owned(),
+                        };
                         self.open(scene);
                         self.edited();
                         receipt.accepted += 1;
                     }
-                    Err(_) => receipt.skipped.push(file.name),
+                    Err(error) => {
+                        receipt.note = Some(format!("{}: {error}", file.name));
+                        receipt.skipped.push(file.name);
+                    }
                 }
             } else {
                 let svg = file.name.to_lowercase().ends_with(".svg");

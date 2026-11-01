@@ -9,7 +9,9 @@ pub struct Scene {
     pub version: u32,
     pub project_id: String,
     pub project_name: String,
+    #[serde(default = "landscape_width")]
     pub width: f32,
+    #[serde(default = "landscape_height")]
     pub height: f32,
     pub duration: f64,
     pub bg: String,
@@ -82,6 +84,8 @@ pub struct ColorKey {
 }
 
 fn smooth() -> String { "smooth".into() }
+fn landscape_width() -> f32 { 960.0 }
+fn landscape_height() -> f32 { 600.0 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Key {
@@ -117,7 +121,10 @@ impl Scene {
 
     pub fn read(bytes: &[u8]) -> Result<Self, String> {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-        let scene: Self = serde_json::from_slice(bytes).map_err(|e| format!("Invalid Forma project: {e}"))?;
+        let mut scene: Self = serde_json::from_slice(bytes).map_err(|e| format!("Invalid Forma project: {e}"))?;
+        for shape in &mut scene.shapes {
+            shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+        }
         if scene.version != 1 || !(100.0..=4000.0).contains(&scene.width) || !(100.0..=4000.0).contains(&scene.height)
             || !scene.duration.is_finite() || scene.duration < 1.0 || scene.shapes.len() > 500
             || scene.shapes.iter().any(|shape| shape.keys.is_empty() || shape.keys.iter().any(|key| !key.t.is_finite() || key.w <= 0.0 || key.h <= 0.0)) {

@@ -1,6 +1,7 @@
 //! Forma's native editor. The model reads the same version-one scene JSON that Electron Forma saves.
 
 pub mod app;
+pub mod archive;
 pub mod assets;
 pub mod model;
 pub mod render;
@@ -24,7 +25,7 @@ pub static DESCRIPTOR: AppDescriptor = AppDescriptor {
     folder: "Forma",
     icon_png: &[],
     accepts: |file: &SharedFile| {
-        [".json", ".png", ".jpg", ".jpeg", ".webp", ".svg"]
+        [".json", ".forma", ".png", ".jpg", ".jpeg", ".webp", ".svg"]
             .iter()
             .any(|ext| file.name.to_lowercase().ends_with(ext))
     },
