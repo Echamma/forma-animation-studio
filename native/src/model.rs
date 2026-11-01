@@ -564,6 +564,54 @@ impl Scene {
     }
 }
 
+impl Scene {
+    /// Pictures picked as stop-motion poses (Electron's `importPoses` and `arrangeAsPoses`): one track, each pose
+    /// `length` seconds in the first one's spot, named Pose 1, 2…, the scene as long as the poses (at least 1 s).
+    pub fn arrange_as_poses(&mut self, layers: &[usize], length: f64, track: String) {
+        let Some(&first) = layers.first() else { return };
+        let (x, y) = (self.shapes[first].keys[0].x, self.shapes[first].keys[0].y);
+        self.duration = (layers.len() as f64 * length).max(1.0);
+        for (i, &index) in layers.iter().enumerate() {
+            let start = hundredths(i as f64 * length);
+            let shape = &mut self.shapes[index];
+            shape.name = format!("Pose {}", i + 1);
+            shape.extra.insert("trackId".into(), track.clone().into());
+            (shape.in_time, shape.out_time) = (Some(start), Some(hundredths(start + length)));
+            let key = Key { t: start, x, y, ..shape.keys[0].clone() };
+            shape.keys = vec![key];
+        }
+        self.duration = self.duration.max(hundredths(layers.len() as f64 * length));
+    }
+
+    /// The faint copy of the previous clip on the selected clip's track, as it ends, to line up the next pose of a
+    /// stop-motion sequence (Electron's onion skin): a still layer at 30 % opacity, or `None` off a track or clip.
+    pub fn onion_skin(&self, index: usize, t: f64) -> Option<Shape> {
+        let shape = &self.shapes[index];
+        let track = shape.extra.get("trackId").and_then(Value::as_str).filter(|t| !t.is_empty())?;
+        if !shape.visible(t, self.duration) {
+            return None;
+        }
+        let end = |s: &Shape| s.out_time.unwrap_or(self.duration);
+        let previous = self.shapes.iter()
+            .filter(|s| s.id != shape.id && s.extra.get("trackId").and_then(Value::as_str) == Some(track) && end(s) <= shape.clip_start() + 1e-6)
+            .max_by(|a, b| end(a).total_cmp(&end(b)))?;
+        let at = previous.clip_start().max(end(previous) - 0.001);
+        // Posed as it ends, outside its clip: the scene with the clip open-ended.
+        let mut open = previous.clone();
+        (open.in_time, open.out_time) = (None, None);
+        let p = self.render_pose(&open, at);
+        // It keeps its id, so the renderer finds its picture.
+        let mut ghost = previous.clone();
+        (ghost.in_time, ghost.out_time, ghost.disappear, ghost.base_rotation) = (None, None, None, 0.0);
+        ghost.color = previous.color_at(at);
+        ghost.color_keys.clear();
+        ghost.rotation_clips.clear();
+        ghost.extra.insert("linkId".into(), "".into());
+        ghost.keys = vec![Key { t: 0.0, x: p.x, y: p.y, w: p.w, h: p.h, r: p.r, o: p.o * 0.3, ease: None, curve: None, extra: Map::new() }];
+        Some(ghost)
+    }
+}
+
 /// A name without a trailing number (Electron's `/ \d+$/`).
 fn strip_number(name: &str) -> &str {
     match name.rsplit_once(' ') {
@@ -940,6 +988,25 @@ mod tests {
         let (a, b) = (&scene.shapes[0], &scene.shapes[1]);
         assert_eq!((a.name.as_str(), a.color.as_str(), a.keys[0].w), ("Rect 1", "#ed795e", 108.0));
         assert_eq!((b.name.as_str(), b.color.as_str(), b.keys[0].w, b.keys[0].h), ("Arrow 2", "#aaa0ce", 167.4, 86.4));
+    }
+
+    #[test]
+    fn poses_line_up_on_one_track_and_the_last_one_shows_under_the_next() {
+        let mut scene = Scene::empty("test".into());
+        for id in ["a", "b", "c"] {
+            scene.add_shape(id.into(), "rect");
+        }
+        scene.shapes[0].keys[0].x = 100.0;
+        scene.arrange_as_poses(&[0, 1, 2], 0.5, "track".into());
+        assert_eq!(scene.shapes.iter().map(|s| (s.name.as_str(), s.in_time, s.keys[0].x)).collect::<Vec<_>>(),
+            vec![("Pose 1", Some(0.0), 100.0), ("Pose 2", Some(0.5), 100.0), ("Pose 3", Some(1.0), 100.0)]);
+        assert_eq!(scene.duration, 1.5);
+        scene.shapes[0].keys[0].y = 50.0;
+        let ghost = scene.onion_skin(1, 0.6).unwrap();
+        assert_eq!((ghost.keys[0].x, ghost.keys[0].y), (100.0, 50.0));
+        assert!((ghost.keys[0].o - 30.0).abs() < 0.001, "faint: {}", ghost.keys[0].o);
+        assert!(scene.onion_skin(0, 0.2).is_none(), "the first pose has nothing before it");
+        assert!(scene.onion_skin(1, 0.2).is_none(), "only while the playhead is in the clip");
     }
 
     #[test]

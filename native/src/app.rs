@@ -165,6 +165,10 @@ pub struct Forma {
     preview_end: Option<f64>,
     /// Files picked with the Add button, taken in like dropped files on the next frame.
     pending_import: Vec<std::path::PathBuf>,
+    /// Pictures picked as stop-motion poses, in order.
+    pending_poses: Vec<std::path::PathBuf>,
+    /// Whether editing a clip on a track shows the clip before it faintly (Electron's onion skin, on by default).
+    onion_skin: bool,
     /// The SVG editor's markup for a layer, and its preview (by the markup's hash).
     svg_edit: Option<SvgEdit>,
     svg_preview: Option<(u64, TextureHandle)>,
@@ -210,6 +214,8 @@ impl Forma {
             clipboard: None,
             preview_end: None,
             pending_import: Vec::new(),
+            pending_poses: Vec::new(),
+            onion_skin: true,
             svg_edit: None,
             svg_preview: None,
             suppress_history: false,
@@ -328,6 +334,8 @@ impl Forma {
                     Err(error) => host.toast(error),
                 }
             }
+            ui.checkbox(&mut self.onion_skin, "Onion skin")
+                .on_hover_text("While editing a clip, faintly show the clip before it on the same track");
             if ui
                 .add_enabled(self.export.is_none(), egui::Button::new("Export"))
                 .on_hover_text("A video, a picture or the project file, into Files")
@@ -372,6 +380,13 @@ impl Forma {
                 .add_filter("Pictures, SVG and video", &["png", "jpg", "jpeg", "webp", "svg", "mp4", "webm", "ogv"])
                 .pick_files();
             self.pending_import.extend(picked.unwrap_or_default());
+        }
+        if ui.button("+ Stop-motion poses…").on_hover_text("Pictures in the order picked become poses, half a second each, on one track").clicked() {
+            let picked = rfd::FileDialog::new()
+                .set_title("Pick the poses in order")
+                .add_filter("Pictures and SVG", &["png", "jpg", "jpeg", "webp", "svg"])
+                .pick_files();
+            self.pending_poses.extend(picked.unwrap_or_default());
         }
         // With a layer selected that isn't text, new text follows it (Electron's addText).
         let target = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id)).filter(|&i| self.scene.shapes[i].kind != "text");
@@ -961,11 +976,23 @@ impl Forma {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
         let generation = self.videos.generation;
+        // While a clip on a track is being edited, the clip before it shows faintly beneath everything.
+        let ghost = self.selected.as_deref().filter(|_| self.onion_skin && !self.playing)
+            .and_then(|id| self.scene.shapes.iter().position(|s| s.id == id))
+            .and_then(|index| self.scene.onion_skin(index, self.time));
+        let display = match ghost {
+            Some(ghost) => {
+                let mut scene = self.scene.clone();
+                scene.shapes.insert(0, ghost);
+                std::borrow::Cow::Owned(scene)
+            }
+            None => std::borrow::Cow::Borrowed(&self.scene),
+        };
         let stale = self.preview.as_ref().is_none_or(|(_, scene, time, drawn, shown)| {
-            *drawn != size || *time != self.time || *scene != self.scene || *shown != generation
+            *drawn != size || *time != self.time || *scene != *display || *shown != generation
         });
         if stale {
-            if let Some(pixmap) = renderer.preview(&self.scene, self.time, scale, &self.videos.frames) {
+            if let Some(pixmap) = renderer.preview(&display, self.time, scale, &self.videos.frames) {
                 let image = egui::ColorImage::from_rgba_premultiplied(
                     [pixmap.width() as usize, pixmap.height() as usize],
                     pixmap.data(),
@@ -973,11 +1000,11 @@ impl Forma {
                 match &mut self.preview {
                     Some((texture, scene, time, drawn, shown)) => {
                         texture.set(image, TextureOptions::LINEAR);
-                        (*scene, *time, *drawn, *shown) = (self.scene.clone(), self.time, size, generation);
+                        (*scene, *time, *drawn, *shown) = (display.clone().into_owned(), self.time, size, generation);
                     }
                     None => {
                         let texture = ui.ctx().load_texture("forma-preview", image, TextureOptions::LINEAR);
-                        self.preview = Some((texture, self.scene.clone(), self.time, size, generation));
+                        self.preview = Some((texture, display.clone().into_owned(), self.time, size, generation));
                     }
                 }
             }
@@ -1835,6 +1862,19 @@ impl Forma {
 
 impl CanopyApp for Forma {
     fn ui(&mut self, ui: &mut Ui, host: &mut dyn Host) {
+        if !self.pending_poses.is_empty() {
+            // As Electron's importPoses: the pictures come in, then line up as poses from the start.
+            let before = self.scene.shapes.len();
+            let files = std::mem::take(&mut self.pending_poses).into_iter().map(SharedFile::new).collect();
+            self.receive(files, host);
+            let poses: Vec<usize> = (before..self.scene.shapes.len()).filter(|&i| self.scene.shapes[i].kind != "video").collect();
+            if !poses.is_empty() {
+                self.scene.arrange_as_poses(&poses, 0.5, new_id());
+                (self.selected, self.time) = (Some(self.scene.shapes[poses[0]].id.clone()), 0.0);
+                self.edited();
+                host.toast(format!("{} pose{} added. Press play, or drag a pose to move it.", poses.len(), if poses.len() == 1 { "" } else { "s" }));
+            }
+        }
         if !self.pending_import.is_empty() {
             let files = std::mem::take(&mut self.pending_import).into_iter().map(SharedFile::new).collect();
             let receipt = self.receive(files, host);
