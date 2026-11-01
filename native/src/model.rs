@@ -116,6 +116,7 @@ impl Scene {
     }
 
     pub fn read(bytes: &[u8]) -> Result<Self, String> {
+        let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
         let scene: Self = serde_json::from_slice(bytes).map_err(|e| format!("Invalid Forma project: {e}"))?;
         if scene.version != 1 || !(100.0..=4000.0).contains(&scene.width) || !(100.0..=4000.0).contains(&scene.height)
             || !scene.duration.is_finite() || scene.duration < 1.0 || scene.shapes.len() > 500
