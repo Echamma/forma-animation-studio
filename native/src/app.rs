@@ -764,6 +764,45 @@ impl Forma {
                 }
             }
         });
+        if ui.button("Drop onto the screen").clicked() {
+            let start = (self.time * 100.0).round() / 100.0;
+            let duration = self.motion_options.seconds.clamp(0.4, 10.0);
+            let end = ((start + duration) * 100.0).round() / 100.0;
+            let shape = &self.scene.shapes[index];
+            let linked = shape.kind == "text" && shape.extra.get("linkId").and_then(|v| v.as_str()).is_some_and(|id| !id.is_empty());
+            let occupied = motion::motions(shape).iter().any(|m| m.start_time < end - 0.005 && m.start_time + m.duration > start + 0.005)
+                || shape.keys.iter().any(|k| k.t > start + 0.005 && k.t <= end + 0.005);
+            let landing = self.scene.editable_pose(shape, start);
+            if linked {
+                self.notice = Some("Text that follows a shape drops with its shape".into());
+            } else if occupied {
+                self.notice = Some("Move the playhead to a clear section of this layer first".into());
+            } else if landing.x + landing.w / 2.0 < 0.0 || landing.x - landing.w / 2.0 > self.scene.width || landing.y + landing.h / 2.0 < 0.0 || landing.y - landing.h / 2.0 > self.scene.height {
+                self.notice = Some("Place the item on the canvas where it should land first".into());
+            } else {
+                let above = -landing.h / 2.0 - (self.scene.height * 0.08).max(40.0);
+                let poses = [
+                    (0.0, Pose { y: above, ..landing }),
+                    (0.18, Pose { y: above + (landing.y - above) * 0.07, ..landing }),
+                    (0.6, Pose { y: landing.y + landing.h * 0.09, w: landing.w * 1.13, h: landing.h * 0.82, ..landing }),
+                    (0.71, Pose { y: landing.y - landing.h * 0.17, w: landing.w * 0.94, h: landing.h * 1.06, ..landing }),
+                    (0.8, Pose { y: landing.y - landing.h * 0.28, ..landing }),
+                    (0.91, Pose { y: landing.y + landing.h * 0.04, w: landing.w * 1.06, h: landing.h * 0.93, ..landing }),
+                    (1.0, landing),
+                ];
+                let shape = &mut self.scene.shapes[index];
+                shape.keys.retain(|k| k.t < start - 0.005 || k.t > end + 0.005);
+                for (fraction, pose) in poses { shape.edit_pose(((start + duration * fraction) * 100.0).round() / 100.0, pose); }
+                self.scene.duration = self.scene.duration.max(end);
+                self.motion_mode = None;
+                self.motion_draft = None;
+                self.selected_motion = None;
+                self.selected_spin = None;
+                self.playing = false;
+                self.edited();
+                self.notice = Some("Drop animation added".into());
+            }
+        }
         let help = match self.motion_mode {
             Some("arrow") => "Drag anywhere on the canvas to set the arrow destination.",
             Some(_) => "Hold and drag on the canvas. The selected shape will follow your mouse.",
