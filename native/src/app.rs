@@ -1,27 +1,17 @@
 //! Native Forma scene editor: shape layers, keyframes, timeline and the same project folder as Electron Forma.
 
 use crate::assets;
-use crate::model::{Pose, RotationClip, Scene, Shape};
+use crate::model::{Pose, RotationClip, Scene};
 use crate::render;
 use crate::storage;
-use crate::text;
 use crate::video;
 use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
 use egui::{
-    Align2, Color32, Rect, Sense, Shape as PaintShape, Stroke, StrokeKind, TextureHandle,
+    Align2, Color32, Rect, Sense, Stroke, StrokeKind, TextureHandle,
     TextureOptions, Ui, UiBuilder, pos2, vec2,
 };
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// A text layer's outline rasterized at the size it's shown (the same outline exports fill): what it was drawn from,
-/// and where it sits from the layer's center, in points.
-struct Lettering {
-    drawn: (String, u32, u32),
-    texture: TextureHandle,
-    rect: Rect,
-}
 
 fn new_id() -> String {
     let n = SystemTime::now()
@@ -47,9 +37,10 @@ pub struct Forma {
     last_tick: Instant,
     edited_at: Option<Instant>,
     show_projects: bool,
-    textures: HashMap<String, TextureHandle>,
-    lettering: HashMap<String, Lettering>,
-    failed_assets: HashSet<String>,
+    /// Draws the preview the way exports draw frames. Made again when the scene's pictures change.
+    renderer: Option<render::Renderer>,
+    /// The preview picture, and what it shows: the scene, the time, and its size in pixels.
+    preview: Option<(TextureHandle, Scene, f64, [u32; 2])>,
     undo: Vec<Scene>,
     redo: Vec<Scene>,
     recording_drag: bool,
@@ -72,9 +63,8 @@ impl Forma {
             last_tick: Instant::now(),
             edited_at: None,
             show_projects: false,
-            textures: HashMap::new(),
-            lettering: HashMap::new(),
-            failed_assets: HashSet::new(),
+            renderer: None,
+            preview: None,
             undo: Vec::new(),
             redo: Vec::new(),
             recording_drag: false,
@@ -93,9 +83,8 @@ impl Forma {
         self.selected = None;
         self.time = 0.0;
         self.playing = false;
-        self.textures.clear();
-        self.lettering.clear();
-        self.failed_assets.clear();
+        self.renderer = None;
+        self.preview = None;
         self.undo.clear();
         self.redo.clear();
         self.suppress_history = true;
@@ -414,28 +403,6 @@ impl Forma {
     }
 
     fn canvas(&mut self, ui: &mut Ui) {
-        for shape in &self.scene.shapes {
-            if assets::image_key(shape).is_some()
-                && !self.textures.contains_key(&shape.id)
-                && !self.failed_assets.contains(&shape.id)
-            {
-                match assets::image(shape, &self.place) {
-                    Ok(Some(image)) => {
-                        self.textures.insert(
-                            shape.id.clone(),
-                            ui.ctx().load_texture(
-                                format!("forma-{}", shape.id),
-                                image,
-                                TextureOptions::LINEAR,
-                            ),
-                        );
-                    }
-                    _ => {
-                        self.failed_assets.insert(shape.id.clone());
-                    }
-                }
-            }
-        }
         let area = ui.max_rect().shrink(14.0);
         let scale = (area.width() / self.scene.width)
             .min(area.height() / self.scene.height)
@@ -444,51 +411,65 @@ impl Forma {
             area.center(),
             vec2(self.scene.width * scale, self.scene.height * scale),
         );
-        let pixels = ui.ctx().pixels_per_point() * scale;
-        for shape in self.scene.shapes.iter().filter(|s| s.kind == "text" && s.visible(self.time, self.scene.duration)) {
-            let pose = self.scene.render_pose(shape, self.time);
-            let drawn = (text::content(shape).to_owned(), (pose.w * pixels).round() as u32, (pose.h * pixels).round() as u32);
-            if self.lettering.get(&shape.id).is_some_and(|l| l.drawn == drawn) {
-                continue;
-            }
-            let Some((pixmap, [left, top])) = text::rasterize(&drawn.0, drawn.1 as f32, drawn.2 as f32) else {
-                self.lettering.remove(&shape.id);
-                continue;
-            };
-            let image = egui::ColorImage::from_rgba_premultiplied([pixmap.width() as usize, pixmap.height() as usize], pixmap.data());
-            let points = ui.ctx().pixels_per_point();
-            let rect = Rect::from_min_size(pos2(left, top) / points, vec2(pixmap.width() as f32, pixmap.height() as f32) / points);
-            match self.lettering.get_mut(&shape.id) {
-                Some(lettering) => {
-                    lettering.texture.set(image, TextureOptions::LINEAR);
-                    (lettering.drawn, lettering.rect) = (drawn, rect);
-                }
-                None => {
-                    let texture = ui.ctx().load_texture(format!("forma-text-{}", shape.id), image, TextureOptions::LINEAR);
-                    self.lettering.insert(shape.id.clone(), Lettering { drawn, texture, rect });
+        if self.renderer.as_ref().is_none_or(|r| !r.matches(&self.scene)) {
+            self.renderer = Some(render::Renderer::new(&self.scene, &self.place));
+        }
+        let renderer = self.renderer.as_ref().unwrap();
+        // Drawn at the screen's pixel size, again only when the scene, the time or the size changes.
+        let pixels = ui.ctx().pixels_per_point();
+        let size = [(canvas.width() * pixels).round() as u32, (canvas.height() * pixels).round() as u32];
+        let stale = self.preview.as_ref().is_none_or(|(_, scene, time, drawn)| {
+            *drawn != size || *time != self.time || *scene != self.scene
+        });
+        if stale {
+            if let Some(pixmap) = renderer.preview(&self.scene, self.time, size[0] as f32 / self.scene.width) {
+                let image = egui::ColorImage::from_rgba_premultiplied(
+                    [pixmap.width() as usize, pixmap.height() as usize],
+                    pixmap.data(),
+                );
+                match &mut self.preview {
+                    Some((texture, scene, time, drawn)) => {
+                        texture.set(image, TextureOptions::LINEAR);
+                        (*scene, *time, *drawn) = (self.scene.clone(), self.time, size);
+                    }
+                    None => {
+                        let texture = ui.ctx().load_texture("forma-preview", image, TextureOptions::LINEAR);
+                        self.preview = Some((texture, self.scene.clone(), self.time, size));
+                    }
                 }
             }
         }
         let painter = ui.painter();
         painter.rect_filled(area, 10.0, Color32::from_rgb(24, 29, 37));
-        painter.rect_filled(canvas, 3.0, hex(&self.scene.bg, 255));
+        match &self.preview {
+            Some((texture, ..)) => painter.image(
+                texture.id(),
+                canvas,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            ),
+            None => painter.rect_filled(canvas, 3.0, hex(&self.scene.bg, 255)),
+        };
         let mut hits = Vec::new();
         for shape in &self.scene.shapes {
             if !shape.visible(self.time, self.scene.duration) {
                 continue;
             }
             let pose = self.scene.render_pose(shape, self.time);
-            let fill = shape.color_at(self.time);
-            let bounds = paint_shape(
-                painter,
-                canvas,
-                scale,
-                shape,
-                pose,
-                &fill,
-                self.textures.get(&shape.id),
-                self.lettering.get(&shape.id),
+            let bounds = Rect::from_center_size(
+                pos2(canvas.left() + pose.x * scale, canvas.top() + pose.y * scale),
+                vec2(pose.w * scale, pose.h * scale),
             );
+            if renderer.leaves_out(shape) {
+                painter.rect_filled(bounds, 3.0, hex(&shape.color_at(self.time), (pose.o * 2.55).round() as u8));
+                painter.text(
+                    bounds.center(),
+                    Align2::CENTER_CENTER,
+                    format!("{} layer", shape.kind),
+                    font::ui(12.0),
+                    Color32::BLACK,
+                );
+            }
             if self.selected.as_deref() == Some(&shape.id) {
                 painter.rect_stroke(
                     bounds.expand(4.0),
@@ -808,111 +789,4 @@ fn hex(value: &str, alpha: u8) -> Color32 {
     } else {
         Color32::from_rgba_unmultiplied(170, 160, 206, alpha)
     }
-}
-
-fn paint_shape(
-    painter: &egui::Painter,
-    canvas: Rect,
-    scale: f32,
-    shape: &Shape,
-    pose: Pose,
-    layer_color: &str,
-    texture: Option<&TextureHandle>,
-    lettering: Option<&Lettering>,
-) -> Rect {
-    let center = pos2(
-        canvas.left() + pose.x * scale,
-        canvas.top() + pose.y * scale,
-    );
-    let size = vec2(pose.w * scale, pose.h * scale);
-    let bounds = Rect::from_center_size(center, size);
-    let fill = hex(layer_color, (pose.o * 2.55).round() as u8);
-    let angle = pose.r.to_radians();
-    let point = |x: f32, y: f32| {
-        pos2(
-            center.x + x * angle.cos() - y * angle.sin(),
-            center.y + x * angle.sin() + y * angle.cos(),
-        )
-    };
-    let (w, h) = (size.x / 2.0, size.y / 2.0);
-    match shape.kind.as_str() {
-        "circle" => {
-            painter.add(PaintShape::circle_filled(center, w.min(h), fill));
-        }
-        "triangle" => {
-            painter.add(PaintShape::convex_polygon(
-                vec![point(0.0, -h), point(w, h), point(-w, h)],
-                fill,
-                Stroke::NONE,
-            ));
-        }
-        "diamond" => {
-            painter.add(PaintShape::convex_polygon(
-                vec![point(0.0, -h), point(w, 0.0), point(0.0, h), point(-w, 0.0)],
-                fill,
-                Stroke::NONE,
-            ));
-        }
-        "arrow" => {
-            painter.add(PaintShape::convex_polygon(
-                vec![
-                    point(-w, -h * 0.18),
-                    point(w * 0.12, -h * 0.18),
-                    point(w * 0.12, -h),
-                    point(w, 0.0),
-                    point(w * 0.12, h),
-                    point(w * 0.12, h * 0.18),
-                    point(-w, h * 0.18),
-                ],
-                fill,
-                Stroke::NONE,
-            ));
-        }
-        "text" => {
-            if let Some(lettering) = lettering {
-                let mut mesh = egui::Mesh::with_texture(lettering.texture.id());
-                mesh.add_rect_with_uv(
-                    lettering.rect.translate(center.to_vec2()),
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    fill,
-                );
-                for vertex in &mut mesh.vertices {
-                    let offset = vertex.pos - center;
-                    vertex.pos = point(offset.x, offset.y);
-                }
-                painter.add(PaintShape::mesh(mesh));
-            }
-        }
-        "rect" => {
-            painter.add(PaintShape::convex_polygon(
-                vec![point(-w, -h), point(w, -h), point(w, h), point(-w, h)],
-                fill,
-                Stroke::NONE,
-            ));
-        }
-        "image" | "video" if texture.is_some() => {
-            let mut mesh = egui::Mesh::with_texture(texture.unwrap().id());
-            mesh.add_rect_with_uv(
-                bounds,
-                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                Color32::from_white_alpha((pose.o * 2.55).round() as u8),
-            );
-            for vertex in &mut mesh.vertices {
-                let offset = vertex.pos - center;
-                vertex.pos = point(offset.x, offset.y);
-            }
-            painter.add(PaintShape::mesh(mesh));
-        }
-        _ => {
-            painter.rect_filled(bounds, 3.0, fill);
-            painter.text(
-                center,
-                Align2::CENTER_CENTER,
-                format!("{} layer", shape.kind),
-                font::ui(12.0),
-                Color32::BLACK,
-            );
-        }
-    }
-    bounds
 }

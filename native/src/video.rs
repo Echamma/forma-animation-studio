@@ -1,4 +1,4 @@
-//! Exports shape, picture and text scenes to a silent MP4 through FFmpeg, with frames rendered in Rust.
+//! Exports scenes to a silent MP4 through FFmpeg, with frames rendered in Rust.
 
 use crate::{model::Scene, render::Renderer};
 use canopy_ui::Place;
@@ -23,25 +23,8 @@ pub fn start(
     output: PathBuf,
     ctx: egui::Context,
 ) -> Result<Export, String> {
-    if scene.shapes.iter().any(|shape| {
-        !matches!(
-            shape.kind.as_str(),
-            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "image" | "text"
-        )
-    }) {
-        return Err("Video export of SVG and video layers is coming later.".into());
-    }
-    if scene.shapes.iter().any(|shape| {
-        shape
-            .extra
-            .get("blur")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0)
-            > 0.0
-    }) {
-        return Err("Video export of blurred layers is coming later.".into());
-    }
-    let renderer = Renderer::new(scene, place)?;
+    let renderer = Renderer::new(scene, place);
+    renderer.check(scene)?;
     let scene = scene.clone();
     let progress = Arc::new(AtomicU32::new(0));
     let cancel = Arc::new(AtomicBool::new(false));

@@ -208,10 +208,15 @@ impl Scene {
         if t < d.start_time { return 1.0; }
         let reappear = match d.reappear_mode.as_str() {
             "time" => d.reappear_time.unwrap_or(f64::INFINITY),
-            "clip" => self.shapes.iter().find(|s| Some(&s.id) == d.trigger_shape_id.as_ref()).and_then(|target| {
-                if d.trigger_clip_id.as_deref() == Some("keys") && target.keys.len() > 1 { return target.keys.last().map(|k| k.t); }
-                target.rotation_clips.iter().find(|c| Some(&c.id) == d.trigger_clip_id.as_ref()).map(|c| c.start_time + c.duration)
-            }).unwrap_or(f64::INFINITY),
+            // With another layer's animation: when it ends, but never before this one has finished disappearing.
+            "clip" => self.shapes.iter().find(|s| Some(&s.id) == d.trigger_shape_id.as_ref() && s.id != shape.id).and_then(|target| {
+                let clip = d.trigger_clip_id.as_deref()?;
+                if clip == "keys" && target.keys.len() > 1 { return target.keys.last().map(|k| k.t); }
+                let motions = target.extra.get("motions").and_then(Value::as_array).into_iter().flatten().find_map(|m| {
+                    (m.get("id")?.as_str()? == clip).then(|| m.get("startTime")?.as_f64().zip(m.get("duration")?.as_f64()))?
+                }).map(|(start, duration)| start + duration);
+                motions.or_else(|| target.rotation_clips.iter().find(|c| c.id == clip).map(|c| c.start_time + c.duration))
+            }).map_or(f64::INFINITY, |end| end.max(d.start_time + d.duration)),
             _ => f64::INFINITY,
         };
         if t >= reappear { return 1.0; }
@@ -225,8 +230,12 @@ fn value_f32(map: &Map<String, Value>, field: &str, fallback: f32) -> f32 {
 }
 
 impl Shape {
+    /// Whether the layer is on screen at `t`: from `in_time` up to, but not including, `out_time`. A layer without
+    /// one lasts, and one that ends with the scene stays on its final frame (Electron's `inClip`).
     pub fn visible(&self, t: f64, scene_duration: f64) -> bool {
-        t >= self.in_time.unwrap_or(0.0) && t < self.out_time.unwrap_or(scene_duration)
+        const EPSILON: f64 = 1e-6;
+        if self.in_time.is_some_and(|start| t < start - EPSILON) { return false; }
+        self.out_time.is_none_or(|end| t < end - EPSILON || (end >= scene_duration - EPSILON && t >= scene_duration - EPSILON))
     }
 
     pub fn rotation_at(&self, t: f64) -> f32 {
@@ -322,6 +331,8 @@ mod tests {
         assert!(!shape.visible(0.5, scene.duration));
         assert!(shape.visible(2.0, scene.duration));
         assert!(!shape.visible(3.0, scene.duration));
+        let to_the_end = Shape { out_time: Some(4.0), ..shape.clone() };
+        assert!(to_the_end.visible(4.0, scene.duration), "the final frame shows a layer that lasts to the end");
         assert_eq!(shape.pose(2.0).x, 0.0);
         scene.shapes.push(shape);
     }
@@ -351,6 +362,19 @@ mod tests {
         assert_eq!(scene.render_pose(shape, 2.5).o, 50.0);
         assert_eq!(shape.color_at(2.0), "#808080");
         assert_eq!(scene.render_pose(shape, 3.6).o, 100.0);
+    }
+
+    #[test]
+    fn layers_can_reappear_with_a_drawn_move_but_not_before_they_have_gone() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("mover".into(), "circle");
+        scene.add_shape("ghost".into(), "rect");
+        scene.shapes[0].extra.insert("motions".into(), serde_json::json!([{"id": "m1", "type": "arrow", "startTime": 0.5, "duration": 1.0}]));
+        scene.shapes[1].disappear = Some(Disappear { start_time: 1.0, duration: 1.0, reappear_mode: "clip".into(), reappear_time: None,
+            trigger_shape_id: Some("mover".into()), trigger_clip_id: Some("m1".into()), extra: Map::new() });
+        let ghost = &scene.shapes[1];
+        assert_eq!(scene.render_pose(ghost, 1.5).o, 50.0, "still fading although the move ended at 1.5");
+        assert_eq!(scene.render_pose(ghost, 2.0).o, 100.0);
     }
 
     #[test]
