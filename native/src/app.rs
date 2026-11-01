@@ -3,18 +3,26 @@
 use crate::animated_svg;
 use crate::archive;
 use crate::assets;
-use crate::model::{Pose, RotationClip, Scene};
+use crate::model::{HANDLES, Pose, RotationClip, Scene, resized_pose};
 use crate::render;
 use crate::storage;
 use crate::video;
 use crate::videos::Videos;
 use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
 use egui::{
-    Align2, Color32, Rect, Sense, Stroke, StrokeKind, TextureHandle,
-    TextureOptions, Ui, UiBuilder, pos2, vec2,
+    Align2, Color32, Pos2, Rect, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// A drag on the canvas, with what it started from (scene pixels, editable poses).
+#[derive(Clone, Copy)]
+enum Gesture {
+    Move { index: usize, start: Pos2, pose: Pose },
+    Resize { index: usize, handle: (i8, i8), start: Pos2, pose: Pose, angle: f32 },
+    Rotate { index: usize, center: Pos2, last: f32 },
+}
 
 /// What Electron Forma's export dialog can make.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,6 +68,8 @@ pub struct Forma {
     undo: Vec<Scene>,
     redo: Vec<Scene>,
     recording_drag: bool,
+    /// A drag on the canvas: moving, resizing or turning a layer.
+    gesture: Option<Gesture>,
     suppress_history: bool,
     export: Option<video::Export>,
 }
@@ -88,6 +98,7 @@ impl Forma {
             undo: Vec::new(),
             redo: Vec::new(),
             recording_drag: false,
+            gesture: None,
             suppress_history: false,
             export: None,
         }
@@ -462,66 +473,133 @@ impl Forma {
             ),
             None => painter.rect_filled(canvas, 3.0, hex(&self.scene.bg, 255)),
         };
+        // Layers as drawn on screen: center, size in points and angle, for hit testing (topmost last).
+        let on_screen = |pose: Pose| (pos2(canvas.left() + pose.x * scale, canvas.top() + pose.y * scale), vec2(pose.w, pose.h) * scale, pose.r);
+        let local = |p: Pos2, (center, _, angle): (Pos2, Vec2, f32)| {
+            let (d, a) = (p - center, (-angle).to_radians());
+            vec2(d.x * a.cos() - d.y * a.sin(), d.x * a.sin() + d.y * a.cos())
+        };
+        let turn = |v: Vec2, angle: f32| {
+            let a = angle.to_radians();
+            vec2(v.x * a.cos() - v.y * a.sin(), v.x * a.sin() + v.y * a.cos())
+        };
         let mut hits = Vec::new();
         for shape in &self.scene.shapes {
             if !shape.visible(self.time, self.scene.duration) {
                 continue;
             }
             let pose = self.scene.render_pose(shape, self.time);
-            let bounds = Rect::from_center_size(
-                pos2(canvas.left() + pose.x * scale, canvas.top() + pose.y * scale),
-                vec2(pose.w * scale, pose.h * scale),
-            );
+            let (center, size, angle) = on_screen(pose);
             if renderer.leaves_out(shape) {
-                painter.rect_filled(bounds, 3.0, hex(&shape.color_at(self.time), (pose.o * 2.55).round() as u8));
-                painter.text(
-                    bounds.center(),
-                    Align2::CENTER_CENTER,
-                    format!("{} layer", shape.kind),
-                    font::ui(12.0),
-                    Color32::BLACK,
-                );
+                let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| center + turn(vec2(x, y) * size / 2.0, angle));
+                painter.add(egui::Shape::convex_polygon(corners.to_vec(), hex(&shape.color_at(self.time), (pose.o * 2.55).round() as u8), Stroke::NONE));
+                painter.text(center, Align2::CENTER_CENTER, format!("{} layer", shape.kind), font::ui(12.0), Color32::BLACK);
             }
-            if self.selected.as_deref() == Some(&shape.id) {
-                painter.rect_stroke(
-                    bounds.expand(4.0),
-                    3.0,
-                    Stroke::new(1.5, color::SUN),
-                    StrokeKind::Outside,
-                );
+            hits.push((shape.id.clone(), (center, size, angle)));
+        }
+        // The selected layer's box, resize handles and rotation handle (Electron's selection control).
+        let selected = self.selected.as_deref().and_then(|id| hits.iter().find(|(hit, _)| hit == id)).map(|(_, place)| *place);
+        let mut handles = Vec::new();
+        let mut rotate_at = None;
+        if let (Some((center, size, angle)), false) = (selected, self.playing) {
+            let smallest = size.x.min(size.y);
+            let (knob, reach) = ((smallest * 0.28).clamp(8.0, 12.0), (smallest * 0.5).clamp(12.0, 28.0));
+            let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| center + turn(vec2(x, y) * size / 2.0, angle));
+            painter.add(egui::Shape::closed_line(corners.to_vec(), Stroke::new(1.5, color::SUN)));
+            for (sx, sy) in HANDLES {
+                if (sx == 0 && size.x < 48.0) || (sy == 0 && size.y < 48.0) {
+                    continue;
+                }
+                let at = center + turn(vec2(sx as f32 * size.x, sy as f32 * size.y) / 2.0, angle);
+                let square = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| at + turn(vec2(x, y) * knob / 2.0, angle));
+                painter.add(egui::Shape::convex_polygon(square.to_vec(), Color32::WHITE, Stroke::new(1.0, color::SUN)));
+                handles.push(((sx, sy), at, reach));
             }
-            hits.push((shape.id.clone(), bounds));
+            let top = center + turn(vec2(0.0, -size.y / 2.0), angle);
+            let knob_at = center + turn(vec2(0.0, -size.y / 2.0 - 34.0), angle);
+            painter.line_segment([top, knob_at], Stroke::new(1.5, color::SUN));
+            painter.circle(knob_at, 10.0, Color32::WHITE, Stroke::new(1.5, color::SUN));
+            painter.circle_stroke(knob_at, 4.5, Stroke::new(1.5, color::SUN));
+            rotate_at = Some(knob_at);
         }
         let response = ui.interact(
-            canvas,
+            canvas.expand(48.0).intersect(ui.max_rect()),
             ui.scope_id().with("forma-canvas"),
             Sense::click_and_drag(),
         );
-        if response.clicked() || response.drag_started() {
-            let pointer = response.interact_pointer_pos();
-            self.selected = pointer.and_then(|p| {
-                hits.iter()
-                    .rev()
-                    .find(|(_, rect)| rect.contains(p))
-                    .map(|(id, _)| id.clone())
-            });
+        let near_handle = |p: Pos2| {
+            handles.iter().find(|(_, at, reach)| {
+                let d = local(p, (*at, Vec2::ZERO, selected.map_or(0.0, |s| s.2)));
+                d.x.abs() <= reach / 2.0 && d.y.abs() <= reach / 2.0
+            }).map(|(handle, ..)| *handle)
+        };
+        let on_rotate = |p: Pos2| rotate_at.is_some_and(|at| at.distance(p) <= 12.0);
+        let topmost = |p: Pos2| hits.iter().rev().find(|(_, place)| {
+            let d = local(p, *place);
+            d.x.abs() <= place.1.x / 2.0 && d.y.abs() <= place.1.y / 2.0
+        }).map(|(id, _)| id.clone());
+        if let Some(p) = response.hover_pos() {
+            if on_rotate(p) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            } else if let Some((sx, sy)) = near_handle(p) {
+                // Electron's resizeCursor: the handle's direction on screen, to the nearest 45 degrees.
+                let degrees = ((sy as f32).atan2(sx as f32).to_degrees() + selected.map_or(0.0, |s| s.2)).rem_euclid(180.0);
+                ui.ctx().set_cursor_icon([egui::CursorIcon::ResizeHorizontal, egui::CursorIcon::ResizeNwSe, egui::CursorIcon::ResizeVertical, egui::CursorIcon::ResizeNeSw][(degrees / 45.0).round() as usize % 4]);
+            } else if topmost(p).is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            }
         }
-        if response.dragged() {
-            let delta = ui.input(|i| i.pointer.delta()) / scale;
-            if delta != egui::Vec2::ZERO {
-                if let Some(shape) = self
-                    .scene
-                    .shapes
-                    .iter_mut()
-                    .find(|s| Some(s.id.as_str()) == self.selected.as_deref())
-                {
-                    let mut pose = shape.pose(self.time);
-                    pose.x += delta.x;
-                    pose.y += delta.y;
-                    shape.edit_pose(self.time, pose);
-                    self.edited();
+        if response.drag_started() || response.clicked() {
+            // Where the button went down: by the time a drag starts, the pointer has moved off a small handle.
+            if let Some(p) = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos()) {
+                let index = |id: &str| self.scene.shapes.iter().position(|s| s.id == id);
+                let to_scene = |p: Pos2| pos2((p.x - canvas.left()) / scale, (p.y - canvas.top()) / scale);
+                self.gesture = None;
+                if let (true, Some(i)) = (on_rotate(p), self.selected.as_deref().and_then(index)) {
+                    let center = self.scene.render_pose(&self.scene.shapes[i], self.time);
+                    let point = to_scene(p);
+                    self.gesture = Some(Gesture::Rotate { index: i, center: pos2(center.x, center.y), last: (point.y - center.y).atan2(point.x - center.x).to_degrees() });
+                } else if let (Some(handle), Some(i)) = (near_handle(p), self.selected.as_deref().and_then(index)) {
+                    let shape = &self.scene.shapes[i];
+                    self.gesture = Some(Gesture::Resize { index: i, handle, start: to_scene(p), pose: self.scene.editable_pose(shape, self.time), angle: self.scene.render_pose(shape, self.time).r });
+                } else {
+                    self.selected = topmost(p);
+                    if let Some(i) = self.selected.as_deref().and_then(index) {
+                        self.gesture = Some(Gesture::Move { index: i, start: to_scene(p), pose: self.scene.editable_pose(&self.scene.shapes[i], self.time) });
+                    }
+                }
+                if response.clicked() {
+                    self.gesture = None;
                 }
             }
+        }
+        if response.dragged() {
+            if let (Some(gesture), Some(p)) = (self.gesture, response.interact_pointer_pos()) {
+                let point = pos2((p.x - canvas.left()) / scale, (p.y - canvas.top()) / scale);
+                let freeform = ui.input(|i| i.modifiers.shift);
+                match gesture {
+                    Gesture::Move { index, start, pose } => {
+                        let moved = Pose { x: pose.x + point.x - start.x, y: pose.y + point.y - start.y, ..pose };
+                        self.scene.set_pose(index, self.time, moved);
+                    }
+                    Gesture::Resize { index, handle, start, pose, angle } => {
+                        let resized = resized_pose(pose, angle, handle, (point.x - start.x, point.y - start.y), freeform);
+                        self.scene.set_pose(index, self.time, resized);
+                    }
+                    // Turning a layer by hand changes its base rotation, as in Electron, not its keyframes.
+                    Gesture::Rotate { index, center, last } => {
+                        let angle = (point.y - center.y).atan2(point.x - center.x).to_degrees();
+                        let delta = (angle - last + 540.0).rem_euclid(360.0) - 180.0;
+                        let shape = &mut self.scene.shapes[index];
+                        shape.base_rotation = (shape.base_rotation + delta).clamp(-10000.0, 10000.0);
+                        self.gesture = Some(Gesture::Rotate { index, center, last: angle });
+                    }
+                }
+                self.edited();
+            }
+        }
+        if response.drag_stopped() {
+            self.gesture = None;
         }
     }
 

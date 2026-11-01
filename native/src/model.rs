@@ -225,6 +225,44 @@ impl Scene {
         (1.0 - (t - d.start_time) / d.duration) as f32
     }
 
+    /// The pose the editor changes: what's drawn, except opacity from the layer's own keys, and for anything but
+    /// linked text, rotation without rotation clips and base rotation (Electron's `editableState`).
+    pub fn editable_pose(&self, shape: &Shape, t: f64) -> Pose {
+        let mut pose = self.render_pose(shape, t);
+        let own = shape.pose(t);
+        pose.o = own.o;
+        if !is_linked(shape) {
+            pose.r = own.r;
+        }
+        pose
+    }
+
+    /// Sets the editable pose of the layer at `index`: linked text keeps it as offsets from what it's linked to
+    /// (Electron's `setLinkedTextPose`), anything else as a keyframe at `t`.
+    pub fn set_pose(&mut self, index: usize, t: f64, pose: Pose) {
+        let shape = &self.shapes[index];
+        let target = shape.extra.get("linkId").and_then(Value::as_str).filter(|_| shape.kind == "text")
+            .and_then(|id| self.shapes.iter().find(|s| s.id == id));
+        let Some(target) = target else { return self.shapes[index].edit_pose(t, pose) };
+        let mut p = target.pose(t);
+        p.r += target.rotation_at(t) + target.base_rotation;
+        let base_w = shape.extra.get("linkBase").and_then(|v| v.get("w")).and_then(Value::as_f64).unwrap_or(p.w as f64) as f32;
+        let base_h = shape.extra.get("linkBase").and_then(|v| v.get("h")).and_then(Value::as_f64).unwrap_or(p.h as f64) as f32;
+        let (sx, sy) = (p.w / if base_w == 0.0 { p.w } else { base_w }, p.h / if base_h == 0.0 { p.h } else { base_h });
+        let or_one = |v: f32| if v == 0.0 || !v.is_finite() { 1.0 } else { v };
+        let angle = (-p.r).to_radians();
+        let (dx, dy) = (pose.x - p.x, pose.y - p.y);
+        let rotation = pose.r - p.r - shape.rotation_at(t) - shape.base_rotation;
+        let opacity = if p.o != 0.0 { pose.o / p.o } else { 1.0 };
+        let extra = &mut self.shapes[index].extra;
+        extra.insert("offsetX".into(), serde_json::json!((dx * angle.cos() - dy * angle.sin()) / or_one(sx)));
+        extra.insert("offsetY".into(), serde_json::json!((dx * angle.sin() + dy * angle.cos()) / or_one(sy)));
+        extra.insert("textWidth".into(), serde_json::json!(pose.w / or_one(sx.abs())));
+        extra.insert("fontSize".into(), serde_json::json!(pose.h / or_one(sy.abs())));
+        extra.insert("rotationOffset".into(), serde_json::json!(rotation));
+        extra.insert("opacityFactor".into(), serde_json::json!(opacity));
+    }
+
     /// When a layer that disappears comes back (Electron's `reappearAt`); never is infinity.
     pub fn reappear_at(&self, shape: &Shape) -> f64 {
         let Some(d) = &shape.disappear else { return f64::INFINITY };
@@ -242,6 +280,36 @@ impl Scene {
             _ => f64::INFINITY,
         }
     }
+}
+
+fn is_linked(shape: &Shape) -> bool {
+    shape.kind == "text" && shape.extra.get("linkId").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
+}
+
+/// Electron's resize handles, by direction from the center.
+pub const HANDLES: [(i8, i8); 8] = [(-1, -1), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0)];
+
+/// A pose dragged by its handle `(sx, sy)` by `delta` scene pixels, the layer turned `angle` degrees (Electron's
+/// `resizedPose`): corners scale both ways together unless `freeform`, sides stretch one way, and the opposite side
+/// stays put.
+pub fn resized_pose(start: Pose, angle: f32, (sx, sy): (i8, i8), (dx, dy): (f32, f32), freeform: bool) -> Pose {
+    let (sx, sy) = (sx as f32, sy as f32);
+    let (cos, sin) = (angle.to_radians().cos(), angle.to_radians().sin());
+    let (dx, dy) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+    let (max_w, max_h) = (start.w.max(4000.0), start.h.max(4000.0));
+    let (mut w, mut h) = (start.w, start.h);
+    if sx != 0.0 && sy != 0.0 && !freeform {
+        let scale = (1.0 + (sx * dx * start.w + sy * dy * start.h) / (start.w * start.w + start.h * start.h))
+            .clamp((5.0 / start.w).max(5.0 / start.h), (max_w / start.w).min(max_h / start.h));
+        (w, h) = (start.w * scale, start.h * scale);
+    } else {
+        if sx != 0.0 { w = (start.w + sx * dx).clamp(5.0, max_w); }
+        if sy != 0.0 { h = (start.h + sy * dy).clamp(5.0, max_h); }
+    }
+    if (w - start.w).abs() < 0.01 && (h - start.h).abs() < 0.01 { return start; }
+    let (w, h) = ((w * 10.0).round() / 10.0, (h * 10.0).round() / 10.0);
+    let (shift_x, shift_y) = (sx * (w - start.w) / 2.0, sy * (h - start.h) / 2.0);
+    Pose { w, h, x: start.x + shift_x * cos - shift_y * sin, y: start.y + shift_x * sin + shift_y * cos, ..start }
 }
 
 fn value_f32(map: &Map<String, Value>, field: &str, fallback: f32) -> f32 {
@@ -295,9 +363,11 @@ impl Shape {
             h: mix(before.h, after.h), r: mix(before.r, after.r), o: mix(before.o, after.o) }
     }
 
-    /// Edits a pose at the playhead, inserting a keyframe when the playhead sits between keys.
+    /// Edits a pose at the playhead, inserting a keyframe when the playhead sits between keys. Like Electron's
+    /// `keyAt`, keys sit on hundredths of a second and a key within one of them is the one edited.
     pub fn edit_pose(&mut self, t: f64, pose: Pose) {
-        let at = self.keys.iter().position(|key| (key.t - t).abs() < 1e-6);
+        let t = (t * 100.0).round() / 100.0;
+        let at = self.keys.iter().position(|key| (key.t - t).abs() < 0.011);
         let index = match at {
             Some(index) => index,
             None => {
@@ -400,6 +470,45 @@ mod tests {
         let ghost = &scene.shapes[1];
         assert_eq!(scene.render_pose(ghost, 1.5).o, 50.0, "still fading although the move ended at 1.5");
         assert_eq!(scene.render_pose(ghost, 2.0).o, 100.0);
+    }
+
+    #[test]
+    fn handles_resize_like_electron() {
+        let start = Pose { x: 100.0, y: 100.0, w: 100.0, h: 50.0, r: 0.0, o: 100.0 };
+        // The right side moves right 20: 20 wider, the center 10 right, the left side where it was.
+        let right = resized_pose(start, 0.0, (1, 0), (20.0, 5.0), false);
+        assert_eq!((right.w, right.h, right.x, right.y), (120.0, 50.0, 110.0, 100.0));
+        // A corner keeps the shape's proportions.
+        let corner = resized_pose(start, 0.0, (1, 1), (25.0, 0.0), false);
+        assert!((corner.w / corner.h - 2.0).abs() < 0.01 && corner.w > 100.0);
+        // Turned a quarter, dragging down widens it.
+        let turned = resized_pose(start, 90.0, (1, 0), (0.0, 20.0), false);
+        assert!((turned.w - 120.0).abs() < 0.01 && (turned.y - 110.0).abs() < 0.01, "{turned:?}");
+    }
+
+    #[test]
+    fn linked_text_moves_as_offsets_from_its_shape() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("c".into(), "circle");
+        scene.add_text("t".into());
+        scene.shapes[1].extra.insert("linkId".into(), "c".into());
+        let mut pose = scene.editable_pose(&scene.shapes[1], 0.0);
+        pose.x += 30.0;
+        scene.set_pose(1, 0.0, pose);
+        let drawn = scene.render_pose(&scene.shapes[1], 0.0);
+        assert!((drawn.x - (scene.shapes[0].keys[0].x + 30.0)).abs() < 0.01, "{drawn:?}");
+        assert_eq!(scene.shapes[1].keys.len(), 1, "no keyframe of its own");
+    }
+
+    #[test]
+    fn keys_sit_on_hundredths_of_a_second() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "rect");
+        let shape = &mut scene.shapes[0];
+        shape.edit_pose(1.234, Pose { x: 1.0, ..shape.pose(0.0) });
+        shape.edit_pose(1.236, Pose { x: 2.0, ..shape.pose(0.0) });
+        assert_eq!(shape.keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![0.0, 1.23]);
+        assert_eq!(shape.keys[1].x, 2.0);
     }
 
     #[test]
