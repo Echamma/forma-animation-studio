@@ -75,6 +75,76 @@ pub fn recolor(source: &str, color: &str) -> Result<String, String> {
     Ok(out)
 }
 
+const PARTS: &[&str] = &["path", "rect", "circle", "ellipse", "line", "polygon", "polyline", "text", "image", "use"];
+
+fn part<'a>(doc: &'a roxmltree::Document<'a>, index: usize) -> Option<roxmltree::Node<'a, 'a>> {
+    doc.descendants().filter(|node| node.is_element() && PARTS.contains(&node.tag_name().name())).nth(index)
+}
+
+pub fn part_name(source: &str, index: usize) -> Option<String> {
+    let doc = roxmltree::Document::parse(source).ok()?;
+    Some(part(&doc, index)?.tag_name().name().to_owned())
+}
+
+/// Find the topmost painted element under a preview pixel. Each candidate is rendered with the other drawable
+/// elements removed, so transforms, clipping and inherited paint use the same renderer as the artwork itself.
+pub fn hit_part(source: &str, x: u32, y: u32, width: u32, height: u32) -> Option<usize> {
+    let doc = roxmltree::Document::parse(source).ok()?;
+    let nodes: Vec<_> = doc.descendants().filter(|node| node.is_element() && PARTS.contains(&node.tag_name().name())).collect();
+    for selected in (0..nodes.len()).rev() {
+        let mut isolated = source.to_owned();
+        let mut ranges: Vec<_> = nodes.iter().enumerate().filter(|(i, _)| *i != selected).map(|(_, node)| node.range()).collect();
+        ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
+        for range in ranges { isolated.replace_range(range, ""); }
+        let tree = parse(&isolated).ok()?;
+        if rasterize(&tree, width, height)?.pixel(x, y)?.alpha() > 0 { return Some(selected); }
+    }
+    None
+}
+
+pub fn part_color(source: &str, index: usize, paint: &str) -> Option<String> {
+    let doc = roxmltree::Document::parse(source).ok()?;
+    let node = part(&doc, index)?;
+    let value = node.attribute(paint).or_else(|| {
+        node.attribute("style")?.split(';').filter_map(|entry| entry.split_once(':')).find(|(key, _)| key.trim() == paint).map(|(_, value)| value.trim())
+    })?;
+    Some(value.to_owned())
+}
+
+pub fn set_part_paint(source: &str, index: usize, paint: &str, color: &str) -> Result<String, String> {
+    if !["fill", "stroke"].contains(&paint) || !color.starts_with('#') || color.len() != 7 || !color[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Invalid SVG color".into());
+    }
+    let doc = roxmltree::Document::parse(source).map_err(|e| e.to_string())?;
+    let node = part(&doc, index).ok_or("SVG part no longer exists")?;
+    let mut edits = Vec::new();
+    if let Some(attr) = node.attributes().find(|attr| attr.name() == paint && attr.namespace().is_none()) {
+        edits.push((attr.range_value(), color.to_owned()));
+    } else {
+        let start = node.range().start + 1;
+        let name_len = source[start..].find(|c: char| c.is_whitespace() || c == '>' || c == '/').ok_or("Invalid SVG element")?;
+        edits.push((start + name_len..start + name_len, format!(r#" {paint}="{color}""#)));
+    }
+    if let Some(style) = node.attributes().find(|attr| attr.name() == "style" && attr.namespace().is_none()) {
+        let kept: Vec<_> = style.value().split(';').filter(|entry| entry.split_once(':').is_none_or(|(key, _)| key.trim() != paint)).collect();
+        edits.push((style.range_value(), kept.join(";")));
+    }
+    let mut out = source.to_owned();
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, value) in edits { out.replace_range(range, &value); }
+    parse(&out)?;
+    Ok(out)
+}
+
+pub fn delete_part(source: &str, index: usize) -> Result<String, String> {
+    let doc = roxmltree::Document::parse(source).map_err(|e| e.to_string())?;
+    let range = part(&doc, index).ok_or("SVG part no longer exists")?.range();
+    let mut out = source.to_owned();
+    out.replace_range(range, "");
+    parse(&out)?;
+    Ok(out)
+}
+
 /// The SVG's own size, from its width and height or its viewBox.
 pub fn size(tree: &Tree) -> (f32, f32) {
     (tree.size().width(), tree.size().height())
@@ -111,6 +181,21 @@ mod tests {
         assert!(out.contains(r##"fill="url(#g)""##), "{out}");
         assert!(parse(&out).is_ok());
         assert!(recolor("<svg", "#000000").is_err());
+    }
+
+    #[test]
+    fn svg_parts_can_be_picked_painted_and_deleted() {
+        let source = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#ff0000"/><circle cx="5" cy="5" r="2" style="fill:blue;stroke:none"/></svg>"##;
+        assert_eq!(hit_part(source, 5, 5, 10, 10), Some(1));
+        assert_eq!(hit_part(source, 1, 1, 10, 10), Some(0));
+        assert_eq!(part_name(source, 1).as_deref(), Some("circle"));
+        let painted = set_part_paint(source, 1, "fill", "#123456").unwrap();
+        assert!(painted.contains("fill=\"#123456\""));
+        assert!(!painted.contains("fill:blue"));
+        let pixmap = rasterize(&parse(&painted).unwrap(), 10, 10).unwrap();
+        assert_eq!(pixmap.pixel(5, 5).unwrap().red(), 0x12);
+        let deleted = delete_part(&painted, 1).unwrap();
+        assert_eq!(hit_part(&deleted, 5, 5, 10, 10), Some(0));
     }
 
     #[test]

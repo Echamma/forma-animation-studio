@@ -31,6 +31,7 @@ struct SvgEdit {
     id: String,
     source: String,
     color: [u8; 3],
+    selected_part: Option<usize>,
     status: String,
 }
 
@@ -446,7 +447,7 @@ impl Forma {
         let shape = &mut self.scene.shapes[index];
         if shape.kind == "svg" && ui.button("Edit SVG…").on_hover_text("Change its markup or recolor it").clicked() {
             let source = assets::svg_source(shape, &self.place).ok().flatten().unwrap_or_default();
-            self.svg_edit = Some(SvgEdit { id: shape.id.clone(), source, color: [0x1f, 0x3d, 0x2b], status: String::new() });
+            self.svg_edit = Some(SvgEdit { id: shape.id.clone(), source, color: [0x1f, 0x3d, 0x2b], selected_part: None, status: String::new() });
         }
         let shape = &mut self.scene.shapes[index];
         // The fill: with "Animate color" on, picking a color sets a color keyframe at the playhead (as in Electron).
@@ -1568,14 +1569,28 @@ impl Forma {
             }
             match (&tree, &self.svg_preview) {
                 (Ok(_), Some((_, texture))) => {
-                    ui.add(egui::Image::new(texture).max_size(vec2(480.0, 180.0)));
+                    let response = ui.add(egui::Image::new(texture).max_size(vec2(480.0, 180.0)).sense(egui::Sense::click()));
+                    if let Some(pos) = response.interact_pointer_pos().filter(|_| response.clicked()) {
+                        let uv = (pos - response.rect.min) / response.rect.size();
+                        let size = texture.size();
+                        edit.selected_part = svg::hit_part(&edit.source, (uv.x * size[0] as f32) as u32, (uv.y * size[1] as f32) as u32, size[0] as u32, size[1] as u32);
+                        if let Some(index) = edit.selected_part {
+                            if let Some(hex) = svg::part_color(&edit.source, index, "fill") {
+                                if hex.len() == 7 && hex.starts_with('#') {
+                                    if let Ok(rgb) = u32::from_str_radix(&hex[1..], 16) { edit.color = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]; }
+                                }
+                            }
+                        }
+                    }
                 }
                 _ => {
                     ui.label(egui::RichText::new("Fix the SVG markup to preview it.").color(color::INK_MUTED));
                 }
             }
             egui::ScrollArea::vertical().id_salt("forma-svg-source").max_height(200.0).show(ui, |ui| {
-                ui.add(egui::TextEdit::multiline(&mut edit.source).code_editor().desired_width(f32::INFINITY).desired_rows(8));
+                if ui.add(egui::TextEdit::multiline(&mut edit.source).code_editor().desired_width(f32::INFINITY).desired_rows(8)).changed() {
+                    edit.selected_part = None;
+                }
             });
             ui.horizontal(|ui| {
                 egui::color_picker::color_edit_button_srgb(ui, &mut edit.color);
@@ -1587,6 +1602,26 @@ impl Forma {
                     }
                 }
             });
+            if let Some(index) = edit.selected_part {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Selected: {}", svg::part_name(&edit.source, index).unwrap_or_default()));
+                    let color = format!("#{:02x}{:02x}{:02x}", edit.color[0], edit.color[1], edit.color[2]);
+                    for (label, paint) in [("Set fill", "fill"), ("Set stroke", "stroke")] {
+                        if ui.button(label).clicked() {
+                            match svg::set_part_paint(&edit.source, index, paint, &color) {
+                                Ok(source) => { edit.source = source; edit.status = format!("{label} updated. Apply to save."); },
+                                Err(error) => edit.status = error,
+                            }
+                        }
+                    }
+                    if ui.button("Delete part").clicked() {
+                        match svg::delete_part(&edit.source, index) {
+                            Ok(source) => { edit.source = source; edit.selected_part = None; edit.status = "Part deleted. Apply to save.".into(); },
+                            Err(error) => edit.status = error,
+                        }
+                    }
+                });
+            }
             if !edit.status.is_empty() {
                 ui.label(egui::RichText::new(&edit.status).color(color::INK_MUTED));
             }
