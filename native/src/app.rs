@@ -1,9 +1,11 @@
 //! Native Forma scene editor: shape layers, keyframes, timeline and the same project folder as Electron Forma.
 
 use crate::model::{Pose, Scene, Shape};
+use crate::assets;
 use crate::storage;
 use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
-use egui::{Align2, Color32, Rect, Sense, Shape as PaintShape, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
+use egui::{Align2, Color32, Rect, Sense, Shape as PaintShape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui, UiBuilder, pos2, vec2};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn new_id() -> String {
@@ -21,13 +23,16 @@ pub struct Forma {
     last_tick: Instant,
     edited_at: Option<Instant>,
     show_projects: bool,
+    textures: HashMap<String, TextureHandle>,
+    failed_assets: HashSet<String>,
 }
 
 impl Forma {
     pub fn new(place: Place) -> Self {
         let scene = storage::list(&place).first().and_then(|doc| storage::load_document(&place, &doc.id).ok())
             .unwrap_or_else(|| Scene::empty(new_id()));
-        Self { place, scene, selected: None, time: 0.0, playing: false, last_tick: Instant::now(), edited_at: None, show_projects: false }
+        Self { place, scene, selected: None, time: 0.0, playing: false, last_tick: Instant::now(), edited_at: None, show_projects: false,
+            textures: HashMap::new(), failed_assets: HashSet::new() }
     }
 
     fn edited(&mut self) { self.edited_at = Some(Instant::now()); }
@@ -38,6 +43,8 @@ impl Forma {
         self.selected = None;
         self.time = 0.0;
         self.playing = false;
+        self.textures.clear();
+        self.failed_assets.clear();
     }
 
     fn toolbar(&mut self, ui: &mut Ui, host: &mut dyn Host) {
@@ -109,6 +116,14 @@ impl Forma {
     }
 
     fn canvas(&mut self, ui: &mut Ui) {
+        for shape in &self.scene.shapes {
+            if assets::image_key(shape).is_some() && !self.textures.contains_key(&shape.id) && !self.failed_assets.contains(&shape.id) {
+                match assets::image(shape, &self.place) {
+                    Ok(Some(image)) => { self.textures.insert(shape.id.clone(), ui.ctx().load_texture(format!("forma-{}", shape.id), image, TextureOptions::LINEAR)); }
+                    _ => { self.failed_assets.insert(shape.id.clone()); }
+                }
+            }
+        }
         let area = ui.max_rect().shrink(14.0);
         let scale = (area.width() / self.scene.width).min(area.height() / self.scene.height).max(0.01);
         let canvas = Rect::from_center_size(area.center(), vec2(self.scene.width * scale, self.scene.height * scale));
@@ -119,7 +134,7 @@ impl Forma {
         for shape in &self.scene.shapes {
             if !shape.visible(self.time, self.scene.duration) { continue; }
             let pose = shape.pose(self.time);
-            let bounds = paint_shape(painter, canvas, scale, shape, pose);
+            let bounds = paint_shape(painter, canvas, scale, shape, pose, self.textures.get(&shape.id));
             if self.selected.as_deref() == Some(&shape.id) {
                 painter.rect_stroke(bounds.expand(4.0), 3.0, Stroke::new(1.5, color::SUN), StrokeKind::Outside);
             }
@@ -227,12 +242,31 @@ impl CanopyApp for Forma {
     fn receive(&mut self, files: Vec<SharedFile>, host: &mut dyn Host) -> Receipt {
         let mut receipt = Receipt::default();
         for file in files {
-            match storage::load(&file.path) {
-                Ok(scene) => { self.open(scene); self.edited(); receipt.accepted += 1; }
-                Err(_) => receipt.skipped.push(file.name),
+            if file.name.to_lowercase().ends_with(".json") {
+                match storage::load(&file.path) {
+                    Ok(scene) => { self.open(scene); self.edited(); receipt.accepted += 1; }
+                    Err(_) => receipt.skipped.push(file.name),
+                }
+            } else {
+                match assets::import_picture(&file.path, &self.place) {
+                    Ok((url, width, height)) => {
+                        let id = self.scene.add_shape(new_id(), "image");
+                        if let Some(shape) = self.scene.shapes.last_mut() {
+                            shape.name = file.name.clone();
+                            shape.extra.insert("assetData".into(), url.into());
+                            let scale = (300.0 / width.max(height) as f32).min(1.0);
+                            let pose = Pose { w: width as f32 * scale, h: height as f32 * scale, ..shape.pose(0.0) };
+                            shape.edit_pose(0.0, pose);
+                        }
+                        self.selected = Some(id);
+                        self.edited();
+                        receipt.accepted += 1;
+                    }
+                    Err(_) => receipt.skipped.push(file.name),
+                }
             }
         }
-        if receipt.accepted > 0 { host.toast("Opened Forma project".into()); }
+        if receipt.accepted > 0 { host.toast(format!("Forma took {} file(s)", receipt.accepted)); }
         receipt
     }
 
@@ -256,7 +290,7 @@ fn hex(value: &str, alpha: u8) -> Color32 {
     } else { Color32::from_rgba_unmultiplied(170, 160, 206, alpha) }
 }
 
-fn paint_shape(painter: &egui::Painter, canvas: Rect, scale: f32, shape: &Shape, pose: Pose) -> Rect {
+fn paint_shape(painter: &egui::Painter, canvas: Rect, scale: f32, shape: &Shape, pose: Pose, texture: Option<&TextureHandle>) -> Rect {
     let center = pos2(canvas.left() + pose.x * scale, canvas.top() + pose.y * scale);
     let size = vec2(pose.w * scale, pose.h * scale);
     let bounds = Rect::from_center_size(center, size);
@@ -271,6 +305,15 @@ fn paint_shape(painter: &egui::Painter, canvas: Rect, scale: f32, shape: &Shape,
         "arrow" => { painter.add(PaintShape::convex_polygon(vec![point(-w, -h * 0.18), point(w * 0.12, -h * 0.18), point(w * 0.12, -h), point(w, 0.0), point(w * 0.12, h), point(w * 0.12, h * 0.18), point(-w, h * 0.18)], fill, Stroke::NONE)); }
         "text" => { painter.text(center, Align2::CENTER_CENTER, shape.extra.get("text").and_then(|v| v.as_str()).unwrap_or("Text"), font::bold(size.y.min(80.0)), fill); }
         "rect" => { painter.add(PaintShape::convex_polygon(vec![point(-w, -h), point(w, -h), point(w, h), point(-w, h)], fill, Stroke::NONE)); }
+        "image" | "video" if texture.is_some() => {
+            let mut mesh = egui::Mesh::with_texture(texture.unwrap().id());
+            mesh.add_rect_with_uv(bounds, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::from_white_alpha((pose.o * 2.55).round() as u8));
+            for vertex in &mut mesh.vertices {
+                let offset = vertex.pos - center;
+                vertex.pos = point(offset.x, offset.y);
+            }
+            painter.add(PaintShape::mesh(mesh));
+        }
         _ => {
             painter.rect_filled(bounds, 3.0, fill);
             painter.text(center, Align2::CENTER_CENTER, format!("{} layer", shape.kind), font::ui(12.0), Color32::BLACK);

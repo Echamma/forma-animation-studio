@@ -3,6 +3,7 @@
 pub mod model;
 pub mod storage;
 pub mod app;
+pub mod assets;
 
 use canopy_ui::{Accent, AppDescriptor, CanopyApp, Place, SharedFile};
 
@@ -11,6 +12,6 @@ fn create(place: Place, _ctx: &egui::Context) -> Box<dyn CanopyApp> { Box::new(a
 pub static DESCRIPTOR: AppDescriptor = AppDescriptor {
     id: "forma", name: "Forma", description: "Animate shapes and pictures", accent: Accent::Clay,
     initial: "Fo", folder: "Forma", icon_png: &[],
-    accepts: |file: &SharedFile| file.name.to_lowercase().ends_with(".json"),
+    accepts: |file: &SharedFile| [".json", ".png", ".jpg", ".jpeg", ".webp"].iter().any(|ext| file.name.to_lowercase().ends_with(ext)),
     documents: storage::list, create,
 };
