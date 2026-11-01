@@ -126,6 +126,7 @@ pub struct Forma {
     place: Place,
     scene: Scene,
     selected: Option<String>,
+    layer_drag: Option<String>,
     time: f64,
     playing: bool,
     last_tick: Instant,
@@ -176,6 +177,7 @@ impl Forma {
             place,
             scene,
             selected: None,
+            layer_drag: None,
             time: 0.0,
             playing: false,
             last_tick: Instant::now(),
@@ -215,6 +217,7 @@ impl Forma {
         let _ = self.save();
         self.scene = scene;
         self.selected = None;
+        self.layer_drag = None;
         self.time = 0.0;
         self.playing = false;
         self.renderer = None;
@@ -347,21 +350,34 @@ impl Forma {
             self.edited();
         }
         ui.separator();
-        if self.selected.is_some() {
-            if ui.button("Duplicate selected").on_hover_text("Ctrl+D").clicked() {
-                self.clip_action(ClipAction::Duplicate);
-            }
-            if ui.button("Delete selected").on_hover_text("Delete").clicked() {
-                self.clip_action(ClipAction::Delete);
-            }
+        if ui.add_enabled(self.selected.is_some(), egui::Button::new("Duplicate selected")).on_hover_text("Ctrl+D").clicked() {
+            self.clip_action(ClipAction::Duplicate);
+        }
+        if ui.add_enabled(self.selected.is_some(), egui::Button::new("Delete selected")).on_hover_text("Delete").clicked() {
+            self.clip_action(ClipAction::Delete);
         }
         egui::ScrollArea::vertical().id_salt("forma-layers").show(ui, |ui| {
-            for shape in &self.scene.shapes {
-                if ui
-                    .selectable_label(self.selected.as_deref() == Some(&shape.id), &shape.name)
-                    .clicked()
-                {
+            let mut destination = None;
+            for (index, shape) in self.scene.shapes.iter().enumerate() {
+                let response = ui.add(egui::Button::selectable(self.selected.as_deref() == Some(&shape.id), &shape.name).sense(Sense::click_and_drag()));
+                if response.clicked() {
                     self.selected = Some(shape.id.clone());
+                }
+                if response.drag_started() { self.layer_drag = Some(shape.id.clone()); }
+                if self.layer_drag.is_some() && ui.input(|i| i.pointer.any_released()) && response.rect.contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or_default()) {
+                    destination = Some(index);
+                }
+                if self.layer_drag.is_some() && response.hovered() { ui.painter().rect_stroke(response.rect, 3.0, egui::Stroke::new(1.0, color::INK), egui::StrokeKind::Inside); }
+            }
+            if ui.input(|i| i.pointer.any_released()) {
+                if let (Some(id), Some(target)) = (self.layer_drag.take(), destination) {
+                    if let Some(from) = self.scene.shapes.iter().position(|shape| shape.id == id) {
+                        if from != target {
+                            let shape = self.scene.shapes.remove(from);
+                            self.scene.shapes.insert(target, shape);
+                            self.edited();
+                        }
+                    }
                 }
             }
         });
