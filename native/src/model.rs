@@ -172,6 +172,45 @@ impl Scene {
         if ratio >= 1.0 { (longest, longest / ratio) } else { (longest * ratio, longest) }
     }
 
+    /// Text that follows the layer at `target`, just above it (Electron's Add linked text). Returns its id.
+    pub fn add_linked_text(&mut self, id: String, target: usize) -> String {
+        let p = self.shapes[target].pose(0.0);
+        let (target_id, target_name) = (self.shapes[target].id.clone(), self.shapes[target].name.clone());
+        let font_size = (self.width.min(self.height) * 0.07).max(24.0);
+        let (text_width, offset_y) = (font_size * 4.2, -(p.h / 2.0 + font_size));
+        self.add_shape(id.clone(), "text");
+        let shape = self.shapes.last_mut().unwrap();
+        (shape.name, shape.color) = (format!("Text for {target_name}"), "#ffffff".into());
+        shape.keys[0] = Key { t: 0.0, x: p.x, y: p.y + offset_y, w: text_width, h: font_size, r: p.r, o: p.o, ease: None, curve: None, extra: Map::new() };
+        for (field, value) in [
+            ("text", serde_json::json!("Your text")), ("linkId", target_id.into()), ("linkBase", serde_json::json!({"w": p.w, "h": p.h})),
+            ("offsetX", 0.into()), ("offsetY", serde_json::json!(offset_y)), ("textWidth", serde_json::json!(text_width)),
+            ("fontSize", serde_json::json!(font_size)), ("rotationOffset", 0.into()), ("opacityFactor", 1.into()),
+        ] {
+            shape.extra.insert(field.into(), value);
+        }
+        id
+    }
+
+    /// Makes the text at `index` follow the layer at `target`, staying where it is on screen at `t` (Electron's
+    /// text-link change).
+    pub fn link_text(&mut self, index: usize, target: usize, t: f64) {
+        let visible = self.render_pose(&self.shapes[index], t);
+        let p = self.shapes[target].pose(t);
+        let angle = (-p.r).to_radians();
+        let (dx, dy) = (visible.x - p.x, visible.y - p.y);
+        let target_id = self.shapes[target].id.clone();
+        let extra = &mut self.shapes[index].extra;
+        for (field, value) in [
+            ("linkId", target_id.into()), ("linkBase", serde_json::json!({"w": p.w, "h": p.h})),
+            ("offsetX", serde_json::json!(dx * angle.cos() - dy * angle.sin())), ("offsetY", serde_json::json!(dx * angle.sin() + dy * angle.cos())),
+            ("textWidth", serde_json::json!(visible.w)), ("fontSize", serde_json::json!(visible.h)),
+            ("rotationOffset", serde_json::json!(visible.r - p.r)), ("opacityFactor", serde_json::json!(if p.o != 0.0 { visible.o / p.o } else { 1.0 })),
+        ] {
+            extra.insert(field.into(), value);
+        }
+    }
+
     pub fn resize(&mut self, width: f32, height: f32) {
         let (sx, sy) = (width / self.width, height / self.height);
         for shape in &mut self.shapes {
@@ -832,6 +871,22 @@ mod tests {
         assert_eq!((scene.shapes[copy].name.as_str(), scene.shapes[copy].keys[0].x), ("Circle 2", 500.0));
         let third = scene.duplicate_layer(0, "c".into());
         assert_eq!(scene.shapes[third].name, "Circle 3");
+    }
+
+    #[test]
+    fn linked_text_sits_above_its_shape_and_relinks_in_place() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "circle");
+        scene.add_shape("b".into(), "rect");
+        scene.add_linked_text("t".into(), 0);
+        let text = scene.render_pose(&scene.shapes[2], 0.0);
+        assert_eq!((text.x, text.y), (480.0, 300.0 - 80.0 - 42.0));
+        let moved = Pose { x: 100.0, ..scene.shapes[1].pose(0.0) };
+        scene.shapes[1].edit_pose(0.0, moved);
+        scene.link_text(2, 1, 0.0);
+        let relinked = scene.render_pose(&scene.shapes[2], 0.0);
+        assert!((relinked.x - text.x).abs() < 0.01 && (relinked.y - text.y).abs() < 0.01, "stays put: {relinked:?}");
+        assert_eq!(scene.shapes[2].extra["linkId"], "b");
     }
 
     #[test]

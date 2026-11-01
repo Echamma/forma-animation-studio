@@ -321,8 +321,13 @@ impl Forma {
                 self.edited();
             }
         }
-        if ui.button("+ Text").clicked() {
-            let id = self.scene.add_text(new_id());
+        // With a layer selected that isn't text, new text follows it (Electron's addText).
+        let target = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().position(|s| s.id == id)).filter(|&i| self.scene.shapes[i].kind != "text");
+        if ui.button("+ Text").on_hover_text(if target.is_some() { "Text that follows the selected layer" } else { "Text on its own" }).clicked() {
+            let id = match target {
+                Some(target) => self.scene.add_linked_text(new_id(), target),
+                None => self.scene.add_text(new_id()),
+            };
             self.selected = Some(id);
             self.edited();
         }
@@ -401,10 +406,30 @@ impl Forma {
             ui.label("Text");
             let mut content = shape.extra.get("text").and_then(|value| value.as_str()).unwrap_or("").to_owned();
             if ui.add(egui::TextEdit::multiline(&mut content).desired_rows(3)).changed() {
-                shape.extra.insert("text".into(), content.into());
+                // A text layer is named after its words (Electron does the same).
+                shape.name = Some(content.chars().take(32).collect::<String>()).filter(|n| !n.is_empty()).unwrap_or_else(|| "Text".into());
+                shape.extra.insert("text".into(), if content.is_empty() { "Text".into() } else { content.into() });
+                changed = true;
+            }
+            let linked = shape.extra.get("linkId").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+            let text_id = shape.id.clone();
+            let others: Vec<(usize, String, String)> = self.scene.shapes.iter().enumerate()
+                .filter(|(_, s)| s.kind != "text" && s.id != text_id).map(|(i, s)| (i, s.id.clone(), s.name.clone())).collect();
+            let follows = others.iter().find(|(_, id, _)| *id == linked).map_or("Nothing".to_owned(), |(.., name)| name.clone());
+            let mut relink = None;
+            egui::ComboBox::from_label("Follows").selected_text(follows).show_ui(ui, |ui| {
+                for (i, id, name) in &others {
+                    if ui.selectable_label(*id == linked, name).clicked() && *id != linked {
+                        relink = Some(*i);
+                    }
+                }
+            });
+            if let Some(target) = relink {
+                self.scene.link_text(index, target, self.time);
                 changed = true;
             }
         }
+        let shape = &mut self.scene.shapes[index];
         // The fill: with "Animate color" on, picking a color sets a color keyframe at the playhead (as in Electron).
         let current = shape.color_at(self.time);
         let channel = |i: usize| u8::from_str_radix(current.get(i..i + 2).unwrap_or("00"), 16).unwrap_or(0);
