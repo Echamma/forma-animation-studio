@@ -282,6 +282,73 @@ impl Scene {
     }
 }
 
+/// The shortest a clip can be (Electron's `MIN_CLIP`).
+pub const MIN_CLIP: f64 = 0.05;
+
+pub fn hundredths(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+impl Scene {
+    /// Moves a layer's clip and everything timed inside it, never before the scene starts, and lengthens the scene
+    /// to fit (Electron's `shiftLayer`). Returns how far it moved.
+    pub fn shift_layer(&mut self, index: usize, delta: f64) -> f64 {
+        let shape = &mut self.shapes[index];
+        let delta = hundredths(delta).max(-shape.earliest_time());
+        if delta == 0.0 {
+            return 0.0;
+        }
+        shape.in_time = Some(hundredths(shape.clip_start() + delta));
+        shape.out_time = shape.out_time.map(|end| hundredths(end + delta));
+        for t in shape.keys.iter_mut().map(|k| &mut k.t).chain(shape.color_keys.iter_mut().map(|k| &mut k.t)) {
+            *t = hundredths(*t + delta);
+        }
+        for motion in shape.extra.get_mut("motions").and_then(Value::as_array_mut).into_iter().flatten() {
+            let shift = |value: &mut Value| if let Some(t) = value.as_f64() { *value = serde_json::json!(hundredths(t + delta)) };
+            if let Some(start) = motion.get_mut("startTime") { shift(start) }
+            for key in motion.get_mut("baseKeys").and_then(Value::as_array_mut).into_iter().flatten() {
+                if let Some(t) = key.get_mut("t") { shift(t) }
+            }
+        }
+        for clip in &mut shape.rotation_clips {
+            clip.start_time = hundredths(clip.start_time + delta);
+        }
+        if let Some(d) = &mut shape.disappear {
+            d.start_time = hundredths(d.start_time + delta);
+            if d.reappear_mode == "time" {
+                d.reappear_time = d.reappear_time.map(|t| hundredths(t + delta));
+            }
+        }
+        self.duration = self.duration.max(shape.latest_time());
+        delta
+    }
+
+    /// Changes where a layer's clip starts, and ends (`None`: with the scene), without moving its animation
+    /// (Electron's `trimClip`).
+    pub fn trim_clip(&mut self, index: usize, start: f64, end: Option<f64>) -> Result<(), String> {
+        let (start, end) = (hundredths(start.max(0.0)), end.map(hundredths));
+        if end.is_some_and(|end| end < start + MIN_CLIP) {
+            return Err("A clip must last at least 0.05 seconds".into());
+        }
+        let shape = &mut self.shapes[index];
+        if start > 0.0 || shape.in_time.is_some() {
+            shape.in_time = Some(start);
+        }
+        shape.out_time = end;
+        if let Some(end) = end {
+            self.duration = self.duration.max(end);
+        }
+        Ok(())
+    }
+}
+
+/// A drawn move's start and length (Electron keeps them in `motions`, which Forma native doesn't edit yet).
+pub fn motions(shape: &Shape) -> impl Iterator<Item = (&Value, f64, f64)> {
+    shape.extra.get("motions").and_then(Value::as_array).into_iter().flatten().filter_map(|m| {
+        Some((m, m.get("startTime")?.as_f64()?, m.get("duration")?.as_f64()?))
+    })
+}
+
 fn is_linked(shape: &Shape) -> bool {
     shape.kind == "text" && shape.extra.get("linkId").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
 }
@@ -323,6 +390,33 @@ impl Shape {
         const EPSILON: f64 = 1e-6;
         if self.in_time.is_some_and(|start| t < start - EPSILON) { return false; }
         self.out_time.is_none_or(|end| t < end - EPSILON || (end >= scene_duration - EPSILON && t >= scene_duration - EPSILON))
+    }
+
+    pub fn clip_start(&self) -> f64 {
+        self.in_time.unwrap_or(0.0)
+    }
+
+    /// The earliest moment the layer's timing touches, so moves stay inside the scene.
+    fn earliest_time(&self) -> f64 {
+        std::iter::once(self.clip_start())
+            .chain(self.keys.iter().map(|k| k.t))
+            .chain(self.color_keys.iter().map(|k| k.t))
+            .chain(motions(self).map(|(_, start, _)| start))
+            .chain(self.rotation_clips.iter().map(|c| c.start_time))
+            .chain(self.disappear.iter().map(|d| d.start_time))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// The latest moment the layer's timing touches.
+    pub fn latest_time(&self) -> f64 {
+        std::iter::once(self.out_time.unwrap_or(0.0))
+            .chain(self.keys.iter().map(|k| k.t))
+            .chain(self.color_keys.iter().map(|k| k.t))
+            .chain(motions(self).map(|(_, start, length)| start + length))
+            .chain(self.rotation_clips.iter().map(|c| c.start_time + c.duration))
+            .chain(self.disappear.iter().map(|d| d.start_time + d.duration))
+            .chain(self.disappear.iter().filter(|d| d.reappear_mode == "time").filter_map(|d| d.reappear_time))
+            .fold(f64::NEG_INFINITY, f64::max)
     }
 
     /// Where a video layer is in its file at scene time `t`: it starts at `mediaStart` when the clip starts, and loops.
@@ -509,6 +603,41 @@ mod tests {
         shape.edit_pose(1.236, Pose { x: 2.0, ..shape.pose(0.0) });
         assert_eq!(shape.keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![0.0, 1.23]);
         assert_eq!(shape.keys[1].x, 2.0);
+    }
+
+    #[test]
+    fn moving_a_clip_moves_its_animation_but_not_before_zero() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "rect");
+        let shape = &mut scene.shapes[0];
+        shape.in_time = Some(1.0);
+        shape.out_time = Some(2.0);
+        shape.edit_pose(1.5, Pose { x: 10.0, ..shape.pose(0.0) });
+        shape.rotation_clips.push(RotationClip { id: "r".into(), start_time: 1.2, duration: 0.5, degrees: 90.0, ease: "linear".into(), extra: Map::new() });
+        shape.extra.insert("motions".into(), serde_json::json!([{"id": "m", "startTime": 1.1, "duration": 0.4, "baseKeys": [{"t": 1.1}]}]));
+        assert_eq!(scene.shift_layer(0, 3.5), 3.5);
+        let shape = &scene.shapes[0];
+        assert_eq!((shape.in_time, shape.out_time), (Some(4.5), Some(5.5)));
+        assert_eq!(shape.keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![3.5, 5.0]);
+        assert_eq!(shape.rotation_clips[0].start_time, 4.7);
+        assert_eq!(shape.extra["motions"][0]["startTime"], 4.6);
+        assert_eq!(shape.extra["motions"][0]["baseKeys"][0]["t"], 4.6);
+        assert_eq!(scene.duration, 5.5, "the scene grows to fit");
+        // The first key sits at 3.5: it can go back no further than zero.
+        assert_eq!(scene.shift_layer(0, -10.0), -3.5);
+        assert_eq!(scene.shapes[0].keys[0].t, 0.0);
+    }
+
+    #[test]
+    fn trimming_keeps_the_animation_where_it_is() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "rect");
+        assert!(scene.trim_clip(0, 1.0, Some(1.02)).is_err(), "too short");
+        scene.trim_clip(0, 0.5, Some(6.0)).unwrap();
+        assert_eq!((scene.shapes[0].in_time, scene.shapes[0].out_time, scene.duration), (Some(0.5), Some(6.0), 6.0));
+        scene.trim_clip(0, 0.0, None).unwrap();
+        assert_eq!((scene.shapes[0].in_time, scene.shapes[0].out_time), (Some(0.0), None));
+        assert_eq!(scene.shapes[0].keys[0].t, 0.0);
     }
 
     #[test]

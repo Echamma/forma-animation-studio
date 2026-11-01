@@ -3,7 +3,7 @@
 use crate::animated_svg;
 use crate::archive;
 use crate::assets;
-use crate::model::{HANDLES, Pose, RotationClip, Scene, resized_pose};
+use crate::model::{self, HANDLES, Pose, RotationClip, Scene, Shape, resized_pose};
 use crate::render;
 use crate::storage;
 use crate::video;
@@ -22,6 +22,57 @@ enum Gesture {
     Move { index: usize, start: Pos2, pose: Pose },
     Resize { index: usize, handle: (i8, i8), start: Pos2, pose: Pose, angle: f32 },
     Rotate { index: usize, center: Pos2, last: f32 },
+}
+
+/// A timeline row (see `Forma::rows`).
+enum Row {
+    Layer { name: String, clips: Vec<usize> },
+    Fade(usize),
+    Motion(usize, usize),
+    Spin(usize, usize),
+}
+
+/// What a timeline drag holds: a clip (moving it or one of its edges) or a spin (moving it or its end).
+#[derive(Clone, Copy, PartialEq)]
+enum Part {
+    Clip,
+    Start,
+    End,
+    Spin(usize),
+    SpinLength(usize),
+}
+
+/// A timeline drag, with the layer and scene length as they were when it began.
+#[derive(Clone)]
+struct TimelineDrag {
+    index: usize,
+    part: Part,
+    origin: f32,
+    shape: Shape,
+    duration: f64,
+}
+
+/// Easing names as the editor shows them, and as projects store them.
+const EASES: [(&str, &str); 6] = [("Smooth", "smooth"), ("Steady", "linear"), ("Hold", "hold"), ("Speed up", "ease-in"), ("Slow down", "ease-out"), ("Custom curve", "custom")];
+
+/// Deletes a keyframe, and the drawn move it started (Electron's `removeKeyframe` and `detachMotionKey`).
+fn remove_key(shape: &mut Shape, key: usize) {
+    if shape.keys.len() <= 1 {
+        return;
+    }
+    let removed = shape.keys.remove(key);
+    let motion = removed.extra.get("motionId").and_then(|v| v.as_str()).map(str::to_owned)
+        .or_else(|| model::motions(shape).find(|(_, start, _)| (start - removed.t).abs() < 0.011).and_then(|(m, ..)| m.get("id")?.as_str().map(str::to_owned)));
+    if let Some(motion) = motion {
+        if let Some(list) = shape.extra.get_mut("motions").and_then(|v| v.as_array_mut()) {
+            list.retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(motion.as_str()));
+        }
+        for key in &mut shape.keys {
+            if key.extra.get("motionId").and_then(|v| v.as_str()) == Some(motion.as_str()) {
+                key.extra.remove("motionId");
+            }
+        }
+    }
 }
 
 /// What Electron Forma's export dialog can make.
@@ -70,6 +121,8 @@ pub struct Forma {
     recording_drag: bool,
     /// A drag on the canvas: moving, resizing or turning a layer.
     gesture: Option<Gesture>,
+    /// A drag on the timeline.
+    timeline_drag: Option<TimelineDrag>,
     suppress_history: bool,
     export: Option<video::Export>,
 }
@@ -99,6 +152,7 @@ impl Forma {
             redo: Vec::new(),
             recording_drag: false,
             gesture: None,
+            timeline_drag: None,
             suppress_history: false,
             export: None,
         }
@@ -603,81 +657,331 @@ impl Forma {
         }
     }
 
+    /// Electron Forma's timeline rows: one per layer (clips sharing a track side by side), each followed by its
+    /// fade-out, drawn moves and spins. On a track of clips only the selected clip shows those.
+    fn rows(&self) -> Vec<Row> {
+        let mut groups: Vec<(String, Vec<Row>)> = Vec::new();
+        for (index, shape) in self.scene.shapes.iter().enumerate() {
+            let track = shape.extra.get("trackId").and_then(|v| v.as_str()).filter(|t| !t.is_empty());
+            let key = track.unwrap_or(&shape.id).to_owned();
+            let group = match groups.iter().position(|(k, _)| *k == key) {
+                Some(group) => group,
+                None => {
+                    let name = if track.is_some() { shape.name.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end().to_owned() } else { shape.name.clone() };
+                    groups.push((key, vec![Row::Layer { name, clips: Vec::new() }]));
+                    groups.len() - 1
+                }
+            };
+            let rows = &mut groups[group].1;
+            if let Row::Layer { clips, .. } = &mut rows[0] {
+                clips.push(index);
+            }
+            if track.is_some() && self.selected.as_deref() != Some(&shape.id) {
+                continue;
+            }
+            if shape.disappear.is_some() {
+                rows.push(Row::Fade(index));
+            }
+            rows.extend((0..model::motions(shape).count()).map(|m| Row::Motion(index, m)));
+            rows.extend((0..shape.rotation_clips.len()).map(|r| Row::Spin(index, r)));
+        }
+        groups.into_iter().flat_map(|(_, rows)| rows).collect()
+    }
+
     fn timeline(&mut self, ui: &mut Ui) {
         let rect = ui.max_rect();
-        ui.painter()
-            .rect_filled(rect, 8.0, Color32::from_rgb(31, 37, 48));
+        ui.painter().rect_filled(rect, 8.0, Color32::from_rgb(31, 37, 48));
         let left = rect.left() + 130.0;
         let width = (rect.width() - 150.0).max(1.0);
-        let x = |t: f64| left + width * (t / self.scene.duration).clamp(0.0, 1.0) as f32;
-        for tick in 0..=self.scene.duration.ceil() as usize {
+        let duration = self.scene.duration;
+        let x = |t: f64| left + width * (t / duration).clamp(0.0, 1.0) as f32;
+        for tick in 0..=duration.ceil() as usize {
             let pos = x(tick as f64);
-            ui.painter().line_segment(
-                [pos2(pos, rect.top() + 6.0), pos2(pos, rect.bottom())],
-                Stroke::new(0.5, color::HAIRLINE),
-            );
-            ui.painter().text(
-                pos2(pos + 3.0, rect.top() + 4.0),
-                Align2::LEFT_TOP,
-                format!("{tick}s"),
-                font::ui(10.0),
-                color::INK_MUTED,
-            );
+            ui.painter().line_segment([pos2(pos, rect.top() + 6.0), pos2(pos, rect.bottom())], Stroke::new(0.5, color::HAIRLINE));
+            ui.painter().text(pos2(pos + 3.0, rect.top() + 4.0), Align2::LEFT_TOP, format!("{tick}s"), font::ui(10.0), color::INK_MUTED);
         }
-        let mut selected = None;
-        for (index, shape) in self.scene.shapes.iter().enumerate() {
-            let y = rect.top() + 29.0 + index as f32 * 30.0;
-            if y + 24.0 > rect.bottom() {
-                break;
-            }
-            let row =
-                Rect::from_min_size(pos2(rect.left() + 5.0, y), vec2(rect.width() - 10.0, 24.0));
-            if ui
-                .interact(row, ui.scope_id().with(("row", &shape.id)), Sense::click())
-                .clicked()
-            {
-                selected = Some(shape.id.clone());
-            }
-            ui.painter().text(
-                pos2(row.left() + 5.0, y + 12.0),
-                Align2::LEFT_CENTER,
-                &shape.name,
-                font::ui(11.0),
-                color::INK,
-            );
-            let bar = Rect::from_min_max(
-                pos2(x(shape.in_time.unwrap_or(0.0)), y + 3.0),
-                pos2(x(shape.out_time.unwrap_or(self.scene.duration)), y + 21.0),
-            );
-            ui.painter().rect_filled(
-                bar,
-                4.0,
-                if self.selected.as_deref() == Some(&shape.id) {
-                    color::SUN
-                } else {
-                    color::INK_SOFT
-                },
-            );
-            for key in &shape.keys {
-                ui.painter()
-                    .circle_filled(pos2(x(key.t), y + 12.0), 3.0, Color32::WHITE);
-            }
-        }
-        if let Some(id) = selected {
-            self.selected = Some(id);
-        }
-        let play_x = x(self.time);
-        ui.painter().line_segment(
-            [pos2(play_x, rect.top()), pos2(play_x, rect.bottom())],
-            Stroke::new(2.0, color::SUN),
-        );
         let ruler = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 25.0));
         let response = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag());
-        if (response.clicked() || response.dragged()) && response.interact_pointer_pos().is_some() {
-            self.time = (((response.interact_pointer_pos().unwrap().x - left) / width) as f64
-                * self.scene.duration)
-                .clamp(0.0, self.scene.duration);
+        if let (true, Some(p)) = (response.clicked() || response.dragged(), response.interact_pointer_pos()) {
+            self.time = (((p.x - left) / width) as f64 * duration).clamp(0.0, duration);
             self.playing = false;
+        }
+        let rows = self.rows();
+        let area = Rect::from_min_max(pos2(rect.left(), rect.top() + 27.0), rect.max);
+        ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                for row in &rows {
+                    let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+                    self.timeline_row(ui, row, line, &x, width);
+                }
+            });
+        });
+        let play_x = x(self.time);
+        ui.painter().line_segment([pos2(play_x, rect.top()), pos2(play_x, rect.bottom())], Stroke::new(2.0, color::SUN));
+        if ui.input(|i| !i.pointer.any_down()) && self.timeline_drag.take().is_some() {
+            // A clip that moved away from the playhead brings the playhead along, as in Electron.
+            if let Some(shape) = self.selected.as_deref().and_then(|id| self.scene.shapes.iter().find(|s| s.id == id)) {
+                if !shape.visible(self.time, self.scene.duration) {
+                    self.time = shape.clip_start();
+                }
+            }
+        }
+    }
+
+    fn timeline_row(&mut self, ui: &mut Ui, row: &Row, line: Rect, x: &dyn Fn(f64) -> f32, width: f32) {
+        let bar = |from: f64, to: f64| Rect::from_min_max(pos2(x(from), line.top() + 3.0), pos2(x(to).max(x(from) + 3.0), line.bottom() - 3.0));
+        let label = |ui: &Ui, text: &str, swatch: Option<Color32>, sub: bool| {
+            let mut at = line.left() + if sub { 18.0 } else { 6.0 };
+            if let Some(fill) = swatch {
+                ui.painter().rect_filled(Rect::from_center_size(pos2(at + 5.0, line.center().y), vec2(10.0, 10.0)), 2.0, fill);
+                at += 15.0;
+            }
+            ui.painter().text(pos2(at, line.center().y), Align2::LEFT_CENTER, text, font::ui(11.0), if sub { color::INK_MUTED } else { color::INK });
+        };
+        ui.painter().rect_filled(Rect::from_min_max(pos2(x(0.0), line.top() + 3.0), pos2(x(self.scene.duration), line.bottom() - 3.0)), 4.0, Color32::from_rgb(38, 45, 58));
+        match row {
+            Row::Layer { name, clips } => {
+                let first = &self.scene.shapes[clips[0]];
+                label(ui, name, Some(hex(&first.color, 255)), false);
+                let head = ui.interact(Rect::from_min_max(line.min, pos2(x(0.0) - 4.0, line.max.y)), ui.scope_id().with(("track", &first.id)), Sense::click());
+                if head.clicked() {
+                    let pick = clips.iter().find(|&&i| self.selected.as_deref() == Some(&self.scene.shapes[i].id))
+                        .or_else(|| clips.iter().find(|&&i| self.scene.shapes[i].visible(self.time, self.scene.duration)))
+                        .unwrap_or(&clips[0]);
+                    self.select_clip(*pick);
+                }
+                for &index in clips {
+                    self.clip_bar(ui, index, line, x, width);
+                }
+            }
+            Row::Fade(index) => {
+                let shape = &self.scene.shapes[*index];
+                label(ui, "Fade out", None, true);
+                let d = shape.disappear.as_ref().unwrap();
+                let end = self.scene.reappear_at(shape).min(self.scene.duration);
+                let span = bar(d.start_time, end.max(d.start_time + self.scene.duration * 0.015));
+                ui.painter().rect_filled(span, 4.0, Color32::from_rgb(92, 84, 120));
+                ui.painter().text(span.left_center() + vec2(5.0, 0.0), Align2::LEFT_CENTER, "Hidden", font::ui(10.0), color::INK);
+                let tip = format!("Fade out {:.2}–{:.2} s{}", d.start_time, d.start_time + d.duration, if end.is_finite() && end < self.scene.duration { format!("; reappear {end:.2} s") } else { "; stay hidden".into() });
+                if ui.interact(span, ui.scope_id().with(("fade", &shape.id)), Sense::click()).on_hover_text(tip).clicked() {
+                    (self.selected, self.time, self.playing) = (Some(shape.id.clone()), d.start_time, false);
+                }
+            }
+            Row::Motion(index, m) => {
+                let shape = &self.scene.shapes[*index];
+                let Some((motion, start, length)) = model::motions(shape).nth(*m) else { return };
+                let path = motion.get("type").and_then(|t| t.as_str()) == Some("path");
+                label(ui, &format!("{} {}", if path { "Path" } else { "Move" }, m + 1), None, true);
+                let span = bar(start, start + length);
+                ui.painter().rect_filled(span, 4.0, Color32::from_rgb(72, 110, 140));
+                ui.painter().text(span.left_center() + vec2(5.0, 0.0), Align2::LEFT_CENTER, if path { "Mouse path" } else { "Arrow move" }, font::ui(10.0), color::INK);
+                if ui.interact(span, ui.scope_id().with(("motion", &shape.id, *m)), Sense::click()).on_hover_text(format!("{}: {start:.2}–{:.2} s", shape.name, start + length)).clicked() {
+                    (self.selected, self.time, self.playing) = (Some(shape.id.clone()), start, false);
+                }
+            }
+            Row::Spin(index, r) => {
+                let clip = &self.scene.shapes[*index].rotation_clips[*r];
+                let id = self.scene.shapes[*index].id.clone();
+                label(ui, &format!("Spin {}", r + 1), None, true);
+                let span = bar(clip.start_time, clip.start_time + clip.duration);
+                ui.painter().rect_filled(span, 4.0, Color32::from_rgb(120, 96, 64));
+                ui.painter().text(span.left_center() + vec2(5.0, 0.0), Align2::LEFT_CENTER, format!("Spin {}°", clip.degrees), font::ui(10.0), color::INK);
+                let tip = format!("Rotation {}° · {:.2}–{:.2} s. Drag to move, drag the end to change its length.", clip.degrees, clip.start_time, clip.start_time + clip.duration);
+                let start = clip.start_time;
+                let response = ui.interact(span, ui.scope_id().with(("spin", &id, *r)), Sense::click_and_drag()).on_hover_text(tip);
+                self.timeline_gesture(ui, &response, *index, span, Part::Spin(*r), width);
+                if response.clicked() {
+                    (self.selected, self.time, self.playing) = (Some(id), start, false);
+                }
+            }
+        }
+    }
+
+    /// A layer's clip bar, its keyframes and its color keyframes.
+    fn clip_bar(&mut self, ui: &mut Ui, index: usize, line: Rect, x: &dyn Fn(f64) -> f32, width: f32) {
+        let shape = &self.scene.shapes[index];
+        let (start, end) = (shape.clip_start(), shape.out_time.unwrap_or(self.scene.duration).min(self.scene.duration));
+        let span = Rect::from_min_max(pos2(x(start), line.top() + 3.0), pos2(x(end).max(x(start) + 3.0), line.bottom() - 3.0));
+        let selected = self.selected.as_deref() == Some(&shape.id);
+        ui.painter().rect_filled(span, 4.0, if selected { color::SUN } else { color::INK_SOFT });
+        let dragging = self.timeline_drag.as_ref().is_some_and(|d| d.index == index);
+        let track = shape.extra.get("trackId").and_then(|v| v.as_str()).is_some_and(|t| !t.is_empty());
+        if dragging || track {
+            let text = if dragging { format!("{start:.2}–{end:.2} s") } else { shape.name.clone() };
+            ui.painter().text(span.left_center() + vec2(6.0, 0.0), Align2::LEFT_CENTER, text, font::ui(10.0), Color32::from_rgb(24, 29, 37));
+        }
+        let tip = format!("{}: visible {start:.2}–{end:.2} s. Drag to move, drag an edge to trim.", shape.name);
+        let id = shape.id.clone();
+        let response = ui.interact(span, ui.scope_id().with(("clip", &id)), Sense::click_and_drag()).on_hover_text(tip);
+        if let Some(p) = response.hover_pos() {
+            let edge = (p.x - span.left()).abs() <= 6.0 || (p.x - span.right()).abs() <= 6.0;
+            ui.ctx().set_cursor_icon(if edge { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::Grab });
+        }
+        self.timeline_gesture(ui, &response, index, span, Part::Clip, width);
+        if response.clicked() {
+            self.select_clip(index);
+        }
+        // Keyframes inside the clip: click to go to one, right-click to move, ease or delete it.
+        let shape = &self.scene.shapes[index];
+        let keys: Vec<(usize, f64)> = shape.keys.iter().enumerate().map(|(i, k)| (i, k.t)).filter(|(_, t)| *t >= start - 1e-6 && *t <= end + 1e-6).collect();
+        for (key, t) in keys {
+            let at = pos2(x(t), line.center().y);
+            let dot = [vec2(0.0, -5.0), vec2(5.0, 0.0), vec2(0.0, 5.0), vec2(-5.0, 0.0)].map(|v| at + v);
+            ui.painter().add(egui::Shape::convex_polygon(dot.to_vec(), Color32::WHITE, Stroke::new(1.0, Color32::from_rgb(24, 29, 37))));
+            let response = ui.interact(Rect::from_center_size(at, vec2(11.0, 13.0)), ui.scope_id().with(("key", &id, key)), Sense::click())
+                .on_hover_text(format!("{} at {t:.2} seconds — right-click to move or delete", self.scene.shapes[index].name));
+            if response.clicked() {
+                (self.selected, self.time, self.playing) = (Some(id.clone()), t, false);
+            }
+            response.context_menu(|ui| self.key_menu(ui, index, key));
+        }
+        let colors: Vec<(usize, f64, String)> = self.scene.shapes[index].color_keys.iter().enumerate().map(|(i, k)| (i, k.t, k.color.clone()))
+            .filter(|(_, t, _)| *t >= start - 1e-6 && *t <= end + 1e-6).collect();
+        for (key, t, fill) in colors {
+            let at = pos2(x(t), line.bottom() - 4.0);
+            ui.painter().circle(at, 4.0, hex(&fill, 255), Stroke::new(1.0, Color32::WHITE));
+            let response = ui.interact(Rect::from_center_size(at, vec2(10.0, 10.0)), ui.scope_id().with(("color", &id, key)), Sense::click())
+                .on_hover_text(format!("Color {} at {t:.2} s — right-click to delete", fill.to_uppercase()));
+            if response.clicked() {
+                (self.selected, self.time, self.playing) = (Some(id.clone()), t, false);
+            }
+            response.context_menu(|ui| {
+                if ui.button("Delete color keyframe").clicked() {
+                    let shape = &mut self.scene.shapes[index];
+                    let removed = shape.color_keys.remove(key);
+                    // The last color keyframe gone: the layer keeps that color (Electron does the same).
+                    if shape.color_keys.is_empty() {
+                        shape.color = removed.color;
+                    }
+                    ui.close();
+                }
+            });
+        }
+    }
+
+    /// Selects a clip and brings the playhead into it (Electron's `selectClip`).
+    fn select_clip(&mut self, index: usize) {
+        let shape = &self.scene.shapes[index];
+        self.selected = Some(shape.id.clone());
+        self.playing = false;
+        if !shape.visible(self.time, self.scene.duration) {
+            self.time = shape.clip_start();
+        }
+    }
+
+    /// Drags on the timeline, applied to the layer as it was when the drag began, so every frame starts afresh.
+    fn timeline_gesture(&mut self, ui: &Ui, response: &egui::Response, index: usize, span: Rect, part: Part, width: f32) {
+        if response.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(span.center());
+            let part = match part {
+                Part::Clip if (origin.x - span.left()).abs() <= 6.0 => Part::Start,
+                Part::Clip if (origin.x - span.right()).abs() <= 6.0 => Part::End,
+                Part::Spin(r) if (origin.x - span.right()).abs() <= 8.0 => Part::SpinLength(r),
+                part => part,
+            };
+            self.timeline_drag = Some(TimelineDrag { index, part, origin: origin.x, shape: self.scene.shapes[index].clone(), duration: self.scene.duration });
+            self.selected = Some(self.scene.shapes[index].id.clone());
+            self.playing = false;
+        }
+        let Some(drag) = self.timeline_drag.clone().filter(|d| d.index == index && response.dragged()) else { return };
+        let Some(pointer) = response.interact_pointer_pos() else { return };
+        let duration = drag.duration;
+        let delta = ((pointer.x - drag.origin) / width) as f64 * duration;
+        // Snap to the playhead, the scene's ends and other clips' edges within 8 px, else to tenths; Alt is free.
+        let mut targets = vec![0.0, self.time, duration];
+        for (_, other) in self.scene.shapes.iter().enumerate().filter(|(i, _)| *i != index) {
+            targets.push(other.clip_start());
+            targets.extend(other.out_time);
+        }
+        let tolerance = 8.0 / width as f64 * duration;
+        let free = ui.input(|i| i.modifiers.alt);
+        let snap = |t: f64| -> (f64, bool) {
+            if free {
+                return (model::hundredths(t), false);
+            }
+            let nearest = targets.iter().copied().fold(f64::INFINITY, |best, x| if (x - t).abs() < (best - t).abs() { x } else { best });
+            if (nearest - t).abs() <= tolerance { (nearest, true) } else { ((t * 10.0).round() / 10.0, false) }
+        };
+        self.scene.shapes[index] = drag.shape.clone();
+        self.scene.duration = duration;
+        let (start0, end0) = (drag.shape.clip_start(), drag.shape.out_time.unwrap_or(duration));
+        match drag.part {
+            Part::Clip => {
+                let (a, b) = (snap(start0 + delta), snap(end0 + delta));
+                let use_end = b.1 && (!a.1 || (b.0 - end0 - delta).abs() < (a.0 - start0 - delta).abs());
+                self.scene.shift_layer(index, if use_end { b.0 - end0 } else { a.0 - start0 });
+            }
+            Part::Start => {
+                let start = snap(start0 + delta).0.min(end0 - model::MIN_CLIP).max(0.0);
+                let _ = self.scene.trim_clip(index, start, drag.shape.out_time.map(|_| end0));
+            }
+            Part::End => {
+                let end = snap(end0 + delta).0.max(start0 + model::MIN_CLIP);
+                let _ = self.scene.trim_clip(index, start0, Some(end));
+            }
+            Part::Spin(r) | Part::SpinLength(r) => {
+                let clip = &drag.shape.rotation_clips[r];
+                let target = &mut self.scene.shapes[index].rotation_clips[r];
+                if matches!(drag.part, Part::SpinLength(_)) {
+                    target.duration = model::hundredths(clip.duration + delta).clamp(0.1, (duration - clip.start_time).max(0.1));
+                } else {
+                    target.start_time = model::hundredths(clip.start_time + delta).clamp(0.0, (duration - clip.duration).max(0.0));
+                }
+            }
+        }
+        self.edited();
+    }
+
+    /// A keyframe's menu: when it is, how the stretch after it eases, and deleting it (Electron's keyframe menu).
+    fn key_menu(&mut self, ui: &mut Ui, index: usize, key: usize) {
+        let Some(k) = self.scene.shapes[index].keys.get(key) else { return };
+        let mut t = k.t;
+        ui.horizontal(|ui| {
+            ui.label("At");
+            if ui.add(egui::DragValue::new(&mut t).range(0.0..=3600.0).speed(0.01).fixed_decimals(2).suffix(" s")).changed() {
+                let t = model::hundredths(t);
+                let shape = &mut self.scene.shapes[index];
+                // Moving onto another keyframe would make two at one moment: keep this one's place instead.
+                if !shape.keys.iter().enumerate().any(|(i, other)| i != key && (other.t - t).abs() < 0.011) {
+                    shape.keys[key].t = t;
+                    shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+                    self.scene.duration = self.scene.duration.max(t);
+                    ui.close();
+                }
+            }
+        });
+        let shape = &mut self.scene.shapes[index];
+        let k = &mut shape.keys[key];
+        let mut ease = k.ease.clone().unwrap_or_default();
+        egui::ComboBox::from_label("Easing after it")
+            .selected_text(match ease.as_str() { "" => "Layer's easing", e => EASES.iter().find(|(_, v)| *v == e).map_or(e, |(name, _)| name) })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut ease, String::new(), "Layer's easing");
+                for (name, value) in EASES {
+                    ui.selectable_value(&mut ease, value.to_owned(), name);
+                }
+            });
+        if ease != k.ease.clone().unwrap_or_default() {
+            k.ease = (!ease.is_empty()).then_some(ease.clone());
+            if ease == "custom" && k.curve.is_none() {
+                k.curve = Some([0.42, 0.0, 0.58, 1.0]);
+            }
+        }
+        if k.ease.as_deref() == Some("custom") {
+            let curve = k.curve.get_or_insert([0.42, 0.0, 0.58, 1.0]);
+            ui.horizontal(|ui| {
+                ui.label("Curve");
+                for (i, value) in curve.iter_mut().enumerate() {
+                    // Electron's validCurve: the x handles stay between 0 and 1, the y handles within ±5.
+                    let range = if i % 2 == 0 { 0.0..=1.0 } else { -5.0..=5.0 };
+                    ui.add(egui::DragValue::new(value).range(range).speed(0.01).fixed_decimals(2));
+                }
+            });
+        }
+        let only = shape.keys.len() <= 1;
+        if ui.add_enabled(!only, egui::Button::new("Delete keyframe")).on_disabled_hover_text("A layer keeps at least one keyframe").clicked() {
+            remove_key(shape, key);
+            ui.close();
         }
     }
 
