@@ -1,6 +1,6 @@
 //! Native Forma scene editor: shape layers, keyframes, timeline and the same project folder as Electron Forma.
 
-use crate::model::{Pose, Scene, Shape};
+use crate::model::{Pose, RotationClip, Scene, Shape};
 use crate::assets;
 use crate::storage;
 use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
@@ -134,6 +134,23 @@ impl Forma {
         ui.label(egui::RichText::new("Layer").font(font::bold(14.0)).color(color::INK));
         let Some(index) = self.scene.shapes.iter().position(|s| Some(s.id.as_str()) == self.selected.as_deref()) else {
             ui.label("Select a shape to edit it.");
+            ui.separator();
+            ui.label(egui::RichText::new("Scene").font(font::bold(14.0)));
+            let portrait = self.scene.height > self.scene.width;
+            ui.horizontal(|ui| {
+                if ui.selectable_label(!portrait, "Landscape").clicked() && portrait {
+                    self.scene.resize(960.0, 600.0);
+                    self.edited();
+                }
+                if ui.selectable_label(portrait, "Portrait").clicked() && !portrait {
+                    self.scene.resize(1080.0, 1920.0);
+                    self.edited();
+                }
+            });
+            ui.label("Background (hex)");
+            if ui.text_edit_singleline(&mut self.scene.bg).changed() { self.edited(); }
+            let min_duration = self.scene.minimum_duration();
+            if ui.add(egui::Slider::new(&mut self.scene.duration, min_duration..=120.0_f64.max(min_duration)).text("Length").suffix(" s")).changed() { self.edited(); }
             return;
         };
         let shape = &mut self.scene.shapes[index];
@@ -157,7 +174,33 @@ impl Forma {
         let added = ui.button("Add keyframe here").clicked();
         if added { shape.edit_pose(self.time, pose); }
         ui.label(format!("{} keyframes", shape.keys.len()));
-        if changed || added { self.edited(); }
+        let mut animated = false;
+        ui.horizontal(|ui| {
+            if ui.button("Move →").clicked() {
+                shape.edit_pose(self.time, pose);
+                shape.edit_pose(self.time + 1.0, Pose { x: pose.x + 180.0, ..pose });
+                animated = true;
+            }
+            if ui.button("Fade out").clicked() {
+                shape.edit_pose(self.time, pose);
+                shape.edit_pose(self.time + 1.0, Pose { o: 0.0, ..pose });
+                animated = true;
+            }
+            if ui.button("Spin").clicked() {
+                shape.rotation_clips.push(RotationClip { id: new_id(), start_time: self.time, duration: 1.0, degrees: 360.0, ease: "linear".into(), extra: Default::default() });
+                animated = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Easing");
+            egui::ComboBox::from_id_salt(("ease", &shape.id)).selected_text(&shape.ease).show_ui(ui, |ui| {
+                for (label, kind) in [("Smooth", "smooth"), ("Steady", "linear"), ("Hold", "hold"), ("Speed up", "ease-in"), ("Slow down", "ease-out")] {
+                    if ui.selectable_value(&mut shape.ease, kind.into(), label).changed() { changed = true; }
+                }
+            });
+        });
+        if animated { self.scene.duration = self.scene.duration.max(self.time + 1.0); }
+        if changed || added || animated { self.edited(); }
     }
 
     fn canvas(&mut self, ui: &mut Ui) {

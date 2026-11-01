@@ -140,6 +140,24 @@ impl Scene {
         id
     }
 
+    pub fn resize(&mut self, width: f32, height: f32) {
+        let (sx, sy) = (width / self.width, height / self.height);
+        for shape in &mut self.shapes {
+            for key in &mut shape.keys {
+                key.x *= sx; key.y *= sy; key.w *= sx; key.h *= sy;
+            }
+        }
+        self.width = width;
+        self.height = height;
+    }
+
+    pub fn minimum_duration(&self) -> f64 {
+        self.shapes.iter().flat_map(|shape| shape.keys.iter().map(|key| key.t)
+            .chain(shape.out_time)
+            .chain(shape.rotation_clips.iter().map(|clip| clip.start_time + clip.duration)))
+            .fold(1.0, f64::max)
+    }
+
     /// The pose drawn on Forma's canvas: keyframes, rotation clips, disappearance, and linked text.
     pub fn render_pose(&self, shape: &Shape, t: f64) -> Pose {
         let mut own = shape.pose(t);
@@ -315,5 +333,14 @@ mod tests {
         assert_eq!(scene.render_pose(shape, 2.5).o, 50.0);
         assert_eq!(shape.color_at(2.0), "#808080");
         assert_eq!(scene.render_pose(shape, 3.6).o, 100.0);
+    }
+
+    #[test]
+    fn resizing_keeps_shape_positions_proportional() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "circle");
+        scene.resize(1920.0, 1200.0);
+        assert_eq!((scene.shapes[0].keys[0].x, scene.shapes[0].keys[0].w), (960.0, 320.0));
+        assert_eq!((scene.width, scene.height), (1920.0, 1200.0));
     }
 }
