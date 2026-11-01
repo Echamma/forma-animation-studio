@@ -1,4 +1,4 @@
-//! Exports shape and picture scenes to a silent MP4 through FFmpeg, with frames rendered in Rust.
+//! Exports shape, picture and text scenes to a silent MP4 through FFmpeg, with frames rendered in Rust.
 
 use crate::{model::Scene, render::Renderer};
 use canopy_ui::Place;
@@ -26,10 +26,10 @@ pub fn start(
     if scene.shapes.iter().any(|shape| {
         !matches!(
             shape.kind.as_str(),
-            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "image"
+            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "image" | "text"
         )
     }) {
-        return Err("Video export of text, SVG, and video layers is coming later.".into());
+        return Err("Video export of SVG and video layers is coming later.".into());
     }
     if scene.shapes.iter().any(|shape| {
         shape

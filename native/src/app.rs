@@ -4,6 +4,7 @@ use crate::assets;
 use crate::model::{Pose, RotationClip, Scene, Shape};
 use crate::render;
 use crate::storage;
+use crate::text;
 use crate::video;
 use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
 use egui::{
@@ -13,6 +14,14 @@ use egui::{
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// A text layer's outline rasterized at the size it's shown (the same outline exports fill): what it was drawn from,
+/// and where it sits from the layer's center, in points.
+struct Lettering {
+    drawn: (String, u32, u32),
+    texture: TextureHandle,
+    rect: Rect,
+}
 
 fn new_id() -> String {
     let n = SystemTime::now()
@@ -39,6 +48,7 @@ pub struct Forma {
     edited_at: Option<Instant>,
     show_projects: bool,
     textures: HashMap<String, TextureHandle>,
+    lettering: HashMap<String, Lettering>,
     failed_assets: HashSet<String>,
     undo: Vec<Scene>,
     redo: Vec<Scene>,
@@ -63,6 +73,7 @@ impl Forma {
             edited_at: None,
             show_projects: false,
             textures: HashMap::new(),
+            lettering: HashMap::new(),
             failed_assets: HashSet::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -83,6 +94,7 @@ impl Forma {
         self.time = 0.0;
         self.playing = false;
         self.textures.clear();
+        self.lettering.clear();
         self.failed_assets.clear();
         self.undo.clear();
         self.redo.clear();
@@ -432,6 +444,31 @@ impl Forma {
             area.center(),
             vec2(self.scene.width * scale, self.scene.height * scale),
         );
+        let pixels = ui.ctx().pixels_per_point() * scale;
+        for shape in self.scene.shapes.iter().filter(|s| s.kind == "text" && s.visible(self.time, self.scene.duration)) {
+            let pose = self.scene.render_pose(shape, self.time);
+            let drawn = (text::content(shape).to_owned(), (pose.w * pixels).round() as u32, (pose.h * pixels).round() as u32);
+            if self.lettering.get(&shape.id).is_some_and(|l| l.drawn == drawn) {
+                continue;
+            }
+            let Some((pixmap, [left, top])) = text::rasterize(&drawn.0, drawn.1 as f32, drawn.2 as f32) else {
+                self.lettering.remove(&shape.id);
+                continue;
+            };
+            let image = egui::ColorImage::from_rgba_premultiplied([pixmap.width() as usize, pixmap.height() as usize], pixmap.data());
+            let points = ui.ctx().pixels_per_point();
+            let rect = Rect::from_min_size(pos2(left, top) / points, vec2(pixmap.width() as f32, pixmap.height() as f32) / points);
+            match self.lettering.get_mut(&shape.id) {
+                Some(lettering) => {
+                    lettering.texture.set(image, TextureOptions::LINEAR);
+                    (lettering.drawn, lettering.rect) = (drawn, rect);
+                }
+                None => {
+                    let texture = ui.ctx().load_texture(format!("forma-text-{}", shape.id), image, TextureOptions::LINEAR);
+                    self.lettering.insert(shape.id.clone(), Lettering { drawn, texture, rect });
+                }
+            }
+        }
         let painter = ui.painter();
         painter.rect_filled(area, 10.0, Color32::from_rgb(24, 29, 37));
         painter.rect_filled(canvas, 3.0, hex(&self.scene.bg, 255));
@@ -450,6 +487,7 @@ impl Forma {
                 pose,
                 &fill,
                 self.textures.get(&shape.id),
+                self.lettering.get(&shape.id),
             );
             if self.selected.as_deref() == Some(&shape.id) {
                 painter.rect_stroke(
@@ -780,6 +818,7 @@ fn paint_shape(
     pose: Pose,
     layer_color: &str,
     texture: Option<&TextureHandle>,
+    lettering: Option<&Lettering>,
 ) -> Rect {
     let center = pos2(
         canvas.left() + pose.x * scale,
@@ -830,17 +869,19 @@ fn paint_shape(
             ));
         }
         "text" => {
-            painter.text(
-                center,
-                Align2::CENTER_CENTER,
-                shape
-                    .extra
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Text"),
-                font::bold(size.y.min(80.0)),
-                fill,
-            );
+            if let Some(lettering) = lettering {
+                let mut mesh = egui::Mesh::with_texture(lettering.texture.id());
+                mesh.add_rect_with_uv(
+                    lettering.rect.translate(center.to_vec2()),
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    fill,
+                );
+                for vertex in &mut mesh.vertices {
+                    let offset = vertex.pos - center;
+                    vertex.pos = point(offset.x, offset.y);
+                }
+                painter.add(PaintShape::mesh(mesh));
+            }
         }
         "rect" => {
             painter.add(PaintShape::convex_polygon(

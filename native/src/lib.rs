@@ -5,6 +5,7 @@ pub mod assets;
 pub mod model;
 pub mod render;
 pub mod storage;
+pub mod text;
 pub mod video;
 
 use canopy_ui::{Accent, AppDescriptor, CanopyApp, Place, SharedFile};

@@ -1,6 +1,6 @@
 //! Frame-accurate software rendering for Forma's native picture export.
 
-use crate::{assets, model::Scene};
+use crate::{assets, model::Scene, text};
 use canopy_ui::Place;
 use std::collections::HashMap;
 use std::path::Path;
@@ -81,6 +81,14 @@ impl Renderer {
                 canvas.draw_pixmap(0, 0, source.as_ref(), &paint, transform, None);
                 continue;
             }
+            if shape.kind == "text" {
+                // Only spaces draw nothing.
+                if let Some(path) = text::outline(text::content(shape), pose.w, pose.h) {
+                    canvas.fill_path(&path, &fill(&shape.color_at(t), pose.o), FillRule::Winding,
+                        Transform::from_rotate(pose.r).post_translate(pose.x, pose.y), None);
+                }
+                continue;
+            }
             let mut path = PathBuilder::new();
             let (w, h) = (pose.w / 2.0, pose.h / 2.0);
             match shape.kind.as_str() {
@@ -133,13 +141,9 @@ impl Renderer {
                     ));
                 }
             }
-            let [r, g, b] = rgb(&shape.color_at(t));
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(r, g, b, (pose.o * 2.55).round() as u8);
-            paint.anti_alias = true;
             canvas.fill_path(
                 &path.finish().ok_or("Invalid shape path")?,
-                &paint,
+                &fill(&shape.color_at(t), pose.o),
                 FillRule::Winding,
                 Transform::from_rotate_at(pose.r, pose.x, pose.y),
                 None,
@@ -163,6 +167,15 @@ pub fn save_png(scene: &Scene, place: &Place, t: f64, output: &Path) -> Result<(
         image::ColorType::Rgba8,
     )
     .map_err(|e| e.to_string())
+}
+
+/// A layer's color at opacity `o` (0-100).
+fn fill(color: &str, o: f32) -> Paint<'static> {
+    let [r, g, b] = rgb(color);
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(r, g, b, (o * 2.55).round() as u8);
+    paint.anti_alias = true;
+    paint
 }
 
 fn rgb(hex: &str) -> [u8; 3] {
