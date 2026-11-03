@@ -38,6 +38,17 @@ Claude Desktop accepts this entry in its MCP configuration. Replace the path wit
 
 Use a full path to your `node` executable if the client cannot find it. The [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp) describes registration and configuration scopes. The implementation uses the official [MCP SDK's local stdio transport](https://ts.sdk.modelcontextprotocol.io/server).
 
+### Native Forma (Rust)
+
+The native editor (`native/`, the Canopy rewrite) has the same thirteen tools and needs no Node: `Forma.exe --mcp-server` is the stdio server. Turn control on with **MCP off** in the toolbar (it becomes **MCP on**), or start the editor with `--mcp`. Register it with the exe's absolute path:
+
+```powershell
+codex mcp add forma -- "C:\Tools\Forma\Forma.exe" --mcp-server
+claude mcp add --transport stdio --scope user forma -- "C:\Tools\Forma\Forma.exe" --mcp-server
+```
+
+Its bridge writes the same discovery file as the desktop app above (`FORMA_BRIDGE_FILE` overrides it in both), so `forma-mcp.cjs` drives it too; whichever editor turned MCP on last is the one assistants reach. Exports go to the editor's export folder (in Canopy, the space's files) unless `FORMA_EXPORT_DIR` is set. Opening a project or creating a scene starts a project of its own; the open one is kept. Each tool edit is one undo step in the editor.
+
 ## What the assistant can do
 
 | Tool | Behavior |
