@@ -317,6 +317,11 @@ fn sources(scene: &Scene) -> Vec<(String, Option<u64>)> {
 
 /// One frame, video layers included (each read from its file).
 pub fn frame(scene: &Scene, place: &Place, t: f64) -> Result<Pixmap, String> {
+    frame_sized(scene, place, t, scene_size(scene))
+}
+
+/// One frame at `size` pixels (the scene scaled to fit), video layers included.
+pub fn frame_sized(scene: &Scene, place: &Place, t: f64, size: (u32, u32)) -> Result<Pixmap, String> {
     let renderer = Renderer::new(scene, place);
     let mut frames = Frames::new();
     for shape in scene.shapes.iter().filter(|s| s.kind == "video" && s.visible(t, scene.duration)) {
@@ -325,7 +330,7 @@ pub fn frame(scene: &Scene, place: &Place, t: f64) -> Result<Pixmap, String> {
         let (width, height) = video_size(shape, 1.0);
         frames.insert(shape.id.clone(), crate::media::Frames::start(file, shape.media_time(t, duration), 30, width, height)?.next()?);
     }
-    renderer.frame(scene, t, scene_size(scene), &frames)
+    renderer.frame(scene, t, size, &frames)
 }
 
 /// The scene's size in whole pixels.

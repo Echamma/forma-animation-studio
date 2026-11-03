@@ -107,7 +107,7 @@ enum ExportKind {
     Project,
 }
 
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -174,6 +174,11 @@ pub struct Forma {
     svg_preview: Option<(u64, TextureHandle)>,
     suppress_history: bool,
     export: Option<video::Export>,
+    /// Forma MCP control (Electron's MCP button): the bridge while it's on, whether `--mcp` asked for it at start,
+    /// and a video an assistant asked for, with where its answer goes once it's rendered.
+    bridge: Option<crate::bridge::Bridge>,
+    mcp_wanted: bool,
+    mcp_video: Option<(crate::automation::PendingVideo, std::sync::mpsc::Sender<Result<serde_json::Value, crate::contract::ToolError>>)>,
 }
 
 impl Forma {
@@ -220,6 +225,9 @@ impl Forma {
             svg_preview: None,
             suppress_history: false,
             export: None,
+            bridge: None,
+            mcp_wanted: std::env::args().any(|arg| arg == "--mcp"),
+            mcp_video: None,
         }
     }
 
@@ -270,6 +278,80 @@ impl Forma {
         let pose = Pose { w, h, ..shape.pose(0.0) };
         shape.edit_pose(0.0, pose);
         id
+    }
+
+    /// Turns Forma MCP control on or off.
+    fn set_mcp(&mut self, on: bool, ctx: &egui::Context) -> Result<(), String> {
+        if !on {
+            (self.bridge, self.mcp_video) = (None, None);
+        } else if self.bridge.is_none() {
+            let ctx = ctx.clone();
+            self.bridge = Some(crate::bridge::Bridge::enable(move || ctx.request_repaint())?);
+        }
+        Ok(())
+    }
+
+    /// Where exports for assistants go: `FORMA_EXPORT_DIR` (as in Electron Forma), or the app's export folder.
+    fn mcp_exports(&self) -> std::path::PathBuf {
+        std::env::var_os("FORMA_EXPORT_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| self.place.exports_dir.clone())
+    }
+
+    /// Answers Forma MCP: one call a frame, inside the frame's undo step (so each edit can be undone and is saved), and
+    /// a video it asked for once it's rendered (calls wait meanwhile).
+    fn automation(&mut self, ctx: &egui::Context, host: &mut dyn Host) {
+        use crate::automation::{Editor, Outcome, dispatch, snapshot};
+        if std::mem::take(&mut self.mcp_wanted) {
+            if let Err(error) = self.set_mcp(true, ctx) {
+                host.toast(format!("MCP could not start: {error}"));
+            }
+        }
+        if let Some((pending, _)) = &self.mcp_video {
+            let rendered = match pending.export.result.try_recv() {
+                Ok(rendered) => rendered,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("The video export stopped unexpectedly".into()),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                    return;
+                }
+            };
+            let (pending, reply) = self.mcp_video.take().unwrap();
+            let answer = pending.finish(rendered);
+            if answer.is_ok() && pending.destination.starts_with(&self.place.exports_dir) {
+                host.exported(pending.destination.clone());
+            }
+            let _ = reply.send(answer);
+        }
+        let Some(call) = self.bridge.as_ref().and_then(|bridge| bridge.calls.try_recv().ok()) else { return };
+        let (was_playing, exports) = (self.playing, self.mcp_exports());
+        let mut editor = Editor { scene: &mut self.scene, selected: &mut self.selected, time: &mut self.time, playing: &mut self.playing, place: &self.place, exports: &exports };
+        let answer = match dispatch(&mut editor, &call.name, &call.args) {
+            Ok(Outcome::Done(value)) => Ok(value),
+            Ok(Outcome::Open(scene)) => {
+                // A new or opened scene is a project of its own; the one that was open is saved as it was.
+                self.open(scene);
+                self.edited();
+                let editor = Editor { scene: &mut self.scene, selected: &mut self.selected, time: &mut self.time, playing: &mut self.playing, place: &self.place, exports: &exports };
+                Ok(snapshot(&editor, false))
+            }
+            Ok(Outcome::Video(pending)) => {
+                self.mcp_video = Some((pending, call.reply));
+                ctx.request_repaint();
+                return;
+            }
+            Err(error) => Err(error),
+        };
+        if self.playing && !was_playing {
+            (self.last_tick, self.preview_end) = (Instant::now(), None);
+        }
+        self.multi_selected = self.selected.clone().into_iter().collect();
+        if let Some(path) = answer.as_ref().ok().and_then(|a| a["path"].as_str()).map(std::path::PathBuf::from) {
+            if call.name == "forma_export" && path.starts_with(&self.place.exports_dir) {
+                host.exported(path);
+            }
+        }
+        let _ = call.reply.send(answer);
+        // Another call may be waiting.
+        ctx.request_repaint();
     }
 
     fn undo(&mut self) {
@@ -349,6 +431,21 @@ impl Forma {
                 if ui.button("Stop").clicked() {
                     export.cancel.store(true, Ordering::Relaxed);
                 }
+            }
+            // Electron Forma's MCP button: lets Codex or Claude drive this editor until it's turned off.
+            let on = self.bridge.is_some();
+            let hint = if on {
+                format!("Assistants can control this editor. Click to stop. Their exports go to {}", self.mcp_exports().display())
+            } else {
+                "Click to let Codex or Claude control this editor through Forma MCP (Forma.exe --mcp-server)".to_owned()
+            };
+            if ui.selectable_label(on, if on { "MCP on" } else { "MCP off" }).on_hover_text(hint).clicked() {
+                if let Err(error) = self.set_mcp(!on, ui.ctx()) {
+                    host.toast(format!("MCP could not start: {error}"));
+                }
+            }
+            if self.mcp_video.is_some() {
+                ui.label(egui::RichText::new("Assistant exporting…").color(color::INK_MUTED));
             }
         });
     }
@@ -1904,6 +2001,7 @@ impl CanopyApp for Forma {
             }
         }
         let before = self.scene.clone();
+        self.automation(ui.ctx(), host);
         if host.focused() {
             let undo = ui.input(|i| {
                 i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift

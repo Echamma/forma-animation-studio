@@ -30,16 +30,7 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     for shape in &scene.shapes {
         let p = scene.render_pose(shape, 0.0);
         let mut group = format!(r#"<g fill="{}""#, attr(&shape.color_at(0.0)));
-        let blur = shape.extra.get("blur").and_then(|v| v.as_f64()).filter(|v| v.is_finite()).map_or(0.0, |v| v.clamp(0.0, 100.0));
-        if blur > 0.0 {
-            let width = shape.keys.iter().fold(p.w, |w, k| w.max(k.w)) as f64;
-            let height = shape.keys.iter().fold(p.h, |h, k| h.max(k.h)) as f64;
-            let margin = blur * 3.0 + 4.0;
-            let id = attr(&format!("blur-{}", shape.id));
-            write!(defs, r#"<filter id="{id}" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}"><feGaussianBlur stdDeviation="{blur}"/></filter>"#,
-                -width / 2.0 - margin, -height / 2.0 - margin, width + margin * 2.0, height + margin * 2.0).unwrap();
-            write!(group, r#" filter="url(#{id})""#).unwrap();
-        }
+        group.push_str(&blur_filter(shape, p, &mut defs));
         let samples = sample_layer(scene, shape);
         let timing = timing(&samples);
         let values = |value: &dyn Fn(&Sample) -> String| samples.iter().map(value).collect::<Vec<_>>().join(";");
@@ -60,6 +51,39 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     let (w, h) = (scene.width, scene.height);
     let defs = if defs.is_empty() { "<defs/>".to_owned() } else { format!("<defs>{defs}</defs>") };
     Ok(format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" overflow="hidden">{defs}<rect width="{w}" height="{h}" fill="{}"/>{layers}</svg>"#, attr(&scene.bg)))
+}
+
+/// The scene at `t` as a still SVG (Electron's `svgText(false)`): each layer shown then, posed as it is then.
+pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
+    let mut defs = String::new();
+    let mut layers = String::new();
+    for shape in scene.shapes.iter().filter(|s| s.visible(t, scene.duration)) {
+        let p = scene.render_pose(shape, t);
+        let mut group = format!(r#"<g fill="{}""#, attr(&shape.color_at(t)));
+        group.push_str(&blur_filter(shape, p, &mut defs));
+        write!(group, r#" transform="translate({} {})"><g transform="rotate({})"><g transform="scale({} {})" opacity="{}">"#, p.x, p.y, p.r, p.w, p.h, p.o / 100.0).unwrap();
+        group.push_str(&geometry(shape, place)?);
+        group.push_str("</g></g></g>");
+        layers.push_str(&group);
+    }
+    let (w, h) = (scene.width, scene.height);
+    let defs = if defs.is_empty() { "<defs/>".to_owned() } else { format!("<defs>{defs}</defs>") };
+    Ok(format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" overflow="hidden">{defs}<rect width="{w}" height="{h}" fill="{}"/>{layers}</svg>"#, attr(&scene.bg)))
+}
+
+/// A blurred layer's filter, added to `defs`; the attribute that puts it on the layer's group (empty for no blur).
+fn blur_filter(shape: &Shape, p: Pose, defs: &mut String) -> String {
+    let blur = shape.extra.get("blur").and_then(|v| v.as_f64()).filter(|v| v.is_finite()).map_or(0.0, |v| v.clamp(0.0, 100.0));
+    if blur <= 0.0 {
+        return String::new();
+    }
+    let width = shape.keys.iter().fold(p.w, |w, k| w.max(k.w)) as f64;
+    let height = shape.keys.iter().fold(p.h, |h, k| h.max(k.h)) as f64;
+    let margin = blur * 3.0 + 4.0;
+    let id = attr(&format!("blur-{}", shape.id));
+    write!(defs, r#"<filter id="{id}" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}"><feGaussianBlur stdDeviation="{blur}"/></filter>"#,
+        -width / 2.0 - margin, -height / 2.0 - margin, width + margin * 2.0, height + margin * 2.0).unwrap();
+    format!(r#" filter="url(#{id})""#)
 }
 
 /// A layer one unit across, centered on its origin (the groups around it scale and place it), as `geometry()` draws it.
