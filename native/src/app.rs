@@ -11,7 +11,10 @@ use crate::storage;
 use crate::svg;
 use crate::video;
 use crate::videos::Videos;
-use canopy_ui::{CanopyApp, Host, Place, Receipt, SharedFile, color, font};
+use canopy_ui::{
+    Accent, CanopyApp, Host, Icon, Mood, Place, Receipt, SharedFile, color, font, icon_button,
+    pane_frame, pill, primary_button, quiet_button, section_label,
+};
 use egui::{
     Align2, Color32, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2,
     pos2, vec2,
@@ -525,53 +528,51 @@ impl Forma {
     }
 
     fn toolbar(&mut self, ui: &mut Ui, host: &mut dyn Host) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            if ui.button("Projects").clicked() {
-                self.show_projects = true;
-            }
-            if ui.button("Help").clicked() {
-                self.show_help = true;
-            }
-            if ui.button("New").clicked() {
-                self.open(Scene::empty(new_id()));
-            }
-            if ui
-                .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
-                .clicked()
-            {
-                self.redo();
-            }
+        // Canopy's toolbar, as StreamCuts has it: the name, history, the project's buttons and playback on the left;
+        // status, toggles and the one filled button (Export) on the right.
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             let name = ui.add(
                 egui::TextEdit::singleline(&mut self.scene.project_name)
-                    .desired_width(180.0)
+                    .desired_width(170.0)
                     .font(font::bold(14.0)),
             );
             if name.changed() {
                 self.edited();
             }
-            ui.label(egui::RichText::new(if self.edited_at.is_some() {
-                "Saving..."
-            } else if self.save_failed {
-                "Autosave failed"
-            } else {
-                "Saved locally"
-            }).color(color::INK_MUTED));
-            if ui.button("Back to start").clicked() {
+            ui.add_enabled_ui(!self.undo.is_empty(), |ui| {
+                if icon_button(ui, Icon::Undo, "Undo (Ctrl+Z)", false).clicked() {
+                    self.undo();
+                }
+            });
+            ui.add_enabled_ui(!self.redo.is_empty(), |ui| {
+                if icon_button(ui, Icon::Redo, "Redo (Ctrl+Shift+Z or Ctrl+Y)", false).clicked() {
+                    self.redo();
+                }
+            });
+            if quiet_button(ui, "Projects", Some(Icon::Project))
+                .on_hover_text("Your projects, and a new one")
+                .clicked()
+            {
+                self.show_projects = true;
+            }
+            if quiet_button(ui, "New", Some(Icon::Plus))
+                .on_hover_text("An empty canvas")
+                .clicked()
+            {
+                self.open(Scene::empty(new_id()));
+            }
+            if quiet_button(ui, "Help", None).clicked() {
+                self.show_help = true;
+            }
+            ui.add_space(6.0);
+            if icon_button(ui, Icon::SkipBack, "Back to start", false).clicked() {
                 self.playing = false;
                 self.preview_end = None;
                 self.time = 0.0;
             }
-            if ui
-                .button(if self.playing { "Pause" } else { "Play" })
-                .clicked()
-            {
+            let play = if self.playing { Icon::Pause } else { Icon::Play };
+            if icon_button(ui, play, if self.playing { "Pause" } else { "Play" }, self.playing).clicked() {
                 if !self.playing && self.time >= self.scene.duration {
                     self.time = 0.0;
                 }
@@ -579,45 +580,71 @@ impl Forma {
                 self.preview_end = None;
                 self.last_tick = Instant::now();
             }
-            ui.checkbox(&mut self.loop_playback, "Loop");
-            ui.label(format!("{:.2} / {:.2} s", self.time, self.scene.duration));
-            if ui.button("Save").clicked() {
-                match self.save() {
-                    Ok(()) => host.toast("Forma project saved".into()),
-                    Err(error) => host.toast(error),
-                }
-            }
-            ui.checkbox(&mut self.onion_skin, "Onion skin")
-                .on_hover_text("While editing a clip, faintly show the clip before it on the same track");
-            if ui
-                .add_enabled(self.export.is_none(), egui::Button::new("Export"))
-                .on_hover_text("A video, a picture or the project file, into Files")
+            if pill(ui, "Loop", None, self.loop_playback)
+                .on_hover_text("Loop playback")
                 .clicked()
             {
-                self.show_export = true;
+                self.loop_playback = !self.loop_playback;
             }
-            if let Some(export) = &self.export {
-                let fraction = export.progress.load(Ordering::Relaxed) as f32 / 1000.0;
-                ui.add(egui::ProgressBar::new(fraction).desired_width(75.0));
-                if ui.button("Stop").clicked() {
-                    export.cancel.store(true, Ordering::Relaxed);
+            ui.label(
+                egui::RichText::new(format!("{:.2} / {:.2} s", self.time, self.scene.duration))
+                    .font(font::ui(13.0))
+                    .color(color::INK_SOFT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(self.export.is_none(), |ui| {
+                    if primary_button(ui, "Export", Mood::Ember)
+                        .on_hover_text("A video, a picture or the project file, into Files")
+                        .clicked()
+                    {
+                        self.show_export = true;
+                    }
+                });
+                if let Some(export) = &self.export {
+                    if quiet_button(ui, "Stop", None).clicked() {
+                        export.cancel.store(true, Ordering::Relaxed);
+                    }
+                    let fraction = export.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+                    ui.add(egui::ProgressBar::new(fraction).desired_width(75.0));
                 }
-            }
-            // Electron Forma's MCP button: lets Codex or Claude drive this editor until it's turned off.
-            let on = self.bridge.is_some();
-            let hint = if on {
-                format!("Assistants can control this editor. Click to stop. Their exports go to {}", self.mcp_exports().display())
-            } else {
-                "Click to let Codex or Claude control this editor through Forma MCP (Forma.exe --mcp-server)".to_owned()
-            };
-            if ui.selectable_label(on, if on { "MCP on" } else { "MCP off" }).on_hover_text(hint).clicked() {
-                if let Err(error) = self.set_mcp(!on, ui.ctx()) {
-                    host.toast(format!("MCP could not start: {error}"));
+                // Electron Forma's MCP button: lets Codex or Claude drive this editor until it's turned off.
+                let on = self.bridge.is_some();
+                let hint = if on {
+                    format!("Assistants can control this editor. Click to stop. Their exports go to {}", self.mcp_exports().display())
+                } else {
+                    "Click to let Codex or Claude control this editor through Forma MCP (Forma.exe --mcp-server)".to_owned()
+                };
+                if pill(ui, if on { "MCP on" } else { "MCP off" }, None, on).on_hover_text(hint).clicked() {
+                    if let Err(error) = self.set_mcp(!on, ui.ctx()) {
+                        host.toast(format!("MCP could not start: {error}"));
+                    }
                 }
-            }
-            if self.mcp_video.is_some() {
-                ui.label(egui::RichText::new("Assistant exporting…").color(color::INK_MUTED));
-            }
+                if pill(ui, "Onion skin", None, self.onion_skin)
+                    .on_hover_text("While editing a clip, faintly show the clip before it on the same track")
+                    .clicked()
+                {
+                    self.onion_skin = !self.onion_skin;
+                }
+                if quiet_button(ui, "Save", None).clicked() {
+                    match self.save() {
+                        Ok(()) => host.toast("Forma project saved".into()),
+                        Err(error) => host.toast(error),
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(if self.mcp_video.is_some() {
+                        "Assistant exporting…"
+                    } else if self.edited_at.is_some() {
+                        "Saving..."
+                    } else if self.save_failed {
+                        "Autosave failed"
+                    } else {
+                        "Saved locally"
+                    })
+                    .font(font::ui(12.0))
+                    .color(color::INK_MUTED),
+                );
+            });
         });
     }
 
@@ -629,11 +656,7 @@ impl Forma {
         {
             self.multi_selected.clear();
         }
-        ui.label(
-            egui::RichText::new("Layers")
-                .font(font::bold(14.0))
-                .color(color::INK),
-        );
+        section_label(ui, "Layers");
         ui.add_space(6.0);
         for (label, kind) in [
             ("Circle", "circle"),
@@ -642,13 +665,13 @@ impl Forma {
             ("Diamond", "diamond"),
             ("Arrow", "arrow"),
         ] {
-            if ui.button(format!("+ {label}")).clicked() {
+            if quiet_button(ui, label, Some(Icon::Plus)).clicked() {
                 let id = self.scene.add_layer(new_id(), kind);
                 self.selected = Some(id);
                 self.edited();
             }
         }
-        if ui.button("+ Picture, SVG or video…").clicked() {
+        if quiet_button(ui, "Picture, SVG or video…", Some(Icon::Image)).clicked() {
             let picked = rfd::FileDialog::new()
                 .set_title("Add pictures, SVG artwork or video")
                 .add_filter(
@@ -658,8 +681,7 @@ impl Forma {
                 .pick_files();
             self.pending_import.extend(picked.unwrap_or_default());
         }
-        if ui
-            .button("+ Stop-motion poses…")
+        if quiet_button(ui, "Stop-motion poses…", Some(Icon::Image))
             .on_hover_text(
                 "Pictures in the order picked become poses, half a second each, on one track",
             )
@@ -677,8 +699,7 @@ impl Forma {
             .as_deref()
             .and_then(|id| self.scene.shapes.iter().position(|s| s.id == id))
             .filter(|&i| self.scene.shapes[i].kind != "text");
-        if ui
-            .button("+ Text")
+        if quiet_button(ui, "Text", Some(Icon::Text))
             .on_hover_text(if target.is_some() {
                 "Text that follows the selected layer"
             } else {
@@ -992,11 +1013,7 @@ impl Forma {
     /// Electron's Enter from outside: the layer just outside one side of the canvas at the playhead.
     fn outside_panel(&mut self, ui: &mut Ui, index: usize) {
         ui.separator();
-        ui.label(
-            egui::RichText::new("Enter from outside")
-                .font(font::bold(13.0))
-                .color(color::INK),
-        );
+        section_label(ui, "Enter from outside");
         ui.horizontal_wrapped(|ui| {
             for (label, side) in [
                 ("Left", model::Edge::Left),
@@ -1124,11 +1141,7 @@ impl Forma {
     fn inspector(&mut self, ui: &mut Ui) {
         self.scene_settings(ui);
         self.arrange_panel(ui);
-        ui.label(
-            egui::RichText::new("Layer")
-                .font(font::bold(14.0))
-                .color(color::INK),
-        );
+        section_label(ui, "Layer");
         let Some(index) = self
             .scene
             .shapes
@@ -1655,7 +1668,7 @@ impl Forma {
         ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
             // Darker than the canvas's surroundings, with an edge, so it reads as a bar over them.
             egui::Frame::new()
-                .fill(Color32::from_rgb(16, 20, 27))
+                .fill(Mood::Ember.pane_solid())
                 .stroke(Stroke::new(1.0, color::HAIRLINE))
                 .corner_radius(17.0)
                 .inner_margin(egui::Margin::symmetric(10, 4))
@@ -1703,11 +1716,7 @@ impl Forma {
     /// Electron's rotation animations: spins added at the playhead (or over the chosen move), then retimed.
     fn spin_panel(&mut self, ui: &mut Ui, index: usize) {
         ui.separator();
-        ui.label(
-            egui::RichText::new("Spins")
-                .font(font::bold(13.0))
-                .color(color::INK),
-        );
+        section_label(ui, "Spins");
         if ui
             .button("Add spin")
             .on_hover_text("360° from the playhead, or over the chosen drawn move")
@@ -1829,11 +1838,7 @@ impl Forma {
     /// animation ends.
     fn fade_panel(&mut self, ui: &mut Ui, index: usize) {
         ui.separator();
-        ui.label(
-            egui::RichText::new("Fade out and back")
-                .font(font::bold(13.0))
-                .color(color::INK),
-        );
+        section_label(ui, "Fade out and back");
         let Some(mut d) = self.scene.shapes[index].disappear.clone() else {
             if ui
                 .button("Add fade out")
@@ -2019,11 +2024,7 @@ impl Forma {
     /// or delete it.
     fn motion_panel(&mut self, ui: &mut Ui, index: usize) {
         ui.separator();
-        ui.label(
-            egui::RichText::new("Draw a move")
-                .font(font::bold(13.0))
-                .color(color::INK),
-        );
+        section_label(ui, "Draw a move");
         ui.horizontal(|ui| {
             for (label, kind) in [("Draw arrow", "arrow"), ("Record path", "path")] {
                 if ui
@@ -2431,8 +2432,8 @@ impl Forma {
         }
         // Selection handles can reach past the canvas, but not over the toolbar or the panels.
         let painter = ui.painter().with_clip_rect(viewport);
-        painter.rect_filled(viewport, 10.0, Color32::from_rgb(24, 29, 37));
-        painter.rect_filled(board, 6.0, Color32::from_rgb(33, 39, 50));
+        painter.add(pane_frame(Mood::Ember).paint(viewport));
+        painter.rect_filled(board, 6.0, color::VEIL);
         painter.rect_filled(canvas.expand(1.0), 2.0, Color32::from_black_alpha(90));
         match &self.preview {
             Some((texture, ..)) => painter.image(
@@ -2911,8 +2912,7 @@ impl Forma {
 
     fn timeline(&mut self, ui: &mut Ui) {
         let rect = ui.max_rect();
-        ui.painter()
-            .rect_filled(rect, 8.0, Color32::from_rgb(31, 37, 48));
+        ui.painter().add(pane_frame(Mood::Ember).paint(rect));
         let left = rect.left() + 130.0;
         let width = (rect.width() - 150.0).max(1.0);
         let duration = self.scene.duration;
@@ -3011,7 +3011,7 @@ impl Forma {
                 pos2(x(self.scene.duration), line.bottom() - 3.0),
             ),
             4.0,
-            Color32::from_rgb(38, 45, 58),
+            color::VEIL,
         );
         match row {
             Row::Layer { name, clips } => {
@@ -3047,8 +3047,7 @@ impl Forma {
                     d.start_time,
                     end.max(d.start_time + self.scene.duration * 0.015),
                 );
-                ui.painter()
-                    .rect_filled(span, 4.0, Color32::from_rgb(92, 84, 120));
+                ui.painter().rect_filled(span, 4.0, Accent::Berry.color());
                 ui.painter().text(
                     span.left_center() + vec2(5.0, 0.0),
                     Align2::LEFT_CENTER,
@@ -3092,8 +3091,7 @@ impl Forma {
                     true,
                 );
                 let span = bar(start, start + length);
-                ui.painter()
-                    .rect_filled(span, 4.0, Color32::from_rgb(72, 110, 140));
+                ui.painter().rect_filled(span, 4.0, Accent::Sky.color());
                 ui.painter().text(
                     span.left_center() + vec2(5.0, 0.0),
                     Align2::LEFT_CENTER,
@@ -3123,8 +3121,7 @@ impl Forma {
                 let id = self.scene.shapes[*index].id.clone();
                 label(ui, &format!("Spin {}", r + 1), None, true);
                 let span = bar(clip.start_time, clip.start_time + clip.duration);
-                ui.painter()
-                    .rect_filled(span, 4.0, Color32::from_rgb(120, 96, 64));
+                ui.painter().rect_filled(span, 4.0, Accent::Clay.color());
                 ui.painter().text(
                     span.left_center() + vec2(5.0, 0.0),
                     Align2::LEFT_CENTER,
@@ -3176,13 +3173,14 @@ impl Forma {
             pos2(x(end).max(x(start) + 3.0), line.bottom() - 3.0),
         );
         let selected = self.selected.as_deref() == Some(&shape.id);
+        // Canopy's colors: the selected clip in sun, the rest in moss.
         ui.painter().rect_filled(
             span,
             4.0,
             if selected {
                 color::SUN
             } else {
-                color::INK_SOFT
+                Accent::Moss.color()
             },
         );
         let dragging = self
@@ -3205,7 +3203,11 @@ impl Forma {
                 Align2::LEFT_CENTER,
                 text,
                 font::ui(10.0),
-                Color32::from_rgb(24, 29, 37),
+                if selected {
+                    Mood::Ember.ground()
+                } else {
+                    color::INK
+                },
             );
         }
         let tip = format!(
@@ -3277,7 +3279,7 @@ impl Forma {
             ui.painter().add(egui::Shape::convex_polygon(
                 dot.to_vec(),
                 Color32::WHITE,
-                Stroke::new(1.0, Color32::from_rgb(24, 29, 37)),
+                Stroke::new(1.0, Mood::Ember.ground()),
             ));
             let response = ui
                 .interact(
@@ -4333,16 +4335,15 @@ impl CanopyApp for Forma {
             pos2(rect.left(), top.bottom() + 4.0),
             pos2(rect.right(), rect.bottom() - timeline_h - 6.0),
         );
-        let left = Rect::from_min_size(middle.min, vec2(170.0, middle.height()));
+        // Wide enough for Canopy's outlined Add buttons.
+        let left = Rect::from_min_size(middle.min, vec2(205.0, middle.height()));
         let right = Rect::from_min_max(pos2(middle.right() - 230.0, middle.top()), middle.max);
         let canvas = Rect::from_min_max(
             pos2(left.right() + 5.0, middle.top()),
             pos2(right.left() - 5.0, middle.bottom()),
         );
-        ui.painter()
-            .rect_filled(left, 8.0, Color32::from_rgb(31, 37, 48));
-        ui.painter()
-            .rect_filled(right, 8.0, Color32::from_rgb(31, 37, 48));
+        ui.painter().add(pane_frame(Mood::Ember).paint(left));
+        ui.painter().add(pane_frame(Mood::Ember).paint(right));
         ui.scope_builder(UiBuilder::new().max_rect(left.shrink(8.0)), |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("forma-layers-panel")
