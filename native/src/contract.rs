@@ -15,12 +15,17 @@ pub struct ToolError {
 }
 
 pub fn fail(code: &str, message: impl Into<String>) -> ToolError {
-    ToolError { code: code.into(), message: message.into() }
+    ToolError {
+        code: code.into(),
+        message: message.into(),
+    }
 }
 
 pub fn manifest() -> &'static Value {
     static PARSED: OnceLock<Value> = OnceLock::new();
-    PARSED.get_or_init(|| serde_json::from_str(MANIFEST).expect("mcp/tool_manifest.json is valid JSON"))
+    PARSED.get_or_init(|| {
+        serde_json::from_str(MANIFEST).expect("mcp/tool_manifest.json is valid JSON")
+    })
 }
 
 pub fn tools() -> &'static [Value] {
@@ -38,10 +43,15 @@ pub fn read_only(name: &str) -> bool {
 
 /// Checks a tool's arguments against its input schema.
 pub fn validate(name: &str, args: &Value) -> Result<(), ToolError> {
-    let tool = tool(name).ok_or_else(|| fail("UNKNOWN_TOOL", format!("Unknown Forma tool: {name}")))?;
+    let tool =
+        tool(name).ok_or_else(|| fail("UNKNOWN_TOOL", format!("Unknown Forma tool: {name}")))?;
     let mut problems = Vec::new();
     check(&tool["inputSchema"], args, "data", &mut problems);
-    if problems.is_empty() { Ok(()) } else { Err(fail("INVALID_ARGUMENTS", problems.join("; "))) }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(fail("INVALID_ARGUMENTS", problems.join("; ")))
+    }
 }
 
 fn check(schema: &Value, value: &Value, at: &str, problems: &mut Vec<String>) {
@@ -63,30 +73,50 @@ fn check(schema: &Value, value: &Value, at: &str, problems: &mut Vec<String>) {
     let count = |key: &str| schema.get(key).and_then(Value::as_u64).map(|n| n as usize);
     match schema["type"].as_str() {
         Some("object") => {
-            let Some(map) = value.as_object() else { return problems.push(format!("{at} must be object")) };
-            for name in schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            let Some(map) = value.as_object() else {
+                return problems.push(format!("{at} must be object"));
+            };
+            for name in schema["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
                 if !map.contains_key(name) {
                     problems.push(format!("{at} must have required property '{name}'"));
                 }
             }
             if count("minProperties").is_some_and(|least| map.len() < least) {
-                problems.push(format!("{at} must have at least {} properties", count("minProperties").unwrap()));
+                problems.push(format!(
+                    "{at} must have at least {} properties",
+                    count("minProperties").unwrap()
+                ));
             }
             for (key, item) in map {
                 match schema["properties"].get(key) {
                     Some(property) => check(property, item, &format!("{at}/{key}"), problems),
-                    None if schema["additionalProperties"] == false => problems.push(format!("{at} must NOT have additional property '{key}'")),
+                    None if schema["additionalProperties"] == false => {
+                        problems.push(format!("{at} must NOT have additional property '{key}'"))
+                    }
                     None => {}
                 }
             }
         }
         Some("array") => {
-            let Some(items) = value.as_array() else { return problems.push(format!("{at} must be array")) };
+            let Some(items) = value.as_array() else {
+                return problems.push(format!("{at} must be array"));
+            };
             if count("minItems").is_some_and(|least| items.len() < least) {
-                problems.push(format!("{at} must have at least {} items", count("minItems").unwrap()));
+                problems.push(format!(
+                    "{at} must have at least {} items",
+                    count("minItems").unwrap()
+                ));
             }
             if count("maxItems").is_some_and(|most| items.len() > most) {
-                problems.push(format!("{at} must have at most {} items", count("maxItems").unwrap()));
+                problems.push(format!(
+                    "{at} must have at most {} items",
+                    count("maxItems").unwrap()
+                ));
             }
             if let Some(each) = schema.get("items") {
                 for (i, item) in items.iter().enumerate() {
@@ -95,13 +125,21 @@ fn check(schema: &Value, value: &Value, at: &str, problems: &mut Vec<String>) {
             }
         }
         Some("string") => {
-            let Some(text) = value.as_str() else { return problems.push(format!("{at} must be string")) };
+            let Some(text) = value.as_str() else {
+                return problems.push(format!("{at} must be string"));
+            };
             let length = text.chars().count();
             if count("minLength").is_some_and(|least| length < least) {
-                problems.push(format!("{at} must have at least {} characters", count("minLength").unwrap()));
+                problems.push(format!(
+                    "{at} must have at least {} characters",
+                    count("minLength").unwrap()
+                ));
             }
             if count("maxLength").is_some_and(|most| length > most) {
-                problems.push(format!("{at} must have at most {} characters", count("maxLength").unwrap()));
+                problems.push(format!(
+                    "{at} must have at most {} characters",
+                    count("maxLength").unwrap()
+                ));
             }
             if let Some(pattern) = schema["pattern"].as_str() {
                 if !matches_pattern(pattern, text) {
@@ -110,7 +148,9 @@ fn check(schema: &Value, value: &Value, at: &str, problems: &mut Vec<String>) {
             }
         }
         Some(kind @ ("number" | "integer")) => {
-            let Some(n) = value.as_f64() else { return problems.push(format!("{at} must be {kind}")) };
+            let Some(n) = value.as_f64() else {
+                return problems.push(format!("{at} must be {kind}"));
+            };
             if kind == "integer" && n.fract() != 0.0 {
                 return problems.push(format!("{at} must be integer"));
             }
@@ -121,7 +161,10 @@ fn check(schema: &Value, value: &Value, at: &str, problems: &mut Vec<String>) {
                 problems.push(format!("{at} must be <= {}", number("maximum").unwrap()));
             }
             if number("exclusiveMinimum").is_some_and(|least| n <= least) {
-                problems.push(format!("{at} must be > {}", number("exclusiveMinimum").unwrap()));
+                problems.push(format!(
+                    "{at} must be > {}",
+                    number("exclusiveMinimum").unwrap()
+                ));
             }
         }
         Some("boolean") if !value.is_boolean() => problems.push(format!("{at} must be boolean")),
@@ -138,9 +181,18 @@ fn matches_pattern(pattern: &str, text: &str) -> bool {
         return false;
     }
     match pattern {
-        "^#[0-9a-fA-F]{6}$" => text.len() == 7 && text.starts_with('#') && text[1..].chars().all(|c| c.is_ascii_hexdigit()),
+        "^#[0-9a-fA-F]{6}$" => {
+            text.len() == 7
+                && text.starts_with('#')
+                && text[1..].chars().all(|c| c.is_ascii_hexdigit())
+        }
         "^[A-Za-z0-9][A-Za-z0-9._ -]*$" => {
-            text.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) && text.chars().all(|c| c.is_ascii_alphanumeric() || "._ -".contains(c))
+            text.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+                && text
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._ -".contains(c))
         }
         _ => false,
     }
@@ -167,25 +219,57 @@ mod tests {
         }
         let mut found = Vec::new();
         walk(manifest(), &mut found);
-        assert!(!found.is_empty() && found.iter().all(|p| PATTERNS.contains(&p.as_str())), "{found:?}");
+        assert!(
+            !found.is_empty() && found.iter().all(|p| PATTERNS.contains(&p.as_str())),
+            "{found:?}"
+        );
         assert_eq!(tools().len(), 13);
     }
 
     #[test]
     fn arguments_are_checked_like_electron_forma_checks_them() {
-        assert!(validate("forma_add_shape", &json!({"type": "circle", "color": "#ed795e", "x": 100})).is_ok());
+        assert!(
+            validate(
+                "forma_add_shape",
+                &json!({"type": "circle", "color": "#ed795e", "x": 100})
+            )
+            .is_ok()
+        );
         let problem = |name: &str, args: Value| validate(name, &args).unwrap_err().message;
-        assert!(problem("forma_add_shape", json!({"color": "#ed795e"})).contains("required property 'type'"));
-        assert!(problem("forma_add_shape", json!({"type": "circle", "color": "red"})).contains("pattern"));
+        assert!(
+            problem("forma_add_shape", json!({"color": "#ed795e"}))
+                .contains("required property 'type'")
+        );
+        assert!(
+            problem("forma_add_shape", json!({"type": "circle", "color": "red"}))
+                .contains("pattern")
+        );
         assert!(problem("forma_add_shape", json!({"type": "blob"})).contains("must be one of"));
         assert!(problem("forma_add_shape", json!({"type": "circle", "w": 0})).contains("> 0"));
-        assert!(problem("forma_get_scene", json!({"everything": true})).contains("additional property"));
+        assert!(
+            problem("forma_get_scene", json!({"everything": true})).contains("additional property")
+        );
         assert!(problem("forma_create_scene", json!({"replace": false})).contains("constant"));
-        assert!(problem("forma_export", json!({"format": "png", "filename": "../x.png"})).contains("pattern"));
+        assert!(
+            problem(
+                "forma_export",
+                json!({"format": "png", "filename": "../x.png"})
+            )
+            .contains("pattern")
+        );
         assert!(problem("forma_update_scene", json!({})).contains("at least 1"));
         assert!(validate("forma_update_shape", &json!({"id": "a", "outTime": null})).is_ok());
-        assert!(problem("forma_set_keyframes", json!({"id": "a", "keyframes": [{"t": 0}]})).contains("required property 'x'"));
-        assert_eq!(validate("forma_fly", &json!({})).unwrap_err().code, "UNKNOWN_TOOL");
+        assert!(
+            problem(
+                "forma_set_keyframes",
+                json!({"id": "a", "keyframes": [{"t": 0}]})
+            )
+            .contains("required property 'x'")
+        );
+        assert_eq!(
+            validate("forma_fly", &json!({})).unwrap_err().code,
+            "UNKNOWN_TOOL"
+        );
         assert!(read_only("forma_preview") && !read_only("forma_add_shape"));
     }
 }

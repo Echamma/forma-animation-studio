@@ -37,25 +37,52 @@ struct Stream {
 impl Videos {
     /// Brings the shown frames up to `time`, for a preview drawn at `scale` pixels per scene pixel. Returns whether
     /// it is still waiting for frames (the editor should draw again soon).
-    pub fn update(&mut self, scene: &Scene, renderer: &Renderer, time: f64, playing: bool, scale: f32) -> bool {
-        let showing: Vec<_> = scene.shapes.iter().filter(|s| s.kind == "video" && s.visible(time, scene.duration)).collect();
+    pub fn update(
+        &mut self,
+        scene: &Scene,
+        renderer: &Renderer,
+        time: f64,
+        playing: bool,
+        scale: f32,
+    ) -> bool {
+        let showing: Vec<_> = scene
+            .shapes
+            .iter()
+            .filter(|s| s.kind == "video" && s.visible(time, scene.duration))
+            .collect();
         let before = self.frames.len();
-        self.frames.retain(|id, _| showing.iter().any(|s| &s.id == id));
-        self.shown.retain(|id, _| showing.iter().any(|s| &s.id == id));
-        self.streams.retain(|id, _| playing && showing.iter().any(|s| &s.id == id));
+        self.frames
+            .retain(|id, _| showing.iter().any(|s| &s.id == id));
+        self.shown
+            .retain(|id, _| showing.iter().any(|s| &s.id == id));
+        self.streams
+            .retain(|id, _| playing && showing.iter().any(|s| &s.id == id));
         if self.frames.len() != before {
             self.generation += 1;
         }
         let mut waiting = false;
         for shape in showing {
-            let (Some(file), Some(duration)) = (renderer.video(&shape.id), shape.extra.get("mediaDuration").and_then(|d| d.as_f64())) else { continue };
+            let (Some(file), Some(duration)) = (
+                renderer.video(&shape.id),
+                shape.extra.get("mediaDuration").and_then(|d| d.as_f64()),
+            ) else {
+                continue;
+            };
             let pose = scene.render_pose(shape, time);
-            let size = ((pose.w * scale).round().clamp(2.0, 1920.0) as u32, (pose.h * scale).round().clamp(2.0, 1920.0) as u32);
+            let size = (
+                (pose.w * scale).round().clamp(2.0, 1920.0) as u32,
+                (pose.h * scale).round().clamp(2.0, 1920.0) as u32,
+            );
             let at = shape.media_time(time, duration);
             if playing {
-                let fresh = self.streams.get(&shape.id).is_some_and(|s| s.size == size && (s.from + s.read as f64 / FPS - time).abs() < 0.3);
+                let fresh = self.streams.get(&shape.id).is_some_and(|s| {
+                    s.size == size && (s.from + s.read as f64 / FPS - time).abs() < 0.3
+                });
                 if !fresh {
-                    self.streams.insert(shape.id.clone(), Stream::start(file.to_owned(), at, time, size));
+                    self.streams.insert(
+                        shape.id.clone(),
+                        Stream::start(file.to_owned(), at, time, size),
+                    );
                 }
                 if let Some(frame) = self.streams.get_mut(&shape.id).unwrap().due(time) {
                     self.frames.insert(shape.id.clone(), frame);
@@ -90,7 +117,10 @@ impl Videos {
                 let (send, receive) = channel();
                 let file = file.to_owned();
                 std::thread::spawn(move || {
-                    let frame = media::Frames::start(&file, key.0 as f64 / FPS, FPS as u32, key.1, key.2).and_then(|mut f| f.next()).ok();
+                    let frame =
+                        media::Frames::start(&file, key.0 as f64 / FPS, FPS as u32, key.1, key.2)
+                            .and_then(|mut f| f.next())
+                            .ok();
                     let _ = send.send(frame);
                 });
                 self.stills.insert(shape.id.clone(), (key, receive));
@@ -105,7 +135,9 @@ impl Stream {
     fn start(file: std::path::PathBuf, at: f64, from: f64, size: (u32, u32)) -> Self {
         let (send, frames): (SyncSender<Pixmap>, _) = sync_channel(3);
         std::thread::spawn(move || {
-            let Ok(mut reader) = media::Frames::start(&file, at, FPS as u32, size.0, size.1) else { return };
+            let Ok(mut reader) = media::Frames::start(&file, at, FPS as u32, size.0, size.1) else {
+                return;
+            };
             // Ends when the editor drops the stream (the send fails) or the video does.
             while let Ok(frame) = reader.next() {
                 if send.send(frame).is_err() {
@@ -113,14 +145,22 @@ impl Stream {
                 }
             }
         });
-        Self { from, read: 0, size, frames, ahead: None }
+        Self {
+            from,
+            read: 0,
+            size,
+            frames,
+            ahead: None,
+        }
     }
 
     /// The newest frame that is due at `time`, if a new one is.
     fn due(&mut self, time: f64) -> Option<Pixmap> {
         let mut newest = None;
         loop {
-            let Some(frame) = self.ahead.take().or_else(|| self.frames.try_recv().ok()) else { break };
+            let Some(frame) = self.ahead.take().or_else(|| self.frames.try_recv().ok()) else {
+                break;
+            };
             if self.from + self.read as f64 / FPS > time + 0.5 / FPS {
                 self.ahead = Some(frame);
                 break;

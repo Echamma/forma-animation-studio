@@ -33,9 +33,11 @@ pub static DESCRIPTOR: AppDescriptor = AppDescriptor {
     folder: "Forma",
     icon_png: &[],
     accepts: |file: &SharedFile| {
-        [".json", ".forma", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".mp4", ".webm", ".ogv"]
-            .iter()
-            .any(|ext| file.name.to_lowercase().ends_with(ext))
+        [
+            ".json", ".forma", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".mp4", ".webm", ".ogv",
+        ]
+        .iter()
+        .any(|ext| file.name.to_lowercase().ends_with(ext))
     },
     documents: storage::list,
     create,

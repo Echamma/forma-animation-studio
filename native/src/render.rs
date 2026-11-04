@@ -7,7 +7,8 @@ use canopy_ui::Place;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tiny_skia::{
-    Color, FillRule, IntRect, IntSize, Paint, Path as Outline, PathBuilder, Pixmap, PixmapPaint, Point, Rect, Transform,
+    Color, FillRule, IntRect, IntSize, Paint, Path as Outline, PathBuilder, Pixmap, PixmapPaint,
+    Point, Rect, Transform,
 };
 
 /// Video layers' frames at one moment, by layer id.
@@ -36,7 +37,12 @@ impl Ink<'_> {
             Ink::Fill(outline, _) => Some(outline.bounds()),
             Ink::Picture(pixmap, _, transform) => {
                 let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
-                let mut corners = [Point::from_xy(0.0, 0.0), Point::from_xy(w, 0.0), Point::from_xy(w, h), Point::from_xy(0.0, h)];
+                let mut corners = [
+                    Point::from_xy(0.0, 0.0),
+                    Point::from_xy(w, 0.0),
+                    Point::from_xy(w, h),
+                    Point::from_xy(0.0, h),
+                ];
                 transform.map_points(&mut corners);
                 Rect::from_points(&corners)
             }
@@ -45,10 +51,17 @@ impl Ink<'_> {
 
     fn paint(&self, target: &mut Pixmap, offset: Transform) {
         match self {
-            Ink::Fill(outline, paint) => target.fill_path(outline, paint, FillRule::Winding, offset, None),
-            Ink::Picture(pixmap, paint, transform) => {
-                target.draw_pixmap(0, 0, pixmap.as_ref(), paint, transform.post_concat(offset), None)
+            Ink::Fill(outline, paint) => {
+                target.fill_path(outline, paint, FillRule::Winding, offset, None)
             }
+            Ink::Picture(pixmap, paint, transform) => target.draw_pixmap(
+                0,
+                0,
+                pixmap.as_ref(),
+                paint,
+                transform.post_concat(offset),
+                None,
+            ),
         }
     }
 }
@@ -59,7 +72,11 @@ impl Renderer {
         let mut missing = HashMap::new();
         let mut videos = HashMap::new();
         for shape in scene.shapes.iter().filter(|s| s.kind == "video") {
-            if let Some(file) = assets::stored(shape, "assetData", place).ok().flatten().and_then(|url| assets::library_file(&url, place)) {
+            if let Some(file) = assets::stored(shape, "assetData", place)
+                .ok()
+                .flatten()
+                .and_then(|url| assets::library_file(&url, place))
+            {
                 videos.insert(shape.id.clone(), file);
             }
         }
@@ -79,7 +96,12 @@ impl Renderer {
                 }
             }
         }
-        Self { images, videos, missing, sources: sources(scene) }
+        Self {
+            images,
+            videos,
+            missing,
+            sources: sources(scene),
+        }
     }
 
     /// Whether this renderer has read the pictures `scene` shows.
@@ -89,7 +111,10 @@ impl Renderer {
 
     /// Whether every layer can be exported: none is left out of an export.
     pub fn check(&self, scene: &Scene) -> Result<(), String> {
-        scene.shapes.iter().try_for_each(|shape| self.exportable(shape))
+        scene
+            .shapes
+            .iter()
+            .try_for_each(|shape| self.exportable(shape))
     }
 
     fn exportable(&self, shape: &Shape) -> Result<(), String> {
@@ -119,25 +144,45 @@ impl Renderer {
     }
 
     fn draws(&self, shape: &Shape) -> bool {
-        matches!(shape.kind.as_str(), "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text")
-            || (matches!(shape.kind.as_str(), "image" | "video" | "svg") && self.images.contains_key(&shape.id))
+        matches!(
+            shape.kind.as_str(),
+            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text"
+        ) || (matches!(shape.kind.as_str(), "image" | "video" | "svg")
+            && self.images.contains_key(&shape.id))
     }
 
     /// The frame at `t`, `width` × `height` pixels, for export, with video layers showing `frames`: a visible layer it
     /// can't draw is an error, never left out.
-    pub fn frame(&self, scene: &Scene, t: f64, (width, height): (u32, u32), frames: &Frames) -> Result<Pixmap, String> {
+    pub fn frame(
+        &self,
+        scene: &Scene,
+        t: f64,
+        (width, height): (u32, u32),
+        frames: &Frames,
+    ) -> Result<Pixmap, String> {
         self.draw(scene, t, (width, height), true, frames)
     }
 
     /// The frame at `t` at `scale` times the scene's size, for the editor: layers it can't draw are left out, and
     /// video layers without one of `frames` show their poster.
     pub fn preview(&self, scene: &Scene, t: f64, scale: f32, frames: &Frames) -> Option<Pixmap> {
-        let size = ((scene.width * scale).round().max(1.0) as u32, (scene.height * scale).round().max(1.0) as u32);
+        let size = (
+            (scene.width * scale).round().max(1.0) as u32,
+            (scene.height * scale).round().max(1.0) as u32,
+        );
         self.draw(scene, t, size, false, frames).ok()
     }
 
-    fn draw(&self, scene: &Scene, t: f64, (width, height): (u32, u32), strict: bool, frames: &Frames) -> Result<Pixmap, String> {
-        let mut canvas = Pixmap::new(width.max(1), height.max(1)).ok_or("Scene is too large to render")?;
+    fn draw(
+        &self,
+        scene: &Scene,
+        t: f64,
+        (width, height): (u32, u32),
+        strict: bool,
+        frames: &Frames,
+    ) -> Result<Pixmap, String> {
+        let mut canvas =
+            Pixmap::new(width.max(1), height.max(1)).ok_or("Scene is too large to render")?;
         let [r, g, b] = rgb(&scene.bg);
         canvas.fill(Color::from_rgba8(r, g, b, 255));
         // Like Electron's export, which scales the canvas by width and height separately.
@@ -157,7 +202,9 @@ impl Renderer {
                     return Err(format!("{}: no video frame", shape.name));
                 }
             }
-            let Some(ink) = self.ink(shape, pose, &shape.color_at(t), view, frames) else { continue };
+            let Some(ink) = self.ink(shape, pose, &shape.color_at(t), view, frames) else {
+                continue;
+            };
             let blur = blur(shape) * scale;
             if blur <= 0.0 {
                 ink.paint(&mut canvas, Transform::identity());
@@ -166,29 +213,63 @@ impl Renderer {
             // A blurred layer is drawn on its own, blurred, then laid on the canvas, like canvas's `filter: blur()`.
             let margin = (blur * 3.0).ceil() + 2.0;
             let area = ink.bounds().and_then(|b| {
-                let (left, top) = (b.left().max(-margin) - margin, b.top().max(-margin) - margin);
-                let (right, bottom) = (b.right().min(width as f32 + margin) + margin, b.bottom().min(height as f32 + margin) + margin);
-                IntRect::from_ltrb(left.floor() as i32, top.floor() as i32, right.ceil() as i32, bottom.ceil() as i32)
+                let (left, top) = (
+                    b.left().max(-margin) - margin,
+                    b.top().max(-margin) - margin,
+                );
+                let (right, bottom) = (
+                    b.right().min(width as f32 + margin) + margin,
+                    b.bottom().min(height as f32 + margin) + margin,
+                );
+                IntRect::from_ltrb(
+                    left.floor() as i32,
+                    top.floor() as i32,
+                    right.ceil() as i32,
+                    bottom.ceil() as i32,
+                )
             });
             let Some(area) = area else { continue };
-            let Some(mut layer) = Pixmap::new(area.width(), area.height()) else { continue };
-            ink.paint(&mut layer, Transform::from_translate(-area.x() as f32, -area.y() as f32));
+            let Some(mut layer) = Pixmap::new(area.width(), area.height()) else {
+                continue;
+            };
+            ink.paint(
+                &mut layer,
+                Transform::from_translate(-area.x() as f32, -area.y() as f32),
+            );
             gaussian_blur(&mut layer, blur);
-            canvas.draw_pixmap(area.x(), area.y(), layer.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+            canvas.draw_pixmap(
+                area.x(),
+                area.y(),
+                layer.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
         }
         Ok(canvas)
     }
 
     /// A layer at `pose` in `color`: shapes and text as outlines, pictures as pixmaps. Each is drawn around its center,
     /// turned by its rotation, then placed (Electron translates, rotates, then draws at the origin).
-    fn ink<'a>(&'a self, shape: &Shape, pose: Pose, color: &str, view: Transform, frames: &'a Frames) -> Option<Ink<'a>> {
-        let place = Transform::from_rotate(pose.r).post_translate(pose.x, pose.y).post_concat(view);
+    fn ink<'a>(
+        &'a self,
+        shape: &Shape,
+        pose: Pose,
+        color: &str,
+        view: Transform,
+        frames: &'a Frames,
+    ) -> Option<Ink<'a>> {
+        let place = Transform::from_rotate(pose.r)
+            .post_translate(pose.x, pose.y)
+            .post_concat(view);
         if let Some(pixmap) = frames.get(&shape.id).or_else(|| self.images.get(&shape.id)) {
             let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
             let mut paint = PixmapPaint::default();
             paint.opacity = (pose.o / 100.0).clamp(0.0, 1.0);
             paint.quality = tiny_skia::FilterQuality::Bilinear;
-            let transform = Transform::from_scale(pose.w / w, pose.h / h).post_translate(-pose.w / 2.0, -pose.h / 2.0).post_concat(place);
+            let transform = Transform::from_scale(pose.w / w, pose.h / h)
+                .post_translate(-pose.w / 2.0, -pose.h / 2.0)
+                .post_concat(place);
             return Some(Ink::Picture(pixmap, paint, transform));
         }
         let outline = match shape.kind.as_str() {
@@ -212,7 +293,15 @@ fn shape_outline(kind: &str, w: f32, h: f32) -> Option<Outline> {
     match kind {
         "triangle" => polygon(&[(0.0, -h), (w, h), (-w, h)]),
         "diamond" => polygon(&[(0.0, -h), (w, 0.0), (0.0, h), (-w, 0.0)]),
-        "arrow" => polygon(&[(-w, -h * 0.18), (w * 0.12, -h * 0.18), (w * 0.12, -h), (w, 0.0), (w * 0.12, h), (w * 0.12, h * 0.18), (-w, h * 0.18)]),
+        "arrow" => polygon(&[
+            (-w, -h * 0.18),
+            (w * 0.12, -h * 0.18),
+            (w * 0.12, -h),
+            (w, 0.0),
+            (w * 0.12, h),
+            (w * 0.12, h * 0.18),
+            (-w, h * 0.18),
+        ]),
         "circle" => path.push_oval(Rect::from_ltrb(-w, -h, w, h)?),
         "rect" => {
             // `roundRect(..., 3)`: quarter circles, as cubic curves, no bigger than the shape allows.
@@ -236,7 +325,12 @@ fn shape_outline(kind: &str, w: f32, h: f32) -> Option<Outline> {
 
 /// A layer's blur in pixels, as Electron Forma reads it.
 fn blur(shape: &Shape) -> f32 {
-    shape.extra.get("blur").and_then(|v| v.as_f64()).filter(|v| v.is_finite()).map_or(0.0, |v| v.clamp(0.0, 100.0) as f32)
+    shape
+        .extra
+        .get("blur")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite())
+        .map_or(0.0, |v| v.clamp(0.0, 100.0) as f32)
 }
 
 /// Gaussian blur with standard deviation `sigma` (what CSS `blur()` means), as three box blurs each way, the
@@ -261,18 +355,36 @@ fn box_sizes(sigma: f32) -> [usize; 3] {
         lower -= 1;
     }
     let lower = lower.max(1);
-    let smaller = ((variance - 3.0 * (lower * lower) as f32 - 12.0 * lower as f32 - 9.0) / (-4.0 * lower as f32 - 4.0)).round() as i32;
-    std::array::from_fn(|i| if (i as i32) < smaller { lower as usize } else { lower as usize + 2 })
+    let smaller = ((variance - 3.0 * (lower * lower) as f32 - 12.0 * lower as f32 - 9.0)
+        / (-4.0 * lower as f32 - 4.0))
+        .round() as i32;
+    std::array::from_fn(|i| {
+        if (i as i32) < smaller {
+            lower as usize
+        } else {
+            lower as usize + 2
+        }
+    })
 }
 
 /// Averages each of `lines` lines of `length` pixels over `radius` pixels either side. Pixel `j` of line `i` starts
 /// at byte `i * stride + j * step`.
-fn box_blur(from: &[u8], to: &mut [u8], lines: usize, length: usize, step: usize, stride: usize, radius: usize) {
+fn box_blur(
+    from: &[u8],
+    to: &mut [u8],
+    lines: usize,
+    length: usize,
+    step: usize,
+    stride: usize,
+    radius: usize,
+) {
     let window = (2 * radius + 1) as u32;
     for line in 0..lines {
         for channel in 0..4 {
             let at = |j: usize| line * stride + j * step + channel;
-            let mut sum: u32 = (0..=radius.min(length - 1)).map(|j| from[at(j)] as u32).sum();
+            let mut sum: u32 = (0..=radius.min(length - 1))
+                .map(|j| from[at(j)] as u32)
+                .sum();
             for j in 0..length {
                 to[at(j)] = ((sum + window / 2) / window) as u8;
                 if j + radius + 1 < length {
@@ -289,7 +401,8 @@ fn box_blur(from: &[u8], to: &mut [u8], lines: usize, length: usize, step: usize
 fn picture(shape: &Shape, place: &Place) -> Result<Pixmap, String> {
     let image = assets::image(shape, place)?.ok_or("This layer has no picture")?;
     let bytes: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
-    let size = IntSize::from_wh(image.size[0] as u32, image.size[1] as u32).ok_or("Invalid picture size")?;
+    let size = IntSize::from_wh(image.size[0] as u32, image.size[1] as u32)
+        .ok_or("Invalid picture size")?;
     Pixmap::from_vec(bytes, size).ok_or_else(|| "Invalid picture pixels".into())
 }
 
@@ -298,21 +411,34 @@ fn picture(shape: &Shape, place: &Place) -> Result<Pixmap, String> {
 fn svg_picture(shape: &Shape, place: &Place) -> Result<Pixmap, String> {
     let source = assets::svg_source(shape, place)?.ok_or("This layer has no SVG")?;
     let tree = svg::parse(&source)?;
-    let (w, h) = shape.keys.iter().fold((1.0f32, 1.0f32), |(w, h), key| (w.max(key.w), h.max(key.h)));
+    let (w, h) = shape
+        .keys
+        .iter()
+        .fold((1.0f32, 1.0f32), |(w, h), key| (w.max(key.w), h.max(key.h)));
     let fit = (4096.0 / (2.0 * w.max(h))).min(1.0);
-    svg::rasterize(&tree, (2.0 * w * fit).ceil() as u32, (2.0 * h * fit).ceil() as u32).ok_or_else(|| "This SVG is too large to draw".into())
+    svg::rasterize(
+        &tree,
+        (2.0 * w * fit).ceil() as u32,
+        (2.0 * h * fit).ceil() as u32,
+    )
+    .ok_or_else(|| "This SVG is too large to draw".into())
 }
 
 fn sources(scene: &Scene) -> Vec<(String, Option<u64>)> {
     use std::hash::{Hash, Hasher};
-    scene.shapes.iter().filter(|s| matches!(s.kind.as_str(), "image" | "video" | "svg")).map(|s| {
-        let key = assets::image_key(s).map(|key| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            hasher.finish()
-        });
-        (s.id.clone(), key)
-    }).collect()
+    scene
+        .shapes
+        .iter()
+        .filter(|s| matches!(s.kind.as_str(), "image" | "video" | "svg"))
+        .map(|s| {
+            let key = assets::image_key(s).map(|key| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                hasher.finish()
+            });
+            (s.id.clone(), key)
+        })
+        .collect()
 }
 
 /// One frame, video layers included (each read from its file).
@@ -321,14 +447,29 @@ pub fn frame(scene: &Scene, place: &Place, t: f64) -> Result<Pixmap, String> {
 }
 
 /// One frame at `size` pixels (the scene scaled to fit), video layers included.
-pub fn frame_sized(scene: &Scene, place: &Place, t: f64, size: (u32, u32)) -> Result<Pixmap, String> {
+pub fn frame_sized(
+    scene: &Scene,
+    place: &Place,
+    t: f64,
+    size: (u32, u32),
+) -> Result<Pixmap, String> {
     let renderer = Renderer::new(scene, place);
     let mut frames = Frames::new();
-    for shape in scene.shapes.iter().filter(|s| s.kind == "video" && s.visible(t, scene.duration)) {
-        let Some(file) = renderer.video(&shape.id) else { continue };
+    for shape in scene
+        .shapes
+        .iter()
+        .filter(|s| s.kind == "video" && s.visible(t, scene.duration))
+    {
+        let Some(file) = renderer.video(&shape.id) else {
+            continue;
+        };
         let duration = crate::media::probe(file)?.duration;
         let (width, height) = video_size(shape, 1.0);
-        frames.insert(shape.id.clone(), crate::media::Frames::start(file, shape.media_time(t, duration), 30, width, height)?.next()?);
+        frames.insert(
+            shape.id.clone(),
+            crate::media::Frames::start(file, shape.media_time(t, duration), 30, width, height)?
+                .next()?,
+        );
     }
     renderer.frame(scene, t, size, &frames)
 }
@@ -340,13 +481,23 @@ pub fn scene_size(scene: &Scene) -> (u32, u32) {
 
 /// The size to decode a video layer's frames at for an export `scale` times the scene's size: its largest size.
 pub fn video_size(shape: &Shape, scale: f32) -> (u32, u32) {
-    let (w, h) = shape.keys.iter().fold((2.0f32, 2.0f32), |(w, h), key| (w.max(key.w), h.max(key.h)));
+    let (w, h) = shape
+        .keys
+        .iter()
+        .fold((2.0f32, 2.0f32), |(w, h), key| (w.max(key.w), h.max(key.h)));
     ((w * scale).round() as u32, (h * scale).round() as u32)
 }
 
 pub fn save_png(scene: &Scene, place: &Place, t: f64, output: &Path) -> Result<(), String> {
     let pixmap = frame(scene, place, t)?;
-    image::save_buffer(output, pixmap.data(), pixmap.width(), pixmap.height(), image::ColorType::Rgba8).map_err(|e| e.to_string())
+    image::save_buffer(
+        output,
+        pixmap.data(),
+        pixmap.width(),
+        pixmap.height(),
+        image::ColorType::Rgba8,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// A layer's color at opacity `o` (0-100).
@@ -368,7 +519,12 @@ mod tests {
     use super::*;
 
     fn place(root: std::path::PathBuf) -> Place {
-        Place { space: None, projects_dir: root.clone(), data_dir: root.clone(), exports_dir: root }
+        Place {
+            space: None,
+            projects_dir: root.clone(),
+            data_dir: root.clone(),
+            exports_dir: root,
+        }
     }
 
     #[test]
@@ -378,16 +534,22 @@ mod tests {
         let output = frame(&scene, &place(std::env::temp_dir()), 0.0).unwrap();
         let center = output.pixel(480, 300).unwrap();
         let corner = output.pixel(0, 0).unwrap();
-        assert!(center.green() < corner.green(), "circle should be coral on the pale background");
+        assert!(
+            center.green() < corner.green(),
+            "circle should be coral on the pale background"
+        );
         assert_eq!(corner.alpha(), 255);
     }
 
     #[test]
     fn picture_layers_render_from_the_shared_media_library() {
-        let root = std::env::temp_dir().join(format!("forma-render-picture-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("forma-render-picture-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("blue.png");
-        image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 255, 255])).save(&path).unwrap();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 255, 255]))
+            .save(&path)
+            .unwrap();
         let place = place(root.clone());
         let (url, _, _) = assets::import_picture(&path, &place).unwrap();
         let mut scene = Scene::empty("test".into());
@@ -403,12 +565,25 @@ mod tests {
     fn a_missing_picture_stops_an_export_but_not_the_preview() {
         let mut scene = Scene::empty("test".into());
         scene.add_shape("lost".into(), "image");
-        scene.shapes[0].extra.insert("assetData".into(), format!("forma-asset://media/{}.png", "0".repeat(64)).into());
+        scene.shapes[0].extra.insert(
+            "assetData".into(),
+            format!("forma-asset://media/{}.png", "0".repeat(64)).into(),
+        );
         let renderer = Renderer::new(&scene, &place(std::env::temp_dir()));
-        assert!(renderer.frame(&scene, 0.0, scene_size(&scene), &Frames::new()).is_err());
+        assert!(
+            renderer
+                .frame(&scene, 0.0, scene_size(&scene), &Frames::new())
+                .is_err()
+        );
         assert!(renderer.check(&scene).is_err());
         assert!(renderer.leaves_out(&scene.shapes[0]));
-        assert_eq!(renderer.preview(&scene, 0.0, 0.5, &Frames::new()).unwrap().width(), 480);
+        assert_eq!(
+            renderer
+                .preview(&scene, 0.0, 0.5, &Frames::new())
+                .unwrap()
+                .width(),
+            480
+        );
     }
 
     #[test]
@@ -422,8 +597,22 @@ mod tests {
         // A 160 px square at the center, x 400..560. Electron Forma's canvas, measured on 2026-11-01, darkens these
         // pixels of row 300 this much.
         let darkness = |x: u32| 1.0 - output.pixel(x, 300).unwrap().red() as f32 / 255.0;
-        for (x, electron) in [(370, 0.0), (380, 0.008), (392, 0.173), (396, 0.329), (400, 0.525), (404, 0.71), (410, 0.906), (420, 0.996), (480, 1.0)] {
-            assert!((darkness(x) - electron).abs() < 0.03, "x {x}: {} where Electron has {electron}", darkness(x));
+        for (x, electron) in [
+            (370, 0.0),
+            (380, 0.008),
+            (392, 0.173),
+            (396, 0.329),
+            (400, 0.525),
+            (404, 0.71),
+            (410, 0.906),
+            (420, 0.996),
+            (480, 1.0),
+        ] {
+            assert!(
+                (darkness(x) - electron).abs() < 0.03,
+                "x {x}: {} where Electron has {electron}",
+                darkness(x)
+            );
         }
     }
 
@@ -434,7 +623,10 @@ mod tests {
         let output = frame(&scene, &place(std::env::temp_dir()), 0.0).unwrap();
         let green = |x, y| output.pixel(x, y).unwrap().green() as i32;
         let (background, fill) = (green(0, 0), green(480, 300));
-        assert!((green(400, 220) - background).abs() < (background - fill).abs() / 4, "the very corner is cut");
+        assert!(
+            (green(400, 220) - background).abs() < (background - fill).abs() / 4,
+            "the very corner is cut"
+        );
         assert_eq!(green(480, 220), fill, "the edge is not");
     }
 }
