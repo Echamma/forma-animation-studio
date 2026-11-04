@@ -139,6 +139,24 @@ enum ExportKind {
     Project,
 }
 
+#[derive(Clone, PartialEq)]
+enum PreviewTarget {
+    Motion(String, String),
+    Spin(String, String),
+    Fade(String),
+}
+
+fn fade_preview_range(scene: &Scene, shape: &Shape) -> Option<(f64, f64)> {
+    let fade = shape.disappear.as_ref()?;
+    let reappear = scene.reappear_at(shape);
+    let end = if reappear.is_finite() {
+        (fade.start_time + fade.duration).max(reappear) + 0.25
+    } else {
+        scene.duration
+    };
+    Some(((fade.start_time - 0.25).max(0.0), end.min(scene.duration)))
+}
+
 pub(crate) fn new_id() -> String {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -171,6 +189,7 @@ pub struct Forma {
     clip_in_edit: String,
     clip_out_edit: String,
     show_projects: bool,
+    show_help: bool,
     show_export: bool,
     export_kind: ExportKind,
     video_settings: video::Settings,
@@ -195,6 +214,9 @@ pub struct Forma {
     /// The spin chosen in the inspector.
     selected_spin: Option<String>,
     motion_edit: (f64, f64, motion::Options),
+    motion_shown: Option<(String, motion::Motion)>,
+    live_animation_preview: bool,
+    pending_auto_preview: Option<(Instant, PreviewTarget)>,
     /// A message for the next toast.
     notice: Option<String>,
     /// A layer copied with Ctrl+C.
@@ -245,6 +267,7 @@ impl Forma {
             clip_in_edit: String::new(),
             clip_out_edit: String::new(),
             show_projects: false,
+            show_help: false,
             show_export: false,
             export_kind: ExportKind::Video,
             video_settings: video::Settings::default(),
@@ -262,6 +285,9 @@ impl Forma {
             selected_motion: None,
             selected_spin: None,
             motion_edit: (0.0, 1.0, motion::Options::default()),
+            motion_shown: None,
+            live_animation_preview: false,
+            pending_auto_preview: None,
             notice: None,
             clipboard: None,
             preview_end: None,
@@ -318,6 +344,8 @@ impl Forma {
         self.videos = Videos::default();
         self.undo.clear();
         self.redo.clear();
+        self.motion_shown = None;
+        self.pending_auto_preview = None;
         self.suppress_history = true;
     }
 
@@ -460,6 +488,7 @@ impl Forma {
 
     fn undo(&mut self) {
         if let Some(scene) = self.undo.pop() {
+            self.pending_auto_preview = None;
             self.redo.push(std::mem::replace(&mut self.scene, scene));
             self.suppress_history = true;
             self.playing = false;
@@ -469,6 +498,7 @@ impl Forma {
 
     fn redo(&mut self) {
         if let Some(scene) = self.redo.pop() {
+            self.pending_auto_preview = None;
             self.undo.push(std::mem::replace(&mut self.scene, scene));
             self.suppress_history = true;
             self.playing = false;
@@ -481,6 +511,9 @@ impl Forma {
             ui.spacing_mut().item_spacing.x = 8.0;
             if ui.button("Projects").clicked() {
                 self.show_projects = true;
+            }
+            if ui.button("Help").clicked() {
+                self.show_help = true;
             }
             if ui.button("New").clicked() {
                 self.open(Scene::empty(new_id()));
@@ -665,6 +698,8 @@ impl Forma {
         }
         egui::ScrollArea::vertical()
             .id_salt("forma-layers")
+            // The whole Layers panel scrolls (see `ui`), so the list grows with it and the tip below stays reachable.
+            .max_height(f32::INFINITY)
             .show(ui, |ui| {
                 let mut destination = None;
                 let mut clicked = None;
@@ -734,6 +769,12 @@ impl Forma {
             self.open(scene);
             self.edited();
             self.notice = Some(notice);
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("New to animation?").font(font::bold(12.0)));
+        ui.label("Move the playhead, change a layer, then press play.");
+        if ui.link("Show the quick guide").clicked() {
+            self.show_help = true;
         }
     }
 
@@ -1257,12 +1298,79 @@ impl Forma {
 
     /// Plays from `start` and stops at `end`, as Electron previews a new animation.
     fn preview(&mut self, start: f64, end: f64) {
+        self.motion_mode = None;
         (self.time, self.preview_end, self.playing, self.last_tick) = (
             start,
             Some(end.min(self.scene.duration)),
             true,
             Instant::now(),
         );
+    }
+
+    fn preview_fade(&mut self, index: usize) {
+        if let Some((start, end)) = fade_preview_range(&self.scene, &self.scene.shapes[index]) {
+            self.preview(start, end);
+        }
+    }
+
+    fn queue_auto_preview(&mut self, target: PreviewTarget, ctx: &egui::Context) {
+        if self.live_animation_preview {
+            self.pending_auto_preview = Some((Instant::now() + Duration::from_millis(300), target));
+            ctx.request_repaint_after(Duration::from_millis(310));
+        }
+    }
+
+    fn run_auto_preview(&mut self, ctx: &egui::Context) {
+        let Some((when, target)) = self.pending_auto_preview.clone() else {
+            return;
+        };
+        if Instant::now() < when {
+            ctx.request_repaint_after(when.saturating_duration_since(Instant::now()));
+            return;
+        }
+        self.pending_auto_preview = None;
+        match target {
+            PreviewTarget::Motion(shape_id, motion_id)
+                if self.selected.as_deref() == Some(&shape_id)
+                    && self.selected_motion.as_deref() == Some(&motion_id) =>
+            {
+                let Some(index) = self.scene.shapes.iter().position(|s| s.id == shape_id) else {
+                    return;
+                };
+                let (start, length, options) = self.motion_edit;
+                match motion::edit(&mut self.scene, index, &motion_id, start, length, options) {
+                    Ok(()) => {
+                        self.motion_shown = motion::motions(&self.scene.shapes[index])
+                            .into_iter()
+                            .find(|m| m.id == motion_id)
+                            .map(|m| (shape_id, m));
+                        self.edited();
+                        self.preview(start, start + length);
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
+            PreviewTarget::Spin(shape_id, spin_id)
+                if self.selected.as_deref() == Some(&shape_id)
+                    && self.selected_spin.as_deref() == Some(&spin_id) =>
+            {
+                if let Some(clip) = self
+                    .scene
+                    .shapes
+                    .iter()
+                    .find(|s| s.id == shape_id)
+                    .and_then(|s| s.rotation_clips.iter().find(|c| c.id == spin_id))
+                {
+                    self.preview(clip.start_time, clip.start_time + clip.duration);
+                }
+            }
+            PreviewTarget::Fade(shape_id) if self.selected.as_deref() == Some(&shape_id) => {
+                if let Some(index) = self.scene.shapes.iter().position(|s| s.id == shape_id) {
+                    self.preview_fade(index);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A 360° spin at the playhead, or over the chosen drawn move (Electron's Add rotation).
@@ -1456,6 +1564,16 @@ impl Forma {
                 });
             ui.end_row();
         });
+        if ui
+            .checkbox(
+                &mut self.live_animation_preview,
+                "Preview changes automatically",
+            )
+            .changed()
+            && !self.live_animation_preview
+        {
+            self.pending_auto_preview = None;
+        }
         if changed {
             (clip.start_time, clip.duration) = (
                 model::hundredths(clip.start_time),
@@ -1464,8 +1582,19 @@ impl Forma {
             let end = clip.start_time + clip.duration;
             self.scene.duration = self.scene.duration.max(end);
             self.edited();
+            let target = PreviewTarget::Spin(
+                self.scene.shapes[index].id.clone(),
+                self.scene.shapes[index].rotation_clips[at].id.clone(),
+            );
+            self.queue_auto_preview(target, ui.ctx());
+        }
+        if ui.button("Preview").clicked() {
+            self.pending_auto_preview = None;
+            let clip = &self.scene.shapes[index].rotation_clips[at];
+            self.preview(clip.start_time, clip.start_time + clip.duration);
         }
         if ui.button("Delete spin").clicked() {
+            self.pending_auto_preview = None;
             let clip = self.scene.shapes[index].rotation_clips.remove(at);
             (self.selected_spin, self.time) = (None, clip.start_time);
             self.edited();
@@ -1627,6 +1756,16 @@ impl Forma {
             model::hundredths(d.start_time),
             model::hundredths(d.duration),
         );
+        if ui
+            .checkbox(
+                &mut self.live_animation_preview,
+                "Preview changes automatically",
+            )
+            .changed()
+            && !self.live_animation_preview
+        {
+            self.pending_auto_preview = None;
+        }
         let shape = &mut self.scene.shapes[index];
         if shape.disappear.as_ref() != Some(&d) {
             self.scene.duration = self
@@ -1636,8 +1775,17 @@ impl Forma {
                 .max(d.reappear_time.unwrap_or(0.0));
             self.scene.shapes[index].disappear = Some(d);
             self.edited();
+            self.queue_auto_preview(
+                PreviewTarget::Fade(self.scene.shapes[index].id.clone()),
+                ui.ctx(),
+            );
+        }
+        if ui.button("Preview").clicked() {
+            self.pending_auto_preview = None;
+            self.preview_fade(index);
         }
         if ui.button("Delete fade out").clicked() {
+            self.pending_auto_preview = None;
             self.scene.shapes[index].disappear = None;
             self.edited();
         }
@@ -1740,6 +1888,7 @@ impl Forma {
                         face: m.face,
                     },
                 );
+                self.motion_shown = Some((self.scene.shapes[index].id.clone(), m.clone()));
                 (self.time, self.playing) = (m.start_time, false);
             }
         }
@@ -1748,8 +1897,33 @@ impl Forma {
             .clone()
             .filter(|id| list.iter().any(|m| &m.id == id))
         else {
+            self.motion_shown = None;
             return;
         };
+        let current = list.iter().find(|m| m.id == id).unwrap();
+        let shape_id = self.scene.shapes[index].id.clone();
+        let waiting_on_this = self
+            .pending_auto_preview
+            .as_ref()
+            .is_some_and(|(_, target)| {
+                *target == PreviewTarget::Motion(shape_id.clone(), id.clone())
+            });
+        if !waiting_on_this
+            && self.motion_shown.as_ref() != Some(&(shape_id.clone(), current.clone()))
+        {
+            self.motion_edit = (
+                current.start_time,
+                current.duration,
+                motion::Options {
+                    seconds: current.duration,
+                    distance: current.distance,
+                    spin: current.spin,
+                    face: current.face,
+                },
+            );
+            self.motion_shown = Some((shape_id.clone(), current.clone()));
+        }
+        let edit_before = self.motion_edit;
         let (start, length, options) = &mut self.motion_edit;
         egui::Grid::new("forma-motion-edit")
             .num_columns(2)
@@ -1786,20 +1960,55 @@ impl Forma {
                 ui.end_row();
             });
         ui.checkbox(&mut options.face, "Turn to face where it's going");
+        if ui
+            .checkbox(
+                &mut self.live_animation_preview,
+                "Preview changes automatically",
+            )
+            .changed()
+            && !self.live_animation_preview
+        {
+            self.pending_auto_preview = None;
+        }
+        if self.motion_edit != edit_before {
+            self.queue_auto_preview(
+                PreviewTarget::Motion(shape_id.clone(), id.clone()),
+                ui.ctx(),
+            );
+        }
         let (start, length, options) = self.motion_edit;
         ui.horizontal(|ui| {
             if ui.button("Update").clicked() {
+                self.pending_auto_preview = None;
                 match motion::edit(&mut self.scene, index, &id, start, length, options) {
                     Ok(()) => {
                         (self.time, self.playing) = (start, false);
+                        self.motion_shown = motion::motions(&self.scene.shapes[index])
+                            .into_iter()
+                            .find(|m| m.id == id)
+                            .map(|m| (shape_id.clone(), m));
                         self.edited();
+                        if self.live_animation_preview {
+                            self.preview(start, start + length);
+                        }
                     }
                     Err(error) => self.notice = Some(error),
+                }
+            }
+            if ui.button("Preview").clicked() {
+                self.pending_auto_preview = None;
+                if let Some(m) = motion::motions(&self.scene.shapes[index])
+                    .into_iter()
+                    .find(|m| m.id == id)
+                {
+                    self.preview(m.start_time, m.start_time + m.duration);
                 }
             }
             if ui.button("Delete").clicked() {
                 motion::remove(&mut self.scene, index, &id);
                 self.selected_motion = None;
+                self.motion_shown = None;
+                self.pending_auto_preview = None;
                 self.time = start;
                 self.edited();
             }
@@ -3418,6 +3627,34 @@ impl Forma {
             self.show_projects = false;
         }
     }
+
+    fn help_window(&mut self, ui: &mut Ui) {
+        if !self.show_help {
+            return;
+        }
+        let mut close = false;
+        let modal = egui::Modal::new(ui.scope_id().with("forma-help")).show(ui.ctx(), |ui| {
+            ui.set_width(470.0);
+            ui.heading("Make your first animation");
+            ui.add_space(8.0);
+            for step in [
+                "1. Add a layer. Use + Circle, + Text, or + Picture, SVG or video on the left.",
+                "2. Set a moment. Drag the playhead in the timeline, then drag, resize, or recolor the layer. Forma remembers it as a keyframe.",
+                "3. Make it move. Use Move, Spin, Fade, or Drop under the canvas, or set another moment.",
+                "4. Stop-motion. Give a picture an end time, press Next pose after this, and drag the copy.",
+            ] {
+                ui.label(step);
+                ui.add_space(6.0);
+            }
+            ui.separator();
+            ui.label("Press Ctrl + Z to undo and S to split a clip at the playhead. Press play to preview, then Export.");
+            ui.add_space(8.0);
+            close = ui.button("Got it").clicked();
+        });
+        if close || modal.should_close() {
+            self.show_help = false;
+        }
+    }
 }
 
 impl CanopyApp for Forma {
@@ -3476,6 +3713,7 @@ impl CanopyApp for Forma {
             }
         }
         let before = self.scene.clone();
+        self.run_auto_preview(ui.ctx());
         self.automation(ui.ctx(), host);
         if host.focused() {
             let undo = ui.input(|i| {
@@ -3583,7 +3821,10 @@ impl CanopyApp for Forma {
         ui.painter()
             .rect_filled(right, 8.0, Color32::from_rgb(31, 37, 48));
         ui.scope_builder(UiBuilder::new().max_rect(left.shrink(8.0)), |ui| {
-            self.layers(ui)
+            egui::ScrollArea::vertical()
+                .id_salt("forma-layers-panel")
+                .auto_shrink(false)
+                .show(ui, |ui| self.layers(ui));
         });
         ui.scope_builder(UiBuilder::new().max_rect(canvas), |ui| self.canvas(ui));
         ui.scope_builder(UiBuilder::new().max_rect(right.shrink(8.0)), |ui| {
@@ -3597,6 +3838,7 @@ impl CanopyApp for Forma {
         let timeline = Rect::from_min_max(pos2(rect.left(), middle.bottom() + 6.0), rect.max);
         ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| self.timeline(ui));
         self.projects_window(ui);
+        self.help_window(ui);
         self.export_window(ui, host);
         self.svg_window(ui);
         if !self.suppress_history && self.scene != before {
@@ -3718,5 +3960,34 @@ fn hex(value: &str, alpha: u8) -> Color32 {
         Color32::from_rgba_unmultiplied(channel(1), channel(3), channel(5), alpha)
     } else {
         Color32::from_rgba_unmultiplied(170, 160, 206, alpha)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fade_preview_reaches_reappearance_and_stops_at_scene_end() {
+        let mut scene = Scene::example("test".into());
+        let fade = model::Disappear {
+            start_time: 1.0,
+            duration: 0.5,
+            reappear_mode: "time".into(),
+            reappear_time: Some(2.5),
+            trigger_shape_id: None,
+            trigger_clip_id: None,
+            extra: Default::default(),
+        };
+        scene.shapes[0].disappear = Some(fade);
+        assert_eq!(
+            fade_preview_range(&scene, &scene.shapes[0]),
+            Some((0.75, 2.75))
+        );
+        scene.shapes[0].disappear.as_mut().unwrap().reappear_time = Some(4.0);
+        assert_eq!(
+            fade_preview_range(&scene, &scene.shapes[0]),
+            Some((0.75, 4.0))
+        );
     }
 }
