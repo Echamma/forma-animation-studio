@@ -1179,6 +1179,95 @@ pub fn resized_pose(
     }
 }
 
+/// Where Arrange lines layers up (Electron's `model/arrange.js`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    Left,
+    Center,
+    Right,
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// The poses' centers lined up on `edge` of their unrotated boxes taken together (Electron's `align`).
+pub fn align(poses: &[Pose], edge: Edge) -> Vec<(f32, f32)> {
+    let across = matches!(edge, Edge::Left | Edge::Center | Edge::Right);
+    let at = |p: &Pose| if across { (p.x, p.w) } else { (p.y, p.h) };
+    let low = poses
+        .iter()
+        .map(|p| at(p).0 - at(p).1 / 2.0)
+        .fold(f32::INFINITY, f32::min);
+    let high = poses
+        .iter()
+        .map(|p| at(p).0 + at(p).1 / 2.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    poses
+        .iter()
+        .map(|p| {
+            let size = at(p).1;
+            let value = match edge {
+                Edge::Left | Edge::Top => low + size / 2.0,
+                Edge::Right | Edge::Bottom => high - size / 2.0,
+                Edge::Center | Edge::Middle => (low + high) / 2.0,
+            };
+            if across { (value, p.y) } else { (p.x, value) }
+        })
+        .collect()
+}
+
+/// The poses' centers spaced with equal gaps across (or, not `across`, down), the first and last staying where they
+/// are (Electron's `distribute`).
+pub fn distribute(poses: &[Pose], across: bool) -> Vec<(f32, f32)> {
+    let at = |p: &Pose| if across { (p.x, p.w) } else { (p.y, p.h) };
+    let mut result: Vec<(f32, f32)> = poses.iter().map(|p| (p.x, p.y)).collect();
+    if poses.len() < 2 {
+        return result;
+    }
+    let mut order: Vec<usize> = (0..poses.len()).collect();
+    order.sort_by(|&a, &b| at(&poses[a]).0.total_cmp(&at(&poses[b]).0));
+    let (first, last) = (at(&poses[order[0]]), at(&poses[*order.last().unwrap()]));
+    let span = last.0 + last.1 / 2.0 - (first.0 - first.1 / 2.0);
+    let gap = (span - poses.iter().map(|p| at(p).1).sum::<f32>()) / (poses.len() - 1) as f32;
+    let mut edge = first.0 - first.1 / 2.0;
+    for i in order {
+        let (_, size) = at(&poses[i]);
+        let value = edge + size / 2.0;
+        if across {
+            result[i].0 = value;
+        } else {
+            result[i].1 = value;
+        }
+        edge += size + gap;
+    }
+    result
+}
+
+/// Where Electron's Enter from outside puts a layer: just past one side of the scene, by 5 % of its shorter side (at
+/// least 40 px).
+pub fn outside(pose: Pose, side: Edge, width: f32, height: f32) -> Pose {
+    let gap = (width.min(height) * 0.05).max(40.0);
+    match side {
+        Edge::Left => Pose {
+            x: -pose.w / 2.0 - gap,
+            ..pose
+        },
+        Edge::Right => Pose {
+            x: width + pose.w / 2.0 + gap,
+            ..pose
+        },
+        Edge::Top => Pose {
+            y: -pose.h / 2.0 - gap,
+            ..pose
+        },
+        Edge::Bottom => Pose {
+            y: height + pose.h / 2.0 + gap,
+            ..pose
+        },
+        Edge::Center | Edge::Middle => pose,
+    }
+}
+
 fn value_f32(map: &Map<String, Value>, field: &str, fallback: f32) -> f32 {
     map.get(field)
         .and_then(Value::as_f64)
@@ -1884,5 +1973,59 @@ mod tests {
         assert_eq!(text.extra["text"], "Your text");
         assert!(text.extra["textWidth"].as_f64().unwrap() > 0.0);
         assert!(text.extra["fontSize"].as_f64().unwrap() > 0.0);
+    }
+
+    fn at(x: f32, y: f32, w: f32, h: f32) -> Pose {
+        Pose {
+            x,
+            y,
+            w,
+            h,
+            r: 0.0,
+            o: 100.0,
+        }
+    }
+
+    #[test]
+    fn arrange_aligns_and_spaces_like_electron() {
+        // Electron's tests/unit/arrange.test.js, with its poses and numbers.
+        let poses = [
+            at(100.0, 100.0, 40.0, 20.0),
+            at(300.0, 160.0, 100.0, 60.0),
+            at(180.0, 40.0, 20.0, 80.0),
+        ];
+        let xs = |centers: Vec<(f32, f32)>| centers.iter().map(|c| c.0).collect::<Vec<_>>();
+        let ys = |centers: Vec<(f32, f32)>| centers.iter().map(|c| c.1).collect::<Vec<_>>();
+        let lefts: Vec<f32> = align(&poses, Edge::Left)
+            .iter()
+            .zip(&poses)
+            .map(|(c, p)| c.0 - p.w / 2.0)
+            .collect();
+        assert_eq!(lefts, [80.0, 80.0, 80.0]);
+        assert_eq!(xs(align(&poses, Edge::Right)), [330.0, 300.0, 340.0]);
+        assert_eq!(ys(align(&poses, Edge::Bottom)), [180.0, 160.0, 150.0]);
+        assert_eq!(xs(align(&poses, Edge::Bottom)), [100.0, 300.0, 180.0]);
+        assert_eq!(xs(align(&poses, Edge::Center)), [215.0, 215.0, 215.0]);
+        assert_eq!(ys(align(&poses, Edge::Middle)), [95.0, 95.0, 95.0]);
+        let across = distribute(&poses, true);
+        assert_eq!((across[0].0, across[1].0), (100.0, 300.0));
+        let gaps = (
+            across[2].0 - 10.0 - (across[0].0 + 20.0),
+            across[1].0 - 50.0 - (across[2].0 + 10.0),
+        );
+        assert!((gaps.0 - gaps.1).abs() < 1e-3, "{gaps:?}");
+        assert_eq!(ys(across), [100.0, 160.0, 40.0]);
+    }
+
+    #[test]
+    fn enter_from_outside_puts_a_layer_past_each_side() {
+        let pose = at(480.0, 300.0, 100.0, 60.0);
+        // 5 % of 600 is 30, so the gap is 40.
+        assert_eq!(outside(pose, Edge::Left, 960.0, 600.0).x, -90.0);
+        assert_eq!(outside(pose, Edge::Right, 960.0, 600.0).x, 1050.0);
+        assert_eq!(outside(pose, Edge::Top, 960.0, 600.0).y, -70.0);
+        assert_eq!(outside(pose, Edge::Bottom, 960.0, 600.0).y, 670.0);
+        // A portrait scene's gap is 5 % of 1080.
+        assert_eq!(outside(pose, Edge::Left, 1080.0, 1920.0).x, -104.0);
     }
 }

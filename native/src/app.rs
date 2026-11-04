@@ -197,7 +197,12 @@ pub struct Forma {
     /// Draws the preview the way exports draw frames. Made again when the scene's pictures change.
     renderer: Option<render::Renderer>,
     /// The preview picture, and what it shows: the scene, the time, its size in pixels, and which video frames.
-    preview: Option<(TextureHandle, Scene, f64, [u32; 2], u64)>,
+    preview: Option<(TextureHandle, Scene, f64, (render::View, bool), u64)>,
+    /// The canvas's zoom (1 fits the space, 0.2-5) and how far it's panned from the middle, in points.
+    zoom: f32,
+    pan: Vec2,
+    /// The canvas bar's scene button asked for Scene settings.
+    open_scene: bool,
     videos: Videos,
     sound: Sound,
     undo: Vec<Scene>,
@@ -229,6 +234,8 @@ pub struct Forma {
     pending_import: Vec<std::path::PathBuf>,
     /// Pictures picked as stop-motion poses, in order.
     pending_poses: Vec<std::path::PathBuf>,
+    /// The start screen's canvas shape for a new project.
+    start_portrait: bool,
     /// Whether editing a clip on a track shows the clip before it faintly (Electron's onion skin, on by default).
     onion_skin: bool,
     /// The SVG editor's markup for a layer, and its preview (by the markup's hash).
@@ -248,10 +255,12 @@ pub struct Forma {
 
 impl Forma {
     pub fn new(place: Place) -> Self {
-        let scene = storage::list(&place)
+        // The latest project opens again; a first launch (nothing to open) shows the start screen, as in Electron.
+        let restored = storage::list(&place)
             .first()
-            .and_then(|doc| storage::load_document(&place, &doc.id).ok())
-            .unwrap_or_else(|| Scene::empty(new_id()));
+            .and_then(|doc| storage::load_document(&place, &doc.id).ok());
+        let first_launch = restored.is_none();
+        let scene = restored.unwrap_or_else(|| Scene::empty(new_id()));
         Self {
             place,
             scene,
@@ -268,13 +277,16 @@ impl Forma {
             clip_shown: (0.0, None),
             clip_in_edit: String::new(),
             clip_out_edit: String::new(),
-            show_projects: false,
+            show_projects: first_launch,
             show_help: false,
             show_export: false,
             export_kind: ExportKind::Video,
             video_settings: video::Settings::default(),
             renderer: None,
             preview: None,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            open_scene: false,
             videos: Videos::default(),
             sound: Sound::default(),
             undo: Vec::new(),
@@ -296,6 +308,7 @@ impl Forma {
             preview_end: None,
             pending_import: Vec::new(),
             pending_poses: Vec::new(),
+            start_portrait: false,
             onion_skin: true,
             svg_edit: None,
             svg_preview: None,
@@ -345,6 +358,7 @@ impl Forma {
         self.clip_edit_id = None;
         self.renderer = None;
         self.preview = None;
+        (self.zoom, self.pan) = (1.0, Vec2::ZERO);
         self.videos = Videos::default();
         self.undo.clear();
         self.redo.clear();
@@ -783,8 +797,10 @@ impl Forma {
     }
 
     fn scene_settings(&mut self, ui: &mut Ui) {
-        egui::CollapsingHeader::new("Scene settings")
+        let open = std::mem::take(&mut self.open_scene).then_some(true);
+        let header = egui::CollapsingHeader::new("Scene settings")
             .id_salt("forma-scene-settings")
+            .open(open)
             .show(ui, |ui| {
                 let (mut width, mut height) = (self.scene.width as u32, self.scene.height as u32);
                 // Wrapped: the inspector is narrower than the three sizes side by side.
@@ -812,7 +828,47 @@ impl Forma {
                     self.scene.resize(width as f32, height as f32);
                     self.edited();
                 }
-                ui.label("Background (hex)");
+                // Electron's background swatches, a custom color, and the color as text.
+                ui.label("Background");
+                ui.horizontal_wrapped(|ui| {
+                    for (bg, name) in [
+                        ("#f4f0e8", "Warm white"),
+                        ("#141617", "Charcoal"),
+                        ("#d2f583", "Lime"),
+                        ("#aaa0ce", "Lavender"),
+                        ("#ed795e", "Coral"),
+                    ] {
+                        let (rect, response) =
+                            ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                        let chosen = self.scene.bg.eq_ignore_ascii_case(bg);
+                        ui.painter().circle(
+                            rect.center(),
+                            10.0,
+                            hex(bg, 255),
+                            Stroke::new(
+                                if chosen { 2.0 } else { 1.0 },
+                                if chosen { color::SUN } else { color::HAIRLINE },
+                            ),
+                        );
+                        if response
+                            .on_hover_text(format!("{name} background"))
+                            .clicked()
+                            && !chosen
+                        {
+                            self.scene.bg = bg.into();
+                            self.edited();
+                        }
+                    }
+                    let current = hex(&self.scene.bg, 255);
+                    let mut rgb = [current.r(), current.g(), current.b()];
+                    if egui::color_picker::color_edit_button_srgb(ui, &mut rgb)
+                        .on_hover_text("Custom")
+                        .changed()
+                    {
+                        self.scene.bg = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                        self.edited();
+                    }
+                });
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.scene.bg)
@@ -838,6 +894,135 @@ impl Forma {
                     self.edited();
                 }
             });
+        if open.is_some() {
+            header.header_response.scroll_to_me(Some(egui::Align::TOP));
+        }
+    }
+
+    /// The selected layers, in the order they were picked (the main one included once).
+    fn selection(&self) -> Vec<usize> {
+        let mut ids: Vec<&String> = self.multi_selected.iter().collect();
+        if let Some(main) = &self.selected {
+            if !ids.contains(&main) {
+                ids.push(main);
+            }
+        }
+        ids.iter()
+            .filter_map(|id| self.scene.shapes.iter().position(|s| &&s.id == id))
+            .collect()
+    }
+
+    /// Keys each layer at the playhead with its center moved to `centers` (Electron's arrange `place`). Text that
+    /// follows a layer goes after the layers, so it keeps up with where they went.
+    fn place_centers(&mut self, mut layers: Vec<(usize, (f32, f32))>) {
+        layers.sort_by_key(|(i, _)| {
+            let shape = &self.scene.shapes[*i];
+            shape.kind == "text" && shape.extra.contains_key("linkId")
+        });
+        self.playing = false;
+        let count = layers.len();
+        for (index, (x, y)) in layers {
+            let pose = self
+                .scene
+                .editable_pose(&self.scene.shapes[index], self.time);
+            self.scene.set_pose(index, self.time, Pose { x, y, ..pose });
+        }
+        self.edited();
+        self.notice = Some(format!("Arranged {count} layers at {:.2} s", self.time));
+    }
+
+    /// Electron's Arrange: with several layers selected, line them up or space them evenly at the playhead.
+    fn arrange_panel(&mut self, ui: &mut Ui) {
+        let layers = self.selection();
+        if layers.len() < 2 {
+            return;
+        }
+        ui.label(
+            egui::RichText::new(format!("Arrange · {} layers", layers.len()))
+                .font(font::bold(14.0))
+                .color(color::INK),
+        );
+        let poses: Vec<Pose> = layers
+            .iter()
+            .map(|&i| self.scene.render_pose(&self.scene.shapes[i], self.time))
+            .collect();
+        let mut centers = None;
+        ui.horizontal_wrapped(|ui| {
+            for (label, edge) in [
+                ("Left", model::Edge::Left),
+                ("Center", model::Edge::Center),
+                ("Right", model::Edge::Right),
+                ("Top", model::Edge::Top),
+                ("Middle", model::Edge::Middle),
+                ("Bottom", model::Edge::Bottom),
+            ] {
+                if ui
+                    .button(label)
+                    .on_hover_text(format!("Align {}", label.to_lowercase()))
+                    .clicked()
+                {
+                    centers = Some(model::align(&poses, edge));
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (label, across) in [("Space evenly across", true), ("Space evenly down", false)] {
+                if ui
+                    .add_enabled(layers.len() > 2, egui::Button::new(label))
+                    .on_disabled_hover_text("Select three layers or more")
+                    .clicked()
+                {
+                    centers = Some(model::distribute(&poses, across));
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Shift-click layers on the canvas, timeline, or Layers list to select several. Position edits move them together.",
+            )
+            .font(font::ui(11.0))
+            .color(color::INK_MUTED),
+        );
+        if let Some(centers) = centers {
+            self.place_centers(layers.into_iter().zip(centers).collect());
+        }
+        ui.separator();
+    }
+
+    /// Electron's Enter from outside: the layer just outside one side of the canvas at the playhead.
+    fn outside_panel(&mut self, ui: &mut Ui, index: usize) {
+        ui.separator();
+        ui.label(
+            egui::RichText::new("Enter from outside")
+                .font(font::bold(13.0))
+                .color(color::INK),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for (label, side) in [
+                ("Left", model::Edge::Left),
+                ("Right", model::Edge::Right),
+                ("Above", model::Edge::Top),
+                ("Below", model::Edge::Bottom),
+            ] {
+                if ui.button(label).clicked() {
+                    self.playing = false;
+                    let pose = self
+                        .scene
+                        .editable_pose(&self.scene.shapes[index], self.time);
+                    let placed = model::outside(pose, side, self.scene.width, self.scene.height);
+                    self.scene.set_pose(index, self.time, placed);
+                    self.edited();
+                    self.notice = Some(format!("Placed outside at {:.2} s", self.time));
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Places the layer just outside the canvas at the playhead. Move it inside at a later moment to make it walk in.",
+            )
+            .font(font::ui(11.0))
+            .color(color::INK_MUTED),
+        );
     }
 
     fn clip_fields(&mut self, ui: &mut Ui, index: usize) {
@@ -938,6 +1123,7 @@ impl Forma {
 
     fn inspector(&mut self, ui: &mut Ui) {
         self.scene_settings(ui);
+        self.arrange_panel(ui);
         ui.label(
             egui::RichText::new("Layer")
                 .font(font::bold(14.0))
@@ -1112,6 +1298,7 @@ impl Forma {
             changed = true;
         }
         let mut posed = false;
+        let before = pose;
         for (label, value, range) in [
             ("X", &mut pose.x, -4000.0..=4000.0),
             ("Y", &mut pose.y, -4000.0..=4000.0),
@@ -1129,6 +1316,36 @@ impl Forma {
         if posed || added {
             self.scene.set_pose(index, self.time, pose);
             changed = true;
+        }
+        if posed {
+            // With several layers selected, X and Y move them all by the same amount; other values apply to each.
+            let mut others: Vec<usize> = self
+                .selection()
+                .into_iter()
+                .filter(|&i| i != index)
+                .collect();
+            others.sort_by_key(|&i| {
+                let shape = &self.scene.shapes[i];
+                shape.kind == "text" && shape.extra.contains_key("linkId")
+            });
+            for other in others {
+                let mut p = self
+                    .scene
+                    .editable_pose(&self.scene.shapes[other], self.time);
+                p.x += pose.x - before.x;
+                p.y += pose.y - before.y;
+                for (value, (now, was)) in [
+                    (&mut p.w, (pose.w, before.w)),
+                    (&mut p.h, (pose.h, before.h)),
+                    (&mut p.r, (pose.r, before.r)),
+                    (&mut p.o, (pose.o, before.o)),
+                ] {
+                    if now != was {
+                        *value = now;
+                    }
+                }
+                self.scene.set_pose(other, self.time, p);
+            }
         }
         let shape = &mut self.scene.shapes[index];
         ui.label(format!("{} keyframes", shape.keys.len()));
@@ -1192,6 +1409,7 @@ impl Forma {
         self.motion_panel(ui, index);
         self.spin_panel(ui, index);
         self.fade_panel(ui, index);
+        self.outside_panel(ui, index);
     }
 
     /// Electron's drop: the layer falls onto where it is from above the canvas, squashes and bounces, over the
@@ -1435,8 +1653,10 @@ impl Forma {
             vec2(area.width().min(420.0), 34.0),
         );
         ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
+            // Darker than the canvas's surroundings, with an edge, so it reads as a bar over them.
             egui::Frame::new()
-                .fill(Color32::from_rgb(31, 37, 48))
+                .fill(Color32::from_rgb(16, 20, 27))
+                .stroke(Stroke::new(1.0, color::HAIRLINE))
                 .corner_radius(17.0)
                 .inner_margin(egui::Margin::symmetric(10, 4))
                 .show(ui, |ui| {
@@ -2019,13 +2239,99 @@ impl Forma {
         });
     }
 
+    /// Zooms the canvas by `factor` (20 %-500 %), keeping the scene point under `at` where it is (Electron's
+    /// `setWorkspaceZoom`).
+    fn zoom_by(&mut self, factor: f32, at: Pos2, viewport: Rect) {
+        let old = self.zoom;
+        self.zoom = (self.zoom * factor).clamp(0.2, 5.0);
+        let from_center = at - viewport.center();
+        self.pan = from_center - (from_center - self.pan) * (self.zoom / old);
+    }
+
     fn canvas(&mut self, ui: &mut Ui) {
-        let area = ui.max_rect().shrink(14.0);
-        let scale = (area.width() / self.scene.width)
-            .min(area.height() / self.scene.height)
-            .max(0.01);
+        let viewport = ui.max_rect();
+        self.canvas_view(ui);
+        self.canvas_bar(ui, viewport);
+    }
+
+    /// Electron's canvas bar, over the top of the canvas: the scene's shape (opens Scene settings), a hint, and zoom.
+    fn canvas_bar(&mut self, ui: &mut Ui, viewport: Rect) {
+        let bar = Rect::from_min_size(
+            viewport.min + vec2(8.0, 8.0),
+            vec2(viewport.width() - 16.0, 26.0),
+        );
+        ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
+            ui.horizontal(|ui| {
+                let (w, h) = (self.scene.width, self.scene.height);
+                let shape = if w < h {
+                    "Portrait"
+                } else if w > h {
+                    "Landscape"
+                } else {
+                    "Square"
+                };
+                let playing = if self.playing { " · Playing" } else { "" };
+                if ui
+                    .button(format!("{shape} · {w} × {h}{playing}"))
+                    .on_hover_text("Canvas size, length, and background")
+                    .clicked()
+                {
+                    self.open_scene = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("+").on_hover_text("Zoom in").clicked() {
+                        self.zoom_by(1.25, viewport.center(), viewport);
+                    }
+                    if ui
+                        .small_button(format!("{:.0}%", self.zoom * 100.0))
+                        .on_hover_text("Reset zoom and position")
+                        .clicked()
+                    {
+                        (self.zoom, self.pan) = (1.0, Vec2::ZERO);
+                    }
+                    if ui.small_button("−").on_hover_text("Zoom out").clicked() {
+                        self.zoom_by(0.8, viewport.center(), viewport);
+                    }
+                    if ui.available_width() > 330.0 {
+                        ui.label(
+                            egui::RichText::new(
+                                "Scroll to zoom · middle-drag to pan · only the canvas is exported",
+                            )
+                            .font(font::ui(11.0))
+                            .color(color::INK_MUTED),
+                        );
+                    }
+                });
+            });
+        });
+    }
+
+    fn canvas_view(&mut self, ui: &mut Ui) {
+        let viewport = ui.max_rect();
+        let area = viewport.shrink(14.0);
+        // As Electron sizes its artboard: at 100 % it fits the space, but never past one point a scene pixel.
+        let fit = self
+            .scene
+            .width
+            .min((viewport.width() - 24.0).max(200.0) * 0.92)
+            .min(
+                (viewport.height() - 24.0).max(180.0) * 0.92 * self.scene.width / self.scene.height,
+            )
+            / self.scene.width;
+        // Scroll to zoom, the zoom buttons, middle-drag to pan.
+        // Only over the canvas itself: not through a menu or dialog lying on top of it.
+        let pointer = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|p| viewport.contains(*p) && ui.ctx().layer_id_at(*p) == Some(ui.layer_id()));
+        if let Some(p) = pointer {
+            let factor = ui.input(|i| i.zoom_delta() * (i.smooth_scroll_delta.y * 0.00375).exp());
+            if (factor - 1.0).abs() > 1e-4 {
+                self.zoom_by(factor, p, viewport);
+            }
+        }
+        let scale = (fit * self.zoom).max(0.01);
         let canvas = Rect::from_center_size(
-            area.center(),
+            viewport.center() + self.pan,
             vec2(self.scene.width * scale, self.scene.height * scale),
         );
         if self
@@ -2036,16 +2342,32 @@ impl Forma {
             self.renderer = Some(render::Renderer::new(&self.scene, &self.place));
         }
         let renderer = self.renderer.as_ref().unwrap();
-        // Drawn at the screen's pixel size, again only when the scene, the time or the size changes.
+        // The frame and its surroundings (Electron's pasteboard: 55 % of the longer side around it), as far as they're
+        // in view, drawn at the screen's pixel size, again only when the scene, the time or the view changes.
         let pixels = ui.ctx().pixels_per_point();
-        let size = [
-            (canvas.width() * pixels).round() as u32,
-            (canvas.height() * pixels).round() as u32,
-        ];
-        let scale = size[0] as f32 / self.scene.width;
+        let margin = (self.scene.width.max(self.scene.height) * 0.55).round() * scale;
+        let board = canvas.expand(margin);
+        let shown = board.intersect(viewport);
+        let snapped = Rect::from_min_max(
+            (shown.min.to_vec2() * pixels).round().to_pos2() / pixels,
+            (shown.max.to_vec2() * pixels).round().to_pos2() / pixels,
+        );
+        let pixel_scale = scale * pixels;
+        let view = (
+            (
+                (snapped.left() - canvas.left()) / scale,
+                (snapped.top() - canvas.top()) / scale,
+            ),
+            pixel_scale,
+            (
+                (snapped.width() * pixels).round().max(1.0) as u32,
+                (snapped.height() * pixels).round().max(1.0) as u32,
+            ),
+        );
+        let clip = self.playing;
         if self
             .videos
-            .update(&self.scene, renderer, self.time, self.playing, scale)
+            .update(&self.scene, renderer, self.time, self.playing, pixel_scale)
         {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
@@ -2069,10 +2391,14 @@ impl Forma {
             .preview
             .as_ref()
             .is_none_or(|(_, scene, time, drawn, shown)| {
-                *drawn != size || *time != self.time || *scene != *display || *shown != generation
+                *drawn != (view, clip)
+                    || *time != self.time
+                    || *scene != *display
+                    || *shown != generation
             });
         if stale {
-            if let Some(pixmap) = renderer.preview(&display, self.time, scale, &self.videos.frames)
+            if let Some(pixmap) =
+                renderer.view(&display, self.time, view, clip, &self.videos.frames)
             {
                 let image = egui::ColorImage::from_rgba_premultiplied(
                     [pixmap.width() as usize, pixmap.height() as usize],
@@ -2081,8 +2407,12 @@ impl Forma {
                 match &mut self.preview {
                     Some((texture, scene, time, drawn, shown)) => {
                         texture.set(image, TextureOptions::LINEAR);
-                        (*scene, *time, *drawn, *shown) =
-                            (display.clone().into_owned(), self.time, size, generation);
+                        (*scene, *time, *drawn, *shown) = (
+                            display.clone().into_owned(),
+                            self.time,
+                            (view, clip),
+                            generation,
+                        );
                     }
                     None => {
                         let texture =
@@ -2092,7 +2422,7 @@ impl Forma {
                             texture,
                             display.clone().into_owned(),
                             self.time,
-                            size,
+                            (view, clip),
                             generation,
                         ));
                     }
@@ -2100,12 +2430,14 @@ impl Forma {
             }
         }
         // Selection handles can reach past the canvas, but not over the toolbar or the panels.
-        let painter = ui.painter().with_clip_rect(ui.max_rect());
-        painter.rect_filled(area, 10.0, Color32::from_rgb(24, 29, 37));
+        let painter = ui.painter().with_clip_rect(viewport);
+        painter.rect_filled(viewport, 10.0, Color32::from_rgb(24, 29, 37));
+        painter.rect_filled(board, 6.0, Color32::from_rgb(33, 39, 50));
+        painter.rect_filled(canvas.expand(1.0), 2.0, Color32::from_black_alpha(90));
         match &self.preview {
             Some((texture, ..)) => painter.image(
                 texture.id(),
-                canvas,
+                snapped,
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                 Color32::WHITE,
             ),
@@ -2208,11 +2540,20 @@ impl Forma {
             painter.circle_stroke(knob_at, 4.5, Stroke::new(1.5, color::SUN));
             rotate_at = Some(knob_at);
         }
+        // All of the view takes clicks and drags: layers can be picked up outside the frame.
         let response = ui.interact(
-            canvas.expand(48.0).intersect(ui.max_rect()),
+            viewport,
             ui.scope_id().with("forma-canvas"),
             Sense::click_and_drag(),
         );
+        // The middle button pans, whatever it's over (Electron's workspace pan).
+        if ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle)) {
+            if response.dragged_by(egui::PointerButton::Middle) {
+                self.pan += response.drag_delta();
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            return;
+        }
         let to_screen =
             |p: motion::Point| pos2(canvas.left() + p.x * scale, canvas.top() + p.y * scale);
         // The selected move's path, and one being drawn.
@@ -3605,29 +3946,199 @@ impl Forma {
         }
     }
 
+    /// A new project as Electron's start screen makes one: the example shapes, or an empty canvas, in the shape
+    /// picked there (the example is scaled into portrait the way changing the format scales a scene).
+    fn new_project(&mut self, example: bool) {
+        let id = new_id();
+        let mut scene = if example {
+            Scene::example(id)
+        } else {
+            Scene::empty(id)
+        };
+        if self.start_portrait {
+            scene.resize(1080.0, 1920.0);
+        }
+        self.open(scene);
+        self.edited();
+    }
+
+    /// Electron's start screen ("What would you like to make?"): the canvas shape, three ways to begin, the projects
+    /// saved here, and Open a file. It opens on a first launch and from Projects.
     fn projects_window(&mut self, ui: &mut Ui) {
         if !self.show_projects {
             return;
         }
-        let mut opened = None;
+        enum Choice {
+            Shapes,
+            StopMotion,
+            Empty,
+            Open(String),
+            File,
+            Back,
+        }
+        let mut choice = None;
+        let current = self.scene.project_id.clone();
         let modal = egui::Modal::new(ui.scope_id().with("forma-projects")).show(ui.ctx(), |ui| {
-            ui.set_width(350.0);
-            ui.heading("Forma projects");
-            for doc in storage::list(&self.place) {
-                if ui
-                    .button(format!("{}  ·  {}", doc.name, doc.detail))
-                    .clicked()
-                {
-                    opened = Some(doc.id);
+            ui.set_width(620.0_f32.min(ui.ctx().content_rect().width() - 60.0));
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.heading("What would you like to make?");
+                    ui.label(
+                        egui::RichText::new(
+                            "Pick a starting point. You can mix shapes, text, pictures, and video in any project.",
+                        )
+                        .color(color::INK_MUTED),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    if ui.button("Back to the editor").clicked() {
+                        choice = Some(Choice::Back);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.start_portrait, false, "Landscape");
+                ui.selectable_value(&mut self.start_portrait, true, "Portrait for phones");
+            });
+            ui.add_space(8.0);
+            ui.columns(3, |columns| {
+                for (column, (title, about, pick)) in columns.iter_mut().zip([
+                    (
+                        "Animate shapes",
+                        "Move, spin, and fade shapes and text. Forma fills in the motion between the moments you set.",
+                        Choice::Shapes,
+                    ),
+                    (
+                        "Stop-motion from pictures",
+                        "Pick your drawings in order. Each becomes a pose that shows for half a second, like a flip book.",
+                        Choice::StopMotion,
+                    ),
+                    (
+                        "Start from an empty canvas",
+                        "Add your own shapes, text, pictures, or video.",
+                        Choice::Empty,
+                    ),
+                ]) {
+                    let card = egui::Frame::new()
+                        .fill(color::VEIL)
+                        .corner_radius(10.0)
+                        .inner_margin(12.0)
+                        .show(column, |ui| {
+                            ui.set_min_height(96.0);
+                            // Left-aligned: the columns' justified layout would spread the words out.
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.label(egui::RichText::new(title).font(font::bold(14.0)).color(color::INK));
+                                ui.label(egui::RichText::new(about).font(font::ui(12.0)).color(color::INK_MUTED));
+                            });
+                        })
+                        .response
+                        .interact(Sense::click())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if card.hovered() {
+                        column.painter().rect_stroke(
+                            card.rect,
+                            10.0,
+                            Stroke::new(1.5, color::SUN),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if card.clicked() {
+                        choice = Some(pick);
+                    }
+                }
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Your projects").font(font::bold(14.0)).color(color::INK));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Open a file")
+                        .on_hover_text("A .forma file or an editable JSON project")
+                        .clicked()
+                    {
+                        choice = Some(Choice::File);
+                    }
+                });
+            });
+            let projects = storage::list(&self.place);
+            if projects.is_empty() {
+                ui.label(
+                    egui::RichText::new("Nothing saved yet. Projects appear here as you work.")
+                        .color(color::INK_MUTED),
+                );
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("forma-start-projects")
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for doc in projects {
+                        let open_now = if doc.id == current { " · open now" } else { "" };
+                        let text = format!("{}{open_now}  ·  {}  ·  {}", doc.name, doc.detail, saved_ago(doc.saved_at));
+                        if ui
+                            .add(egui::Button::new(text).min_size(vec2(ui.available_width(), 26.0)))
+                            .clicked()
+                        {
+                            choice = Some(Choice::Open(doc.id));
+                        }
+                    }
+                });
+        });
+        let close = match choice {
+            Some(Choice::Shapes) => {
+                self.new_project(true);
+                self.notice = Some("New project created".into());
+                true
+            }
+            Some(Choice::Empty) => {
+                self.new_project(false);
+                self.notice =
+                    Some("Empty project created. Add something with the tools on the left.".into());
+                true
+            }
+            Some(Choice::StopMotion) => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Pick the poses in order")
+                    .add_filter("Pictures and SVG", &["png", "jpg", "jpeg", "webp", "svg"])
+                    .pick_files();
+                match picked {
+                    Some(files) if !files.is_empty() => {
+                        self.new_project(false);
+                        self.pending_poses.extend(files);
+                        true
+                    }
+                    _ => false,
                 }
             }
-        });
-        if let Some(id) = opened {
-            if let Ok(scene) = storage::load_document(&self.place, &id) {
-                self.open(scene);
+            Some(Choice::Open(id)) => {
+                if id != current {
+                    match storage::load_document(&self.place, &id) {
+                        Ok(scene) => {
+                            self.open(scene);
+                            self.notice = Some("Project opened".into());
+                        }
+                        Err(error) => self.notice = Some(error),
+                    }
+                }
+                true
             }
-            self.show_projects = false;
-        } else if modal.should_close() {
+            Some(Choice::File) => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Open a Forma project")
+                    .add_filter("Forma projects", &["forma", "json"])
+                    .pick_file();
+                match picked {
+                    Some(file) => {
+                        self.pending_import.push(file);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Some(Choice::Back) => true,
+            None => modal.should_close(),
+        };
+        if close {
             self.show_projects = false;
         }
     }
@@ -3743,6 +4254,14 @@ impl CanopyApp for Forma {
                         .map(|shape| shape.id.clone())
                         .collect();
                     self.selected = self.multi_selected.last().cloned();
+                }
+                // Escape stops drawing a move, or goes back from several selected layers to one (Electron's clips.js).
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if self.motion_mode.is_some() {
+                        (self.motion_mode, self.motion_draft) = (None, None);
+                    } else if self.multi_selected.len() > 1 {
+                        self.multi_selected = self.selected.clone().into_iter().collect();
+                    }
                 }
                 let action = ui.input(|i| {
                     let command = i.modifiers.command;
@@ -3968,6 +4487,21 @@ impl CanopyApp for Forma {
     fn title(&self) -> String {
         self.scene.project_name.clone()
     }
+}
+
+/// When a project was saved, said the way people say it ("just now", "5 minutes ago", "3 days ago").
+fn saved_ago(saved_at: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let minutes = now.saturating_sub(saved_at) / 60_000;
+    let (amount, unit) = match minutes {
+        0 => return "just now".into(),
+        m if m < 60 => (m, "minute"),
+        m if m < 60 * 24 => (m / 60, "hour"),
+        m => (m / (60 * 24), "day"),
+    };
+    format!("{amount} {unit}{} ago", if amount == 1 { "" } else { "s" })
 }
 
 fn hex(value: &str, alpha: u8) -> Color32 {

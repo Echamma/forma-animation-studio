@@ -14,6 +14,10 @@ use tiny_skia::{
 /// Video layers' frames at one moment, by layer id.
 pub type Frames = HashMap<String, Pixmap>;
 
+/// What the editor sees (see `Renderer::view`): the scene point at the top-left, pixels to a scene pixel, and the
+/// size in pixels.
+pub type View = ((f32, f32), f32, (u32, u32));
+
 pub struct Renderer {
     /// Pictures, SVGs (drawn once), and video posters, by layer id.
     images: HashMap<String, Pixmap>,
@@ -173,6 +177,51 @@ impl Renderer {
         self.draw(scene, t, size, false, frames).ok()
     }
 
+    /// The editor's view of the scene and its surroundings (Electron's pasteboard): `size` pixels whose top-left is
+    /// at `origin` in the scene, `scale` pixels to a scene pixel. Only the frame is filled with the background, and
+    /// layers outside it still show, unless `clip` (while playing, Electron clips them to the frame). Layers it can't
+    /// draw are left out, and video layers without one of `frames` show their poster.
+    pub fn view(
+        &self,
+        scene: &Scene,
+        t: f64,
+        (origin, scale, size): View,
+        clip: bool,
+        frames: &Frames,
+    ) -> Option<Pixmap> {
+        let mut canvas = Pixmap::new(size.0.max(1), size.1.max(1))?;
+        let (left, top) = (-origin.0 * scale, -origin.1 * scale);
+        let frame = Rect::from_xywh(left, top, scene.width * scale, scene.height * scale)?;
+        let [r, g, b] = rgb(&scene.bg);
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(r, g, b, 255));
+        canvas.fill_rect(frame, &paint, Transform::identity(), None);
+        let view = Transform::from_row(scale, 0.0, 0.0, scale, left, top);
+        self.layers(&mut canvas, scene, t, view, scale, false, frames)
+            .ok()?;
+        if clip {
+            // Everything outside the frame goes back to clear.
+            let width = canvas.width() as i32;
+            let (x0, y0) = (frame.left().round() as i32, frame.top().round() as i32);
+            let (x1, y1) = (frame.right().round() as i32, frame.bottom().round() as i32);
+            let (x0, x1) = (x0.clamp(0, width) as usize, x1.clamp(0, width) as usize);
+            let clear = tiny_skia::PremultipliedColorU8::TRANSPARENT;
+            for (y, row) in canvas
+                .pixels_mut()
+                .chunks_exact_mut(width as usize)
+                .enumerate()
+            {
+                if (y as i32) < y0 || (y as i32) >= y1 {
+                    row.fill(clear);
+                } else {
+                    row[..x0].fill(clear);
+                    row[x1.max(x0)..].fill(clear);
+                }
+            }
+        }
+        Some(canvas)
+    }
+
     fn draw(
         &self,
         scene: &Scene,
@@ -187,7 +236,24 @@ impl Renderer {
         canvas.fill(Color::from_rgba8(r, g, b, 255));
         // Like Electron's export, which scales the canvas by width and height separately.
         let (scale_x, scale_y) = (width as f32 / scene.width, height as f32 / scene.height);
-        let (scale, view) = (scale_x, Transform::from_scale(scale_x, scale_y));
+        let view = Transform::from_scale(scale_x, scale_y);
+        self.layers(&mut canvas, scene, t, view, scale_x, strict, frames)?;
+        Ok(canvas)
+    }
+
+    /// Paints the layers showing at `t` onto `canvas` through `view` (`scale` canvas pixels to a scene pixel).
+    #[allow(clippy::too_many_arguments)]
+    fn layers(
+        &self,
+        canvas: &mut Pixmap,
+        scene: &Scene,
+        t: f64,
+        view: Transform,
+        scale: f32,
+        strict: bool,
+        frames: &Frames,
+    ) -> Result<(), String> {
+        let (width, height) = (canvas.width(), canvas.height());
         for shape in &scene.shapes {
             if !shape.visible(t, scene.duration) {
                 continue;
@@ -207,7 +273,7 @@ impl Renderer {
             };
             let blur = blur(shape) * scale;
             if blur <= 0.0 {
-                ink.paint(&mut canvas, Transform::identity());
+                ink.paint(canvas, Transform::identity());
                 continue;
             }
             // A blurred layer is drawn on its own, blurred, then laid on the canvas, like canvas's `filter: blur()`.
@@ -246,7 +312,7 @@ impl Renderer {
                 None,
             );
         }
-        Ok(canvas)
+        Ok(())
     }
 
     /// A layer at `pose` in `color`: shapes and text as outlines, pictures as pixmaps. Each is drawn around its center,
