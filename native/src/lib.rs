@@ -12,6 +12,7 @@ pub mod media;
 pub mod model;
 pub mod motion;
 pub mod render;
+pub mod sound;
 pub mod storage;
 pub mod svg;
 pub mod text;

@@ -6,6 +6,7 @@ use crate::assets;
 use crate::model::{self, HANDLES, Pose, RotationClip, Scene, Shape, resized_pose};
 use crate::motion;
 use crate::render;
+use crate::sound::Sound;
 use crate::storage;
 use crate::svg;
 use crate::video;
@@ -198,6 +199,7 @@ pub struct Forma {
     /// The preview picture, and what it shows: the scene, the time, its size in pixels, and which video frames.
     preview: Option<(TextureHandle, Scene, f64, [u32; 2], u64)>,
     videos: Videos,
+    sound: Sound,
     undo: Vec<Scene>,
     redo: Vec<Scene>,
     recording_drag: bool,
@@ -274,6 +276,7 @@ impl Forma {
             renderer: None,
             preview: None,
             videos: Videos::default(),
+            sound: Sound::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             recording_drag: false,
@@ -331,6 +334,7 @@ impl Forma {
     }
 
     fn open(&mut self, scene: Scene) {
+        self.sound.pause();
         let _ = self.save();
         self.scene = scene;
         self.selected = None;
@@ -3856,6 +3860,19 @@ impl CanopyApp for Forma {
             self.recording_drag = false;
         }
         self.suppress_history = false;
+        if !self
+            .sound
+            .update(&self.scene, self.renderer.as_ref(), self.time, self.playing)
+        {
+            self.playing = false;
+            self.preview_end = None;
+        }
+        if let Some(notice) = self.sound.take_notice() {
+            self.notice = Some(notice);
+        }
+        if let Some(notice) = self.notice.take() {
+            host.toast(notice);
+        }
     }
 
     fn receive(&mut self, files: Vec<SharedFile>, host: &mut dyn Host) -> Receipt {

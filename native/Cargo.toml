@@ -22,6 +22,7 @@ ttf-parser = "0.25.1"
 resvg = "0.45.1"
 zip = { version = "9.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std"] }
+cpal = "0.18.2"
 
 [profile.dev.package."*"]
 opt-level = 2
