@@ -148,6 +148,69 @@ impl Scene {
         }
     }
 
+    /// The three animated shapes from Electron Forma's `example()`.
+    pub fn example(id: String) -> Self {
+        let mut scene = Self::empty(id);
+        let examples = [
+            (
+                "a",
+                "Coral circle",
+                "circle",
+                "#ed795e",
+                [
+                    (-120.0, 265.0, 190.0, 190.0, 0.0),
+                    (565.0, 275.0, 190.0, 190.0, 0.0),
+                    (360.0, 265.0, 190.0, 190.0, 0.0),
+                ],
+            ),
+            (
+                "b",
+                "Lavender block",
+                "rect",
+                "#aaa0ce",
+                [
+                    (555.0, 325.0, 180.0, 180.0, 15.0),
+                    (370.0, 320.0, 180.0, 180.0, 105.0),
+                    (1080.0, 325.0, 180.0, 180.0, 195.0),
+                ],
+            ),
+            (
+                "c",
+                "Lime triangle",
+                "triangle",
+                "#c3d77f",
+                [
+                    (470.0, -90.0, 125.0, 120.0, 0.0),
+                    (470.0, 390.0, 125.0, 120.0, 180.0),
+                    (470.0, 200.0, 125.0, 120.0, 360.0),
+                ],
+            ),
+        ];
+        for (id, name, kind, color, poses) in examples {
+            scene.add_shape(id.into(), kind);
+            let shape = scene.shapes.last_mut().unwrap();
+            shape.name = name.into();
+            shape.color = color.into();
+            shape.keys = poses
+                .into_iter()
+                .zip([0.0, 2.0, 4.0])
+                .map(|((x, y, w, h, r), t)| Key {
+                    t,
+                    x,
+                    y,
+                    w,
+                    h,
+                    r,
+                    o: 100.0,
+                    ease: None,
+                    curve: None,
+                    extra: Map::new(),
+                })
+                .collect();
+        }
+        scene
+    }
+
     pub fn read(bytes: &[u8]) -> Result<Self, String> {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
         let mut scene: Self =
@@ -1338,6 +1401,35 @@ fn bezier(progress: f32, [x1, y1, x2, y2]: [f32; 4]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn example_matches_electron_scene() {
+        let scene = Scene::example("new-project".into());
+        assert_eq!(scene.project_id, "new-project");
+        assert_eq!(
+            (scene.width, scene.height, scene.duration),
+            (960.0, 600.0, 4.0)
+        );
+        assert_eq!(scene.bg, "#f4f0e8");
+        assert_eq!(
+            scene
+                .shapes
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Coral circle", "Lavender block", "Lime triangle"]
+        );
+        assert_eq!(
+            scene.shapes[0].keys.iter().map(|k| k.t).collect::<Vec<_>>(),
+            [0.0, 2.0, 4.0]
+        );
+        assert_eq!(scene.shapes[1].keys[2].x, 1080.0);
+        assert_eq!(scene.shapes[2].keys[2].r, 360.0);
+        assert_eq!(
+            Scene::read(&serde_json::to_vec(&scene).unwrap()).unwrap(),
+            scene
+        );
+    }
 
     #[test]
     fn old_scenes_round_trip_without_losing_unsupported_animation() {

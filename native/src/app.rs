@@ -162,8 +162,14 @@ pub struct Forma {
     layer_drag: Option<String>,
     time: f64,
     playing: bool,
+    loop_playback: bool,
     last_tick: Instant,
     edited_at: Option<Instant>,
+    save_failed: bool,
+    clip_edit_id: Option<String>,
+    clip_shown: (f64, Option<f64>),
+    clip_in_edit: String,
+    clip_out_edit: String,
     show_projects: bool,
     show_export: bool,
     export_kind: ExportKind,
@@ -230,8 +236,14 @@ impl Forma {
             layer_drag: None,
             time: 0.0,
             playing: false,
+            loop_playback: true,
             last_tick: Instant::now(),
             edited_at: None,
+            save_failed: false,
+            clip_edit_id: None,
+            clip_shown: (0.0, None),
+            clip_in_edit: String::new(),
+            clip_out_edit: String::new(),
             show_projects: false,
             show_export: false,
             export_kind: ExportKind::Video,
@@ -268,6 +280,7 @@ impl Forma {
 
     fn edited(&mut self) {
         self.edited_at = Some(Instant::now());
+        self.save_failed = false;
     }
 
     fn select_layer(&mut self, id: Option<String>, extend: bool) {
@@ -299,6 +312,7 @@ impl Forma {
         self.layer_drag = None;
         self.time = 0.0;
         self.playing = false;
+        self.clip_edit_id = None;
         self.renderer = None;
         self.preview = None;
         self.videos = Videos::default();
@@ -491,14 +505,30 @@ impl Forma {
             if name.changed() {
                 self.edited();
             }
+            ui.label(egui::RichText::new(if self.edited_at.is_some() {
+                "Saving..."
+            } else if self.save_failed {
+                "Autosave failed"
+            } else {
+                "Saved locally"
+            }).color(color::INK_MUTED));
+            if ui.button("Back to start").clicked() {
+                self.playing = false;
+                self.preview_end = None;
+                self.time = 0.0;
+            }
             if ui
                 .button(if self.playing { "Pause" } else { "Play" })
                 .clicked()
             {
+                if !self.playing && self.time >= self.scene.duration {
+                    self.time = 0.0;
+                }
                 self.playing = !self.playing;
                 self.preview_end = None;
                 self.last_tick = Instant::now();
             }
+            ui.checkbox(&mut self.loop_playback, "Loop");
             ui.label(format!("{:.2} / {:.2} s", self.time, self.scene.duration));
             if ui.button("Save").clicked() {
                 match self.save() {
@@ -687,6 +717,24 @@ impl Forma {
                     }
                 }
             });
+        ui.add_space(6.0);
+        if ui.button("Load default project").clicked() {
+            // As Electron's: the default project if there is one, else the example scene.
+            let id = new_id();
+            let (scene, notice) = match storage::load_default(&self.place, id.clone()) {
+                Ok(Some(scene)) => (scene, "Default project loaded".to_owned()),
+                Ok(None) => (Scene::example(id), "Example scene loaded".to_owned()),
+                Err(error) => (
+                    Scene::example(id),
+                    format!(
+                        "The default project couldn't be opened ({error}); here's the example scene"
+                    ),
+                ),
+            };
+            self.open(scene);
+            self.edited();
+            self.notice = Some(notice);
+        }
     }
 
     fn scene_settings(&mut self, ui: &mut Ui) {
@@ -747,6 +795,102 @@ impl Forma {
             });
     }
 
+    fn clip_fields(&mut self, ui: &mut Ui, index: usize) {
+        let shape = &self.scene.shapes[index];
+        // Shown again when another layer is picked, or when the clip changes elsewhere (dragged or trimmed on the
+        // timeline, undone), but not while it's being typed in: typing doesn't change the clip until it's committed.
+        let timing = (shape.clip_start(), shape.out_time);
+        if self.clip_edit_id.as_deref() != Some(shape.id.as_str()) || self.clip_shown != timing {
+            self.clip_edit_id = Some(shape.id.clone());
+            self.clip_shown = timing;
+            self.clip_in_edit = format!("{:.2}", shape.clip_start());
+            self.clip_out_edit = shape.out_time.map_or(String::new(), |t| format!("{t:.2}"));
+        }
+        let mut start_commit = false;
+        let mut end_commit = false;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label("From (s)");
+                let response =
+                    ui.add(egui::TextEdit::singleline(&mut self.clip_in_edit).desired_width(82.0));
+                start_commit = response.lost_focus()
+                    || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            });
+            ui.vertical(|ui| {
+                ui.label("Until (s)");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.clip_out_edit)
+                        .desired_width(82.0)
+                        .hint_text(format!("End ({:.2})", self.scene.duration)),
+                );
+                end_commit = response.lost_focus()
+                    || (response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            });
+        });
+        if start_commit {
+            let end = self.scene.shapes[index]
+                .out_time
+                .unwrap_or(self.scene.duration);
+            let start = self.clip_in_edit.trim().parse::<f64>().ok();
+            if let Some(start) =
+                start.filter(|s| s.is_finite() && *s >= 0.0 && *s <= end - model::MIN_CLIP)
+            {
+                let previous = self.scene.shapes[index].clip_start();
+                if self
+                    .scene
+                    .trim_clip(index, start, self.scene.shapes[index].out_time)
+                    .is_ok()
+                {
+                    let shape = &self.scene.shapes[index];
+                    self.clip_in_edit = format!("{:.2}", shape.clip_start());
+                    if !shape.visible(self.time, self.scene.duration) {
+                        self.time = shape.clip_start();
+                    }
+                    if shape.clip_start() != previous {
+                        self.edited();
+                    }
+                } else {
+                    self.clip_in_edit = format!("{previous:.2}");
+                    self.notice = Some("Start the clip at least 0.05 s before it ends".into());
+                }
+            } else {
+                self.clip_in_edit = format!("{:.2}", self.scene.shapes[index].clip_start());
+                self.notice = Some("Start the clip at least 0.05 s before it ends".into());
+            }
+        }
+        if end_commit {
+            let start = self.scene.shapes[index].clip_start();
+            let raw = self.clip_out_edit.trim();
+            let end = if raw.is_empty() {
+                Some(None)
+            } else {
+                raw.parse::<f64>()
+                    .ok()
+                    .filter(|e| e.is_finite() && *e >= start + model::MIN_CLIP)
+                    .map(Some)
+            };
+            if let Some(end) = end {
+                let previous = self.scene.shapes[index].out_time;
+                if self.scene.trim_clip(index, start, end).is_ok() {
+                    self.clip_out_edit = self.scene.shapes[index]
+                        .out_time
+                        .map_or(String::new(), |t| format!("{t:.2}"));
+                    if self.scene.shapes[index].out_time != previous {
+                        self.edited();
+                    }
+                } else {
+                    self.clip_out_edit = previous.map_or(String::new(), |t| format!("{t:.2}"));
+                    self.notice = Some("End the clip at least 0.05 s after it starts".into());
+                }
+            } else {
+                self.clip_out_edit = self.scene.shapes[index]
+                    .out_time
+                    .map_or(String::new(), |t| format!("{t:.2}"));
+                self.notice = Some("End the clip at least 0.05 s after it starts".into());
+            }
+        }
+    }
+
     fn inspector(&mut self, ui: &mut Ui) {
         self.scene_settings(ui);
         ui.label(
@@ -763,6 +907,7 @@ impl Forma {
             ui.label("Select a shape to edit it.");
             return;
         };
+        self.clip_fields(ui, index);
         let mut pose = self
             .scene
             .editable_pose(&self.scene.shapes[index], self.time);
@@ -3397,7 +3542,12 @@ impl CanopyApp for Forma {
             if let Some(end) = self.preview_end.filter(|end| self.time >= *end) {
                 (self.time, self.playing, self.preview_end) = (end, false, None);
             } else if self.time >= self.scene.duration {
-                self.time = 0.0;
+                if self.loop_playback {
+                    self.time %= self.scene.duration;
+                } else {
+                    self.time = self.scene.duration;
+                    self.playing = false;
+                }
             }
             ui.ctx().request_repaint();
         }
@@ -3550,8 +3700,10 @@ impl CanopyApp for Forma {
     }
 
     fn save(&mut self) -> Result<(), String> {
+        let result = storage::save(&self.place, &self.scene);
         self.edited_at = None;
-        storage::save(&self.place, &self.scene)
+        self.save_failed = result.is_err();
+        result
     }
 
     fn title(&self) -> String {
