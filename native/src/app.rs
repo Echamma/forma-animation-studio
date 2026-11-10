@@ -72,14 +72,38 @@ enum Row {
     Spin(usize, usize),
 }
 
-/// What a timeline drag holds: a clip (moving it or one of its edges) or a spin (moving it or its end).
+/// What a timeline drag holds: a clip, a drawn move, a spin or a fade (moving it, or one of its edges to change
+/// how long it lasts), or a keyframe.
 #[derive(Clone, Copy, PartialEq)]
 enum Part {
     Clip,
     Start,
     End,
     Spin(usize),
+    SpinStart(usize),
     SpinLength(usize),
+    Motion(usize),
+    MotionStart(usize),
+    MotionEnd(usize),
+    Fade,
+    FadeEnd,
+    Key(usize),
+}
+
+/// How close (px) to a bar's end a drag grabs the edge instead of the bar.
+const EDGE: f32 = 6.0;
+
+/// The pointer over a timeline bar: a resize arrow on an end that can be dragged, else a hand.
+fn edge_cursor(ui: &Ui, response: &egui::Response, span: Rect, start: bool, end: bool) {
+    if let Some(p) = response.hover_pos() {
+        let edge = (start && (p.x - span.left()).abs() <= EDGE)
+            || (end && (p.x - span.right()).abs() <= EDGE);
+        ui.ctx().set_cursor_icon(if edge {
+            egui::CursorIcon::ResizeHorizontal
+        } else {
+            egui::CursorIcon::Grab
+        });
+    }
 }
 
 /// A timeline drag, with the layer and scene length as they were when it began.
@@ -3055,27 +3079,34 @@ impl Forma {
                     font::ui(10.0),
                     color::INK,
                 );
+                let timed = d.reappear_mode == "time";
                 let tip = format!(
-                    "Fade out {:.2}–{:.2} s{}",
+                    "Fade out {:.2}–{:.2} s{}. Drag to move it{}.",
                     d.start_time,
                     d.start_time + d.duration,
                     if end.is_finite() && end < self.scene.duration {
                         format!("; reappear {end:.2} s")
                     } else {
                         "; stay hidden".into()
+                    },
+                    if timed {
+                        ", drag its end to change when it comes back"
+                    } else {
+                        ""
                     }
                 );
-                if ui
+                let (id, start) = (shape.id.clone(), d.start_time);
+                let response = ui
                     .interact(
                         span,
-                        ui.scope_id().with(("fade", &shape.id)),
-                        Sense::click(),
+                        ui.scope_id().with(("fade", &id)),
+                        Sense::click_and_drag(),
                     )
-                    .on_hover_text(tip)
-                    .clicked()
-                {
-                    (self.selected, self.time, self.playing) =
-                        (Some(shape.id.clone()), d.start_time, false);
+                    .on_hover_text(tip);
+                edge_cursor(ui, &response, span, false, timed);
+                self.timeline_gesture(ui, &response, *index, span, Part::Fade, width);
+                if response.clicked() {
+                    (self.selected, self.time, self.playing) = (Some(id), start, false);
                 }
             }
             Row::Motion(index, m) => {
@@ -3099,21 +3130,39 @@ impl Forma {
                     font::ui(10.0),
                     color::INK,
                 );
-                if ui
+                let id = shape.id.clone();
+                let motion_id = motion.get("id").and_then(|v| v.as_str()).map(str::to_owned);
+                let dragging = self
+                    .timeline_drag
+                    .as_ref()
+                    .is_some_and(|d| d.index == *index && matches!(d.part, Part::Motion(i) | Part::MotionStart(i) | Part::MotionEnd(i) if i == *m));
+                if dragging {
+                    ui.painter().text(
+                        span.right_center() + vec2(6.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        format!("{start:.2}–{:.2} s · {length:.2} s", start + length),
+                        font::ui(10.0),
+                        color::INK,
+                    );
+                }
+                let response = ui
                     .interact(
                         span,
-                        ui.scope_id().with(("motion", &shape.id, *m)),
-                        Sense::click(),
+                        ui.scope_id().with(("motion", &id, *m)),
+                        Sense::click_and_drag(),
                     )
                     .on_hover_text(format!(
-                        "{}: {start:.2}–{:.2} s",
+                        "{}: {start:.2}–{:.2} s. Drag to move it, drag an end to make it longer or shorter.",
                         shape.name,
                         start + length
-                    ))
-                    .clicked()
-                {
-                    (self.selected, self.time, self.playing) =
-                        (Some(shape.id.clone()), start, false);
+                    ));
+                edge_cursor(ui, &response, span, true, true);
+                self.timeline_gesture(ui, &response, *index, span, Part::Motion(*m), width);
+                if response.clicked() || response.drag_started() {
+                    self.selected_motion = motion_id;
+                }
+                if response.clicked() {
+                    (self.selected, self.time, self.playing) = (Some(id), start, false);
                 }
             }
             Row::Spin(index, r) => {
@@ -3130,7 +3179,7 @@ impl Forma {
                     color::INK,
                 );
                 let tip = format!(
-                    "Rotation {}° · {:.2}–{:.2} s. Drag to move, drag the end to change its length.",
+                    "Rotation {}° · {:.2}–{:.2} s. Drag to move, drag an end to change its length.",
                     clip.degrees,
                     clip.start_time,
                     clip.start_time + clip.duration
@@ -3143,6 +3192,7 @@ impl Forma {
                         Sense::click_and_drag(),
                     )
                     .on_hover_text(tip);
+                edge_cursor(ui, &response, span, true, true);
                 self.timeline_gesture(ui, &response, *index, span, Part::Spin(*r), width);
                 if response.clicked() {
                     (self.selected, self.time, self.playing) = (Some(id), start, false);
@@ -3260,14 +3310,14 @@ impl Forma {
         });
         // Keyframes inside the clip: click to go to one, right-click to move, ease or delete it.
         let shape = &self.scene.shapes[index];
-        let keys: Vec<(usize, f64)> = shape
+        let keys: Vec<(usize, f64, bool)> = shape
             .keys
             .iter()
             .enumerate()
-            .map(|(i, k)| (i, k.t))
-            .filter(|(_, t)| *t >= start - 1e-6 && *t <= end + 1e-6)
+            .map(|(i, k)| (i, k.t, k.extra.get("motionId").is_some()))
+            .filter(|(_, t, _)| *t >= start - 1e-6 && *t <= end + 1e-6)
             .collect();
-        for (key, t) in keys {
+        for (key, t, of_move) in keys {
             let at = pos2(x(t), line.center().y);
             let dot = [
                 vec2(0.0, -5.0),
@@ -3281,16 +3331,37 @@ impl Forma {
                 Color32::WHITE,
                 Stroke::new(1.0, Mood::Ember.ground()),
             ));
+            let spot = Rect::from_center_size(at, vec2(11.0, 13.0));
             let response = ui
                 .interact(
-                    Rect::from_center_size(at, vec2(11.0, 13.0)),
+                    spot,
                     ui.scope_id().with(("key", &id, key)),
-                    Sense::click(),
+                    if of_move { Sense::click() } else { Sense::click_and_drag() },
                 )
-                .on_hover_text(format!(
-                    "{} at {t:.2} seconds — right-click to move or delete",
-                    self.scene.shapes[index].name
-                ));
+                .on_hover_text(if of_move {
+                    format!("{} at {t:.2} seconds, part of a drawn move: drag the move's bar to retime it", self.scene.shapes[index].name)
+                } else {
+                    format!("{} at {t:.2} seconds. Drag to move it in time; right-click to ease or delete it", self.scene.shapes[index].name)
+                });
+            if !of_move {
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if self
+                    .timeline_drag
+                    .as_ref()
+                    .is_some_and(|d| d.index == index && d.part == Part::Key(key))
+                {
+                    ui.painter().text(
+                        at - vec2(0.0, 9.0),
+                        Align2::CENTER_BOTTOM,
+                        format!("{t:.2} s"),
+                        font::ui(10.0),
+                        color::INK,
+                    );
+                }
+                self.timeline_gesture(ui, &response, index, spot, Part::Key(key), width);
+            }
             if response.clicked() {
                 (self.selected, self.time, self.playing) = (Some(id.clone()), t, false);
             }
@@ -3424,10 +3495,18 @@ impl Forma {
             let origin = ui
                 .input(|i| i.pointer.press_origin())
                 .unwrap_or(span.center());
+            let (at_start, at_end) = (
+                (origin.x - span.left()).abs() <= EDGE,
+                (origin.x - span.right()).abs() <= EDGE,
+            );
             let part = match part {
-                Part::Clip if (origin.x - span.left()).abs() <= 6.0 => Part::Start,
-                Part::Clip if (origin.x - span.right()).abs() <= 6.0 => Part::End,
-                Part::Spin(r) if (origin.x - span.right()).abs() <= 8.0 => Part::SpinLength(r),
+                Part::Clip if at_start => Part::Start,
+                Part::Clip if at_end => Part::End,
+                Part::Spin(r) if at_end => Part::SpinLength(r),
+                Part::Spin(r) if at_start => Part::SpinStart(r),
+                Part::Motion(m) if at_end => Part::MotionEnd(m),
+                Part::Motion(m) if at_start => Part::MotionStart(m),
+                Part::Fade if at_end && span.width() > 2.0 * EDGE => Part::FadeEnd,
                 part => part,
             };
             self.timeline_drag = Some(TimelineDrag {
@@ -3507,16 +3586,111 @@ impl Forma {
                 let end = snap(end0 + delta).0.max(start0 + model::MIN_CLIP);
                 let _ = self.scene.trim_clip(index, start0, Some(end));
             }
-            Part::Spin(r) | Part::SpinLength(r) => {
+            Part::Spin(r) | Part::SpinStart(r) | Part::SpinLength(r) => {
                 let clip = &drag.shape.rotation_clips[r];
                 let target = &mut self.scene.shapes[index].rotation_clips[r];
-                if matches!(drag.part, Part::SpinLength(_)) {
-                    target.duration = model::hundredths(clip.duration + delta)
-                        .clamp(0.1, (duration - clip.start_time).max(0.1));
-                } else {
-                    target.start_time = model::hundredths(clip.start_time + delta)
-                        .clamp(0.0, (duration - clip.duration).max(0.0));
+                let end = clip.start_time + clip.duration;
+                match drag.part {
+                    // A spin can run past the scene's end: the scene grows to fit, as it does for clips.
+                    Part::SpinLength(_) => {
+                        target.duration = (snap(end + delta).0 - clip.start_time).max(0.1);
+                        self.scene.duration =
+                            self.scene.duration.max(clip.start_time + target.duration);
+                    }
+                    Part::SpinStart(_) => {
+                        let start = snap(clip.start_time + delta).0.clamp(0.0, end - 0.1);
+                        (target.start_time, target.duration) =
+                            (start, model::hundredths(end - start));
+                    }
+                    _ => {
+                        let (a, b) = (snap(clip.start_time + delta), snap(end + delta));
+                        let start = if b.1 && !a.1 {
+                            b.0 - clip.duration
+                        } else {
+                            a.0
+                        };
+                        target.start_time = model::hundredths(start.max(0.0));
+                        self.scene.duration =
+                            self.scene.duration.max(target.start_time + clip.duration);
+                    }
                 }
+            }
+            Part::Motion(m) | Part::MotionStart(m) | Part::MotionEnd(m) => {
+                let list = motion::motions(&drag.shape);
+                let Some(mo) = list.get(m) else { return };
+                let (s0, l0) = (mo.start_time, mo.duration);
+                // A move can't overlap another of the layer's moves: it stops at its neighbours.
+                let before = list
+                    .iter()
+                    .filter(|o| o.id != mo.id && o.start_time + o.duration <= s0 + 1e-3)
+                    .map(|o| o.start_time + o.duration)
+                    .fold(0.0, f64::max);
+                let after = list
+                    .iter()
+                    .filter(|o| o.id != mo.id && o.start_time >= s0 + l0 - 1e-3)
+                    .map(|o| o.start_time)
+                    .fold(f64::INFINITY, f64::min);
+                let (start, length) = match drag.part {
+                    Part::MotionStart(_) => {
+                        let start = snap(s0 + delta).0.clamp(before, s0 + l0 - 0.1);
+                        (start, s0 + l0 - start)
+                    }
+                    Part::MotionEnd(_) => (s0, (snap(s0 + l0 + delta).0.min(after) - s0).max(0.1)),
+                    _ => {
+                        let (a, b) = (snap(s0 + delta), snap(s0 + l0 + delta));
+                        let start = if b.1 && !a.1 { b.0 - l0 } else { a.0 };
+                        (start.max(before).min(after - l0).max(0.0), l0)
+                    }
+                };
+                let options = motion::Options {
+                    seconds: length,
+                    distance: mo.distance,
+                    spin: mo.spin,
+                    face: mo.face,
+                };
+                let id = mo.id.clone();
+                let _ = motion::edit(&mut self.scene, index, &id, start, length, options);
+            }
+            Part::Fade | Part::FadeEnd => {
+                let Some(d) = drag.shape.disappear.clone() else {
+                    return;
+                };
+                let target = self.scene.shapes[index].disappear.as_mut().unwrap();
+                if drag.part == Part::FadeEnd {
+                    if let Some(back) = d.reappear_time {
+                        target.reappear_time = Some(model::hundredths(
+                            snap(back + delta).0.max(d.start_time + d.duration),
+                        ));
+                    }
+                } else {
+                    let start = model::hundredths(snap(d.start_time + delta).0.max(0.0));
+                    target.start_time = start;
+                    if d.reappear_mode == "time" {
+                        target.reappear_time = d
+                            .reappear_time
+                            .map(|t| model::hundredths(t + start - d.start_time));
+                    }
+                    self.scene.duration = self.scene.duration.max(start + d.duration);
+                }
+            }
+            Part::Key(k) => {
+                let Some(key) = drag.shape.keys.get(k) else {
+                    return;
+                };
+                // A keyframe moves between its neighbours: passing one would swap their order (two poses at once).
+                let lo = if k > 0 {
+                    drag.shape.keys[k - 1].t + 0.01
+                } else {
+                    0.0
+                };
+                let hi = drag
+                    .shape
+                    .keys
+                    .get(k + 1)
+                    .map_or(f64::INFINITY, |next| next.t - 0.01);
+                let t = model::hundredths(snap(key.t + delta).0.clamp(lo, hi.max(lo)));
+                self.scene.shapes[index].keys[k].t = t;
+                self.scene.duration = self.scene.duration.max(t);
             }
         }
         self.edited();
