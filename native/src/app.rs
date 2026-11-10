@@ -3233,10 +3233,9 @@ impl Forma {
                 Accent::Moss.color()
             },
         );
-        let dragging = self
-            .timeline_drag
-            .as_ref()
-            .is_some_and(|d| d.index == index);
+        let dragging = self.timeline_drag.as_ref().is_some_and(|d| {
+            d.index == index && matches!(d.part, Part::Clip | Part::Start | Part::End)
+        });
         let track = shape
             .extra
             .get("trackId")
