@@ -4318,6 +4318,90 @@ impl Forma {
         }
     }
 
+    /// Space plays; Home and End go to the ends; arrows nudge the selected layers (Shift: 10 px) or, with none
+    /// selected, step the playhead; [ and ] move the selected layer back and forward; Ctrl + and Ctrl - zoom the
+    /// canvas and Ctrl+0 resets it.
+    fn more_keys(&mut self, ui: &Ui) {
+        use egui::{Key, Modifiers};
+        let (play, home, end, arrow, big, back, forward, zoom, reset) = ui.input_mut(|i| {
+            let big = i.modifiers.shift;
+            let mut arrow = Vec2::ZERO;
+            if !i.modifiers.command && !i.modifiers.alt {
+                for (key, by) in [(Key::ArrowLeft, vec2(-1.0, 0.0)), (Key::ArrowRight, vec2(1.0, 0.0)), (Key::ArrowUp, vec2(0.0, -1.0)), (Key::ArrowDown, vec2(0.0, 1.0))] {
+                    if i.key_pressed(key) {
+                        arrow += by;
+                    }
+                }
+            }
+            let closer = i.consume_key(Modifiers::COMMAND, Key::Plus) | i.consume_key(Modifiers::COMMAND, Key::Equals);
+            let zoom = if closer { 1.25 } else if i.consume_key(Modifiers::COMMAND, Key::Minus) { 0.8 } else { 1.0 };
+            (
+                i.consume_key(Modifiers::NONE, Key::Space),
+                i.consume_key(Modifiers::NONE, Key::Home),
+                i.consume_key(Modifiers::NONE, Key::End),
+                arrow,
+                big,
+                i.consume_key(Modifiers::NONE, Key::OpenBracket),
+                i.consume_key(Modifiers::NONE, Key::CloseBracket),
+                zoom,
+                i.consume_key(Modifiers::COMMAND, Key::Num0),
+            )
+        });
+        if play {
+            if !self.playing && self.time >= self.scene.duration {
+                self.time = 0.0;
+            }
+            self.playing = !self.playing;
+            self.preview_end = None;
+            self.last_tick = Instant::now();
+        }
+        if home || end {
+            self.playing = false;
+            self.preview_end = None;
+            self.time = if home { 0.0 } else { self.scene.duration };
+        }
+        if arrow != Vec2::ZERO {
+            let mut layers = self.selection();
+            if layers.is_empty() {
+                // Nothing selected: Left and Right step the playhead (Shift: half a second).
+                let step = if big { 0.5 } else { 0.05 };
+                self.playing = false;
+                self.time = (self.time + arrow.x as f64 * step).clamp(0.0, self.scene.duration);
+            } else {
+                // Text that follows a layer goes after the layers, so it keeps up with where they went.
+                layers.sort_by_key(|i| {
+                    let shape = &self.scene.shapes[*i];
+                    shape.kind == "text" && shape.extra.contains_key("linkId")
+                });
+                let by = arrow * if big { 10.0 } else { 1.0 };
+                self.playing = false;
+                for index in layers {
+                    let pose = self.scene.editable_pose(&self.scene.shapes[index], self.time);
+                    self.scene.set_pose(index, self.time, Pose { x: pose.x + by.x, y: pose.y + by.y, ..pose });
+                }
+                self.edited();
+            }
+        }
+        if back || forward {
+            let at = self.selected.as_ref().and_then(|id| self.scene.shapes.iter().position(|s| &s.id == id));
+            let to = at.and_then(|at| if forward { (at + 1 < self.scene.shapes.len()).then_some(at + 1) } else { at.checked_sub(1) });
+            if let (Some(at), Some(to)) = (at, to) {
+                self.scene.shapes.swap(at, to);
+                self.edited();
+                self.notice = Some(if forward { "Moved the layer forward".into() } else { "Moved the layer back".into() });
+            }
+        }
+        if zoom != 1.0 {
+            // Around the middle of the canvas, where the pan is measured from.
+            let old = self.zoom;
+            self.zoom = (self.zoom * zoom).clamp(0.2, 5.0);
+            self.pan *= self.zoom / old;
+        }
+        if reset {
+            (self.zoom, self.pan) = (1.0, Vec2::ZERO);
+        }
+    }
+
     fn help_window(&mut self, ui: &mut Ui) {
         if !self.show_help {
             return;
@@ -4338,6 +4422,8 @@ impl Forma {
             }
             ui.separator();
             ui.label("Press Ctrl + Z to undo and S to split a clip at the playhead. Press play to preview, then Export.");
+            ui.add_space(4.0);
+            ui.label("Keys: Space plays. Arrows nudge the selected layers (Shift: 10 px), or step the playhead with none selected. [ and ] move a layer back and forward. Home and End go to the ends. Ctrl + and Ctrl - zoom, Ctrl+0 resets.");
             ui.add_space(8.0);
             close = ui.button("Got it").clicked();
         });
@@ -4469,6 +4555,7 @@ impl CanopyApp for Forma {
                 if let Some(action) = action {
                     self.clip_action(action);
                 }
+                self.more_keys(ui);
             }
         }
         if self.playing {
