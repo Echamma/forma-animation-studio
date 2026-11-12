@@ -2285,6 +2285,12 @@ impl Forma {
             viewport.min + vec2(8.0, 8.0),
             vec2(viewport.width() - 16.0, 26.0),
         );
+        // The buttons get a dark backing, drawn under them once their places are known: zoomed in, the canvas lies
+        // behind the bar, and their light text would vanish on a light scene.
+        let backing = [ui.painter().add(egui::Shape::Noop), ui.painter().add(egui::Shape::Noop)];
+        let back = |ui: &Ui, slot: egui::layers::ShapeIdx, rect: Rect| {
+            ui.painter().set(slot, egui::epaint::RectShape::filled(rect.expand(2.0), 8, Color32::from_rgba_unmultiplied(24, 22, 16, 235)));
+        };
         ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
             ui.horizontal(|ui| {
                 let (w, h) = (self.scene.width, self.scene.height);
@@ -2296,27 +2302,28 @@ impl Forma {
                     "Square"
                 };
                 let playing = if self.playing { " · Playing" } else { "" };
-                if ui
-                    .button(format!("{shape} · {w} × {h}{playing}"))
-                    .on_hover_text("Canvas size, length, and background")
-                    .clicked()
-                {
+                let size = ui.button(format!("{shape} · {w} × {h}{playing}")).on_hover_text("Canvas size, length, and background");
+                back(ui, backing[0], size.rect);
+                if size.clicked() {
                     self.open_scene = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("+").on_hover_text("Zoom in").clicked() {
+                    let more = ui.small_button("+").on_hover_text("Zoom in");
+                    if more.clicked() {
                         self.zoom_by(1.25, viewport.center(), viewport);
                     }
                     if ui
                         .small_button(format!("{:.0}%", self.zoom * 100.0))
-                        .on_hover_text("Reset zoom and position")
+                        .on_hover_text("Reset zoom and position (Ctrl+0)")
                         .clicked()
                     {
                         (self.zoom, self.pan) = (1.0, Vec2::ZERO);
                     }
-                    if ui.small_button("−").on_hover_text("Zoom out").clicked() {
+                    let less = ui.small_button("−").on_hover_text("Zoom out");
+                    if less.clicked() {
                         self.zoom_by(0.8, viewport.center(), viewport);
                     }
+                    back(ui, backing[1], more.rect.union(less.rect));
                     if ui.available_width() > 330.0 {
                         ui.label(
                             egui::RichText::new(
