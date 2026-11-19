@@ -654,12 +654,6 @@ impl Forma {
                 {
                     self.onion_skin = !self.onion_skin;
                 }
-                if quiet_button(ui, "Save", None).clicked() {
-                    match self.save() {
-                        Ok(()) => host.toast("Forma project saved".into()),
-                        Err(error) => host.toast(error),
-                    }
-                }
                 ui.label(
                     egui::RichText::new(if self.mcp_video.is_some() {
                         "Assistant exporting…"
@@ -928,16 +922,19 @@ impl Forma {
                 {
                     self.edited();
                 }
+                // Any length (Electron's field has no top either); the animations already in the scene set the least.
                 let min_duration = self.scene.minimum_duration();
                 if ui
-                    .add(
-                        egui::Slider::new(
-                            &mut self.scene.duration,
-                            min_duration..=120.0_f64.max(min_duration),
+                    .horizontal(|ui| {
+                        ui.label("Length");
+                        ui.add(
+                            egui::DragValue::new(&mut self.scene.duration)
+                                .range(min_duration..=86_400.0)
+                                .speed(0.1)
+                                .suffix(" s"),
                         )
-                        .text("Length")
-                        .suffix(" s"),
-                    )
+                    })
+                    .inner
                     .changed()
                 {
                     self.time = self.time.min(self.scene.duration);
@@ -2953,16 +2950,27 @@ impl Forma {
         let width = (rect.width() - 150.0).max(1.0);
         let duration = self.scene.duration;
         let x = |t: f64| left + width * (t / duration).clamp(0.0, 1.0) as f32;
-        for tick in 0..=duration.ceil() as usize {
-            let pos = x(tick as f64);
+        // A mark every second on short scenes; on long ones the shortest step that keeps marks 60 px apart.
+        let step = [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0]
+            .into_iter()
+            .find(|s| width as f64 * s / duration >= 60.0)
+            .unwrap_or(3600.0);
+        for n in 0..=(duration / step).floor() as usize {
+            let tick = n as f64 * step;
+            let pos = x(tick);
             ui.painter().line_segment(
                 [pos2(pos, rect.top() + 6.0), pos2(pos, rect.bottom())],
                 Stroke::new(0.5, color::HAIRLINE),
             );
+            let label = if tick >= 60.0 {
+                format!("{}:{:02}", tick as u64 / 60, tick as u64 % 60)
+            } else {
+                format!("{tick}s")
+            };
             ui.painter().text(
                 pos2(pos + 3.0, rect.top() + 4.0),
                 Align2::LEFT_TOP,
-                format!("{tick}s"),
+                label,
                 font::ui(10.0),
                 color::INK_MUTED,
             );
