@@ -259,6 +259,8 @@ pub struct Forma {
     /// inside the menu deleted or added layers while the timeline still drew rows by their old positions, and
     /// deleting the last layer that way crashed Canopy.
     pending_clip: Option<(String, ClipAction)>,
+    /// Forma's pane this frame: its dialogs dim and sit in it, not the whole Canopy window.
+    pane: Rect,
     /// Where playing a new animation's preview stops.
     preview_end: Option<f64>,
     /// Files picked with the Add button, taken in like dropped files on the next frame.
@@ -337,6 +339,7 @@ impl Forma {
             notice: None,
             clipboard: Vec::new(),
             pending_clip: None,
+            pane: Rect::NOTHING,
             preview_end: None,
             pending_import: Vec::new(),
             pending_poses: Vec::new(),
@@ -3893,7 +3896,7 @@ impl Forma {
             return;
         }
         let mut run = false;
-        let modal = egui::Modal::new(ui.scope_id().with("forma-export")).show(ui.ctx(), |ui| {
+        let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-export"), |ui| {
             ui.set_width(380.0);
             ui.label(
                 egui::RichText::new("Export")
@@ -4013,7 +4016,7 @@ impl Forma {
         if run {
             self.show_export = false;
             self.export(host, ui.ctx());
-        } else if modal.should_close() {
+        } else if modal.close {
             self.show_export = false;
         }
     }
@@ -4068,7 +4071,7 @@ impl Forma {
             return;
         };
         let mut apply = false;
-        let modal = egui::Modal::new(ui.scope_id().with("forma-svg")).show(ui.ctx(), |ui| {
+        let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-svg"), |ui| {
             ui.set_width(520.0);
             ui.label(
                 egui::RichText::new("Edit SVG")
@@ -4224,7 +4227,7 @@ impl Forma {
                 shape.extra.insert("svgSource".into(), edit.source.into());
                 self.edited();
             }
-        } else if modal.should_close() {
+        } else if modal.close {
             self.svg_edit = None;
         }
     }
@@ -4261,7 +4264,7 @@ impl Forma {
         }
         let mut choice = None;
         let current = self.scene.project_id.clone();
-        let modal = egui::Modal::new(ui.scope_id().with("forma-projects")).show(ui.ctx(), |ui| {
+        let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-projects"), |ui| {
             ui.set_width(620.0_f32.min(ui.ctx().content_rect().width() - 60.0));
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
@@ -4419,7 +4422,7 @@ impl Forma {
                 }
             }
             Some(Choice::Back) => true,
-            None => modal.should_close(),
+            None => modal.close,
         };
         if close {
             self.show_projects = false;
@@ -4515,7 +4518,7 @@ impl Forma {
             return;
         }
         let mut close = false;
-        let modal = egui::Modal::new(ui.scope_id().with("forma-help")).show(ui.ctx(), |ui| {
+        let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-help"), |ui| {
             ui.set_width(470.0);
             ui.heading("Make your first animation");
             ui.add_space(8.0);
@@ -4535,7 +4538,7 @@ impl Forma {
             ui.add_space(8.0);
             close = ui.button("Got it").clicked();
         });
-        if close || modal.should_close() {
+        if close || modal.close {
             self.show_help = false;
         }
     }
@@ -4543,6 +4546,7 @@ impl Forma {
 
 impl CanopyApp for Forma {
     fn ui(&mut self, ui: &mut Ui, host: &mut dyn Host) {
+        self.pane = ui.max_rect();
         if !self.pending_poses.is_empty() {
             // As Electron's importPoses: the pictures come in, then line up as poses from the start.
             let before = self.scene.shapes.len();
@@ -4599,7 +4603,9 @@ impl CanopyApp for Forma {
         let before = self.scene.clone();
         self.run_auto_preview(ui.ctx());
         self.automation(ui.ctx(), host);
-        if host.focused() {
+        // With a dialog up, the editor's keys wait (Delete would otherwise remove a layer behind the Export dialog).
+        let dialog = self.show_projects || self.show_help || self.show_export || self.svg_edit.is_some();
+        if host.focused() && !dialog {
             let undo = ui.input(|i| {
                 i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift
             });
@@ -4856,6 +4862,54 @@ impl CanopyApp for Forma {
     fn title(&self) -> String {
         self.scene.project_name.clone()
     }
+}
+
+/// What a dialog over Forma's pane returns: its contents' result, and whether it should close (its backdrop was
+/// clicked, or Escape pressed).
+struct PaneModal<R> {
+    #[allow(dead_code)]
+    inner: R,
+    close: bool,
+}
+
+/// A dialog over Forma's own pane: egui's Modal dims and blocks the whole window, which inside Canopy froze the
+/// sidebar and the other pane too. This one dims only `pane`, sits in its middle and scrolls when the pane is short.
+fn pane_modal<R>(
+    ctx: &egui::Context,
+    pane: Rect,
+    id: egui::Id,
+    content: impl FnOnce(&mut Ui) -> R,
+) -> PaneModal<R> {
+    let pane = if pane.is_positive() { pane } else { ctx.content_rect() };
+    let backdrop = egui::Area::new(id.with("backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(pane.min)
+        .constrain(false)
+        .show(ctx, |ui| {
+            ui.painter().rect_filled(pane, 10.0, Color32::from_black_alpha(110));
+            // Takes the clicks meant for the editor underneath.
+            ui.allocate_response(pane.size(), Sense::click())
+        })
+        .inner;
+    let inner = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .pivot(Align2::CENTER_CENTER)
+        .fixed_pos(pane.center())
+        .constrain_to(pane.shrink(8.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.set_max_width((pane.width() - 48.0).max(200.0));
+                    egui::ScrollArea::vertical()
+                        .max_height((pane.height() - 60.0).max(120.0))
+                        .show(ui, content)
+                        .inner
+                })
+                .inner
+        })
+        .inner;
+    let close = backdrop.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    PaneModal { inner, close }
 }
 
 /// When a project was saved, said the way people say it ("just now", "5 minutes ago", "3 days ago").
