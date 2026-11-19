@@ -947,6 +947,40 @@ impl Scene {
         self.shapes.len() - 1
     }
 
+    /// Deletes these layers (Electron's Delete layer). Text that followed one of them and stays is left where it is
+    /// at `t`, standing on its own. Returns how many layers went.
+    pub fn delete_layers(&mut self, ids: &[String], t: f64) -> usize {
+        let staying_linked: Vec<usize> = (0..self.shapes.len())
+            .filter(|&i| {
+                let shape = &self.shapes[i];
+                !ids.contains(&shape.id)
+                    && is_linked(shape)
+                    && shape
+                        .extra
+                        .get("linkId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|target| ids.iter().any(|id| id == target))
+            })
+            .collect();
+        for i in staying_linked {
+            let seen = self.render_pose(&self.shapes[i], t);
+            let shape = &mut self.shapes[i];
+            let rotation = shape.rotation_at(t) + shape.base_rotation;
+            let own = shape.pose(t);
+            let Some(mut key) = shape.keys.first().cloned() else {
+                continue;
+            };
+            (key.t, key.x, key.y, key.w, key.h) = (0.0, seen.x, seen.y, seen.w, seen.h);
+            (key.r, key.o) = (seen.r - rotation, own.o);
+            shape.keys = vec![key];
+            shape.extra.insert("linkId".into(), "".into());
+            shape.extra.remove("linkBase");
+        }
+        let before = self.shapes.len();
+        self.shapes.retain(|shape| !ids.contains(&shape.id));
+        before - self.shapes.len()
+    }
+
     fn nudged_copy(&self, layer: &Shape, id: String) -> Shape {
         const NUDGE: f32 = 20.0;
         let mut copy = layer.clone();
@@ -1674,6 +1708,27 @@ mod tests {
             (turned.w - 120.0).abs() < 0.01 && (turned.y - 110.0).abs() < 0.01,
             "{turned:?}"
         );
+    }
+
+    #[test]
+    fn deleting_layers_leaves_their_text_where_it_was() {
+        let mut scene = Scene::empty("test".into());
+        scene.add_shape("a".into(), "circle");
+        scene.add_shape("b".into(), "rect");
+        scene.add_shape("c".into(), "rect");
+        scene.add_text("t".into());
+        scene.shapes[3].extra.insert("linkId".into(), "a".into());
+        let mut pose = scene.editable_pose(&scene.shapes[3], 0.0);
+        pose.x += 30.0;
+        scene.set_pose(3, 0.0, pose);
+        let seen = scene.render_pose(&scene.shapes[3], 0.0);
+        assert_eq!(scene.delete_layers(&["a".into(), "c".into()], 0.0), 2);
+        let ids: Vec<&str> = scene.shapes.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["b", "t"]);
+        let text = &scene.shapes[1];
+        assert!(!is_linked(text), "the text stands on its own");
+        let now = scene.render_pose(text, 0.0);
+        assert!((now.x - seen.x).abs() < 0.01 && (now.y - seen.y).abs() < 0.01, "{now:?} {seen:?}");
     }
 
     #[test]

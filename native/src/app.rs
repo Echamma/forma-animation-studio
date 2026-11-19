@@ -254,7 +254,11 @@ pub struct Forma {
     /// A message for the next toast.
     notice: Option<String>,
     /// A layer copied with Ctrl+C.
-    clipboard: Option<Shape>,
+    clipboard: Vec<Shape>,
+    /// A clip menu choice (the layer's id and the action), run once the timeline has finished drawing: running it
+    /// inside the menu deleted or added layers while the timeline still drew rows by their old positions, and
+    /// deleting the last layer that way crashed Canopy.
+    pending_clip: Option<(String, ClipAction)>,
     /// Where playing a new animation's preview stops.
     preview_end: Option<f64>,
     /// Files picked with the Add button, taken in like dropped files on the next frame.
@@ -331,7 +335,8 @@ impl Forma {
             live_animation_preview: false,
             pending_auto_preview: None,
             notice: None,
-            clipboard: None,
+            clipboard: Vec::new(),
+            pending_clip: None,
             preview_end: None,
             pending_import: Vec::new(),
             pending_poses: Vec::new(),
@@ -2985,6 +2990,17 @@ impl Forma {
                     }
                 });
         });
+        if let Some((id, action)) = self.pending_clip.take() {
+            if self.scene.shapes.iter().any(|s| s.id == id) {
+                // Right-clicking one of several selected layers acts on all of them, as Delete or Ctrl+C do.
+                if self.multi_selected.contains(&id) {
+                    self.selected = Some(id);
+                } else {
+                    self.select_layer(Some(id), false);
+                }
+                self.clip_action(action);
+            }
+        }
         let play_x = x(self.time);
         ui.painter().line_segment(
             [pos2(play_x, rect.top()), pos2(play_x, rect.bottom())],
@@ -3303,13 +3319,13 @@ impl Forma {
                 ("Copy", ClipAction::Copy, "Ctrl+C"),
                 ("Delete clip", ClipAction::Delete, "Delete"),
             ] {
-                let enabled = action != ClipAction::PasteAfter || self.clipboard.is_some();
+                let enabled = action != ClipAction::PasteAfter || !self.clipboard.is_empty();
                 if ui
                     .add_enabled(enabled, egui::Button::new(label).shortcut_text(keys))
                     .clicked()
                 {
                     self.select_clip(index);
-                    self.clip_action(action);
+                    self.pending_clip = Some((id.clone(), action));
                     ui.close();
                 }
             }
@@ -3411,15 +3427,104 @@ impl Forma {
         }
     }
 
-    /// Electron's clip actions, on the selected layer: they report problems as a toast.
+    /// The layers an action works on: every selected layer when several are (Shift-click, Ctrl+A), else the one.
+    /// In the scene's order.
+    fn targets(&self) -> Vec<String> {
+        let Some(selected) = self.selected.as_ref() else {
+            return Vec::new();
+        };
+        let several = self.multi_selected.len() > 1 && self.multi_selected.contains(selected);
+        self.scene
+            .shapes
+            .iter()
+            .filter(|s| if several { self.multi_selected.contains(&s.id) } else { &s.id == selected })
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// Selects these layers together, the first one in the inspector.
+    fn select_all_of(&mut self, ids: Vec<String>) {
+        self.selected = ids.first().cloned();
+        self.multi_selected = ids;
+    }
+
+    /// Electron's clip actions, on the selected layer (Copy, Duplicate and Delete on every selected layer): they
+    /// report problems as a toast.
     fn clip_action(&mut self, action: ClipAction) {
-        if action == ClipAction::Paste {
-            if let Some(copied) = self.clipboard.clone() {
-                let index = self.scene.paste_layer(&copied, new_id());
-                self.selected = Some(self.scene.shapes[index].id.clone());
+        let plural = |n: usize, one: &str| if n == 1 { one.to_owned() } else { format!("{n} layers") };
+        match action {
+            ClipAction::Paste => {
+                if self.clipboard.is_empty() {
+                    return;
+                }
+                let ids: Vec<String> = self
+                    .clipboard
+                    .clone()
+                    .iter()
+                    .map(|copied| {
+                        let index = self.scene.paste_layer(copied, new_id());
+                        self.scene.shapes[index].id.clone()
+                    })
+                    .collect();
+                self.select_all_of(ids);
                 self.edited();
+                return;
             }
-            return;
+            ClipAction::Copy | ClipAction::Duplicate | ClipAction::Delete => {
+                let ids = self.targets();
+                if ids.is_empty() {
+                    self.notice = Some("Select a layer first".into());
+                    return;
+                }
+                let name = |me: &Self, id: &String| {
+                    me.scene.shapes.iter().find(|s| &s.id == id).map(|s| s.name.clone()).unwrap_or_default()
+                };
+                let first = name(self, &ids[0]);
+                self.playing = false;
+                match action {
+                    ClipAction::Copy => {
+                        self.clipboard = self
+                            .scene
+                            .shapes
+                            .iter()
+                            .filter(|s| ids.contains(&s.id))
+                            .cloned()
+                            .collect();
+                        self.notice = Some(format!("{} copied", plural(ids.len(), &first)));
+                    }
+                    ClipAction::Duplicate => {
+                        let copies: Vec<String> = ids
+                            .iter()
+                            .filter_map(|id| {
+                                let index = self.scene.shapes.iter().position(|s| &s.id == id)?;
+                                let copy = self.scene.duplicate_layer(index, new_id());
+                                Some(self.scene.shapes[copy].id.clone())
+                            })
+                            .collect();
+                        if let Some(shape) = self.scene.shapes.iter().find(|s| Some(&s.id) == copies.first()) {
+                            if !shape.visible(self.time, self.scene.duration) {
+                                self.time = shape.clip_start();
+                            }
+                        }
+                        self.notice = Some(if copies.len() == 1 {
+                            format!("{} added", name(self, &copies[0]))
+                        } else {
+                            format!("{} layers duplicated", copies.len())
+                        });
+                        self.select_all_of(copies);
+                        self.edited();
+                    }
+                    _ => {
+                        self.scene.delete_layers(&ids, self.time);
+                        self.select_all_of(Vec::new());
+                        (self.selected_motion, self.selected_spin, self.motion_shown) = (None, None, None);
+                        self.notice = Some(format!("{} deleted", plural(ids.len(), &first)));
+                        self.edited();
+                    }
+                }
+                return;
+            }
+            _ => {}
         }
         let Some(index) = self
             .selected
@@ -3435,7 +3540,7 @@ impl Forma {
                 .scene
                 .continue_after(index, None, self.time, new_id(), new_id())
                 .map(|i| (i, "added — drag it to its next position")),
-            ClipAction::PasteAfter => match self.clipboard.clone() {
+            ClipAction::PasteAfter => match self.clipboard.first().cloned() {
                 Some(template) => self
                     .scene
                     .continue_after(index, Some(&template), self.time, new_id(), new_id())
@@ -3446,20 +3551,8 @@ impl Forma {
                 .scene
                 .split_at(index, self.time, new_id(), new_id())
                 .map(|i| (i, "split off")),
-            ClipAction::Duplicate | ClipAction::Paste => {
-                Ok((self.scene.duplicate_layer(index, new_id()), "added"))
-            }
-            ClipAction::Copy => {
-                self.clipboard = Some(self.scene.shapes[index].clone());
-                self.notice = Some(format!("{} copied", self.scene.shapes[index].name));
-                return;
-            }
-            ClipAction::Delete => {
-                let gone = self.scene.shapes.remove(index);
-                self.selected = None;
-                self.notice = Some(format!("{} deleted", gone.name));
-                self.edited();
-                return;
+            ClipAction::Paste | ClipAction::Copy | ClipAction::Duplicate | ClipAction::Delete => {
+                unreachable!("handled above")
             }
         };
         match result {
