@@ -52,6 +52,21 @@ struct SvgEdit {
     status: String,
 }
 
+/// The inspector's tabs (Electron's Layer, Animate and Scene).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Layer,
+    Animate,
+    Scene,
+}
+
+/// What the drawer beside the tool rail shows (Electron's Add and Layers drawer).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Drawer {
+    Add,
+    Layers,
+}
+
 /// Electron's clip menu and shortcuts.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClipAction {
@@ -261,6 +276,12 @@ pub struct Forma {
     pending_clip: Option<(String, ClipAction)>,
     /// Forma's pane this frame: its dialogs dim and sit in it, not the whole Canopy window.
     pane: Rect,
+    tab: Tab,
+    /// The move and spin picked last frame, to bring up the Animate tab when another is picked.
+    last_picked: (Option<String>, Option<String>),
+    /// The drawer beside the tool rail, if open; `None` until the pane's width first decides it.
+    drawer: Option<Drawer>,
+    drawer_decided: bool,
     /// Where playing a new animation's preview stops.
     preview_end: Option<f64>,
     /// Files picked with the Add button, taken in like dropped files on the next frame.
@@ -340,6 +361,10 @@ impl Forma {
             clipboard: Vec::new(),
             pending_clip: None,
             pane: Rect::NOTHING,
+            tab: Tab::Layer,
+            last_picked: (None, None),
+            drawer: None,
+            drawer_decided: false,
             preview_end: None,
             pending_import: Vec::new(),
             pending_poses: Vec::new(),
@@ -560,13 +585,15 @@ impl Forma {
     }
 
     fn toolbar(&mut self, ui: &mut Ui, host: &mut dyn Host) {
-        // Canopy's toolbar, as StreamCuts has it: the name, history, the project's buttons and playback on the left;
-        // status, toggles and the one filled button (Export) on the right.
+        // Canopy's toolbar: the name, history and the project's buttons on the left; status, MCP and the one filled
+        // button (Export) on the right. Playback sits on the timeline. In a narrow pane (a split) the buttons drop
+        // their words and the status goes, so nothing overlaps.
+        let compact = ui.available_width() < 780.0;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let name = ui.add(
                 egui::TextEdit::singleline(&mut self.scene.project_name)
-                    .desired_width(170.0)
+                    .desired_width(if compact { 120.0 } else { 170.0 })
                     .font(font::bold(14.0)),
             );
             if name.changed() {
@@ -582,47 +609,29 @@ impl Forma {
                     self.redo();
                 }
             });
-            if quiet_button(ui, "Projects", Some(Icon::Project))
-                .on_hover_text("Your projects, and a new one")
-                .clicked()
-            {
+            let projects = if compact {
+                icon_button(ui, Icon::Project, "Your projects, and a new one", false)
+            } else {
+                quiet_button(ui, "Projects", Some(Icon::Project))
+                    .on_hover_text("Your projects, and a new one")
+            };
+            if projects.clicked() {
                 self.show_projects = true;
             }
-            if quiet_button(ui, "New", Some(Icon::Plus))
-                .on_hover_text("An empty canvas")
-                .clicked()
-            {
+            let new = if compact {
+                icon_button(ui, Icon::Plus, "New: an empty canvas", false)
+            } else {
+                quiet_button(ui, "New", Some(Icon::Plus)).on_hover_text("An empty canvas")
+            };
+            if new.clicked() {
                 self.open(Scene::empty(new_id()));
             }
-            if quiet_button(ui, "Help", None).clicked() {
-                self.show_help = true;
-            }
-            ui.add_space(6.0);
-            if icon_button(ui, Icon::SkipBack, "Back to start", false).clicked() {
-                self.playing = false;
-                self.preview_end = None;
-                self.time = 0.0;
-            }
-            let play = if self.playing { Icon::Pause } else { Icon::Play };
-            if icon_button(ui, play, if self.playing { "Pause" } else { "Play" }, self.playing).clicked() {
-                if !self.playing && self.time >= self.scene.duration {
-                    self.time = 0.0;
-                }
-                self.playing = !self.playing;
-                self.preview_end = None;
-                self.last_tick = Instant::now();
-            }
-            if pill(ui, "Loop", None, self.loop_playback)
-                .on_hover_text("Loop playback")
+            if quiet_button(ui, if compact { "?" } else { "Help" }, None)
+                .on_hover_text("The quick guide")
                 .clicked()
             {
-                self.loop_playback = !self.loop_playback;
+                self.show_help = true;
             }
-            ui.label(
-                egui::RichText::new(format!("{:.2} / {:.2} s", self.time, self.scene.duration))
-                    .font(font::ui(13.0))
-                    .color(color::INK_SOFT),
-            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_enabled_ui(self.export.is_none(), |ui| {
                     if primary_button(ui, "Export", Mood::Ember)
@@ -651,11 +660,8 @@ impl Forma {
                         host.toast(format!("MCP could not start: {error}"));
                     }
                 }
-                if pill(ui, "Onion skin", None, self.onion_skin)
-                    .on_hover_text("While editing a clip, faintly show the clip before it on the same track")
-                    .clicked()
-                {
-                    self.onion_skin = !self.onion_skin;
+                if compact {
+                    return;
                 }
                 ui.label(
                     egui::RichText::new(if self.mcp_video.is_some() {
@@ -674,7 +680,76 @@ impl Forma {
         });
     }
 
-    fn layers(&mut self, ui: &mut Ui) {
+    /// Electron's tool rail: Add and Layers open the drawer beside it; Text, Picture and Draw move act at once;
+    /// Scene opens the inspector's Scene tab.
+    fn rail(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            let drawer = self.drawer;
+            if icon_button(ui, Icon::Plus, "Add a shape, text, or picture", drawer == Some(Drawer::Add)).clicked() {
+                self.drawer = if drawer == Some(Drawer::Add) { None } else { Some(Drawer::Add) };
+            }
+            if icon_button(ui, Icon::Grid, "All layers", drawer == Some(Drawer::Layers)).clicked() {
+                self.drawer = if drawer == Some(Drawer::Layers) { None } else { Some(Drawer::Layers) };
+            }
+            ui.separator();
+            if icon_button(ui, Icon::Text, "Add text. With a layer selected, the text follows it.", false).clicked() {
+                self.add_text();
+            }
+            if icon_button(ui, Icon::Image, "Add pictures, SVG artwork, or video", false).clicked() {
+                self.pick_media();
+            }
+            let drawing = self.motion_mode.is_some();
+            let can_draw = self.selected.is_some();
+            ui.add_enabled_ui(can_draw || drawing, |ui| {
+                if icon_button(ui, Icon::Chevron, "Draw a move for the selected layer (Escape stops)", drawing)
+                    .clicked()
+                {
+                    if drawing {
+                        (self.motion_mode, self.motion_draft) = (None, None);
+                    } else {
+                        self.motion_mode = Some("arrow");
+                        self.tab = Tab::Animate;
+                    }
+                }
+            });
+            if icon_button(ui, Icon::Project, "Canvas size, length, and background", self.tab == Tab::Scene)
+                .clicked()
+            {
+                self.tab = Tab::Scene;
+            }
+        });
+    }
+
+    /// Text on its own, or following the selected layer when that isn't text (Electron's addText).
+    fn add_text(&mut self) {
+        let target = self
+            .selected
+            .as_deref()
+            .and_then(|id| self.scene.shapes.iter().position(|s| s.id == id))
+            .filter(|&i| self.scene.shapes[i].kind != "text");
+        let id = match target {
+            Some(target) => self.scene.add_linked_text(new_id(), target),
+            None => self.scene.add_text(new_id()),
+        };
+        self.select_layer(Some(id), false);
+        self.tab = Tab::Layer;
+        self.edited();
+    }
+
+    fn pick_media(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Add pictures, SVG artwork or video")
+            .add_filter(
+                "Pictures, SVG and video",
+                &["png", "jpg", "jpeg", "webp", "svg", "mp4", "webm", "ogv"],
+            )
+            .pick_files();
+        self.pending_import.extend(picked.unwrap_or_default());
+    }
+
+    /// The drawer beside the rail: Add (shapes, text, files, stop-motion) or Layers (the list), as tabs.
+    fn drawer(&mut self, ui: &mut Ui) {
         if !self
             .selected
             .as_ref()
@@ -682,35 +757,65 @@ impl Forma {
         {
             self.multi_selected.clear();
         }
-        section_label(ui, "Layers");
-        ui.add_space(6.0);
-        for (label, kind) in [
-            ("Circle", "circle"),
-            ("Rectangle", "rect"),
-            ("Triangle", "triangle"),
-            ("Diamond", "diamond"),
-            ("Arrow", "arrow"),
-        ] {
-            if quiet_button(ui, label, Some(Icon::Plus)).clicked() {
-                let id = self.scene.add_layer(new_id(), kind);
-                self.selected = Some(id);
-                self.edited();
+        ui.horizontal(|ui| {
+            for (which, label) in [(Drawer::Add, "Add"), (Drawer::Layers, "Layers")] {
+                let on = self.drawer == Some(which);
+                let text = egui::RichText::new(label).font(if on { font::bold(14.0) } else { font::ui(14.0) });
+                if ui.selectable_label(on, text).clicked() {
+                    self.drawer = Some(which);
+                }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, Icon::Close, "Close", false).clicked() {
+                    self.drawer = None;
+                }
+            });
+        });
+        ui.separator();
+        match self.drawer {
+            Some(Drawer::Add) => self.drawer_add(ui),
+            Some(Drawer::Layers) => self.drawer_layers(ui),
+            None => {}
         }
+    }
+
+    fn drawer_add(&mut self, ui: &mut Ui) {
+        section_label(ui, "Shapes");
+        ui.horizontal_wrapped(|ui| {
+            for (label, kind) in [
+                ("Circle", "circle"),
+                ("Rectangle", "rect"),
+                ("Triangle", "triangle"),
+                ("Diamond", "diamond"),
+                ("Arrow", "arrow"),
+            ] {
+                if quiet_button(ui, label, Some(Icon::Plus)).clicked() {
+                    let id = self.scene.add_layer(new_id(), kind);
+                    self.select_layer(Some(id), false);
+                    self.tab = Tab::Layer;
+                    self.edited();
+                }
+            }
+        });
+        ui.add_space(6.0);
+        let follows = self
+            .selected
+            .as_deref()
+            .and_then(|id| self.scene.shapes.iter().find(|s| s.id == id))
+            .is_some_and(|s| s.kind != "text");
+        if quiet_button(ui, "Text", Some(Icon::Text))
+            .on_hover_text(if follows { "Text that follows the selected layer" } else { "Text on its own" })
+            .clicked()
+        {
+            self.add_text();
+        }
+        ui.add_space(6.0);
+        section_label(ui, "Your files");
         if quiet_button(ui, "Picture, SVG or video…", Some(Icon::Image)).clicked() {
-            let picked = rfd::FileDialog::new()
-                .set_title("Add pictures, SVG artwork or video")
-                .add_filter(
-                    "Pictures, SVG and video",
-                    &["png", "jpg", "jpeg", "webp", "svg", "mp4", "webm", "ogv"],
-                )
-                .pick_files();
-            self.pending_import.extend(picked.unwrap_or_default());
+            self.pick_media();
         }
         if quiet_button(ui, "Stop-motion poses…", Some(Icon::Image))
-            .on_hover_text(
-                "Pictures in the order picked become poses, half a second each, on one track",
-            )
+            .on_hover_text("Pictures in the order picked become poses, half a second each, on one track")
             .clicked()
         {
             let picked = rfd::FileDialog::new()
@@ -719,48 +824,58 @@ impl Forma {
                 .pick_files();
             self.pending_poses.extend(picked.unwrap_or_default());
         }
-        // With a layer selected that isn't text, new text follows it (Electron's addText).
-        let target = self
-            .selected
-            .as_deref()
-            .and_then(|id| self.scene.shapes.iter().position(|s| s.id == id))
-            .filter(|&i| self.scene.shapes[i].kind != "text");
-        if quiet_button(ui, "Text", Some(Icon::Text))
-            .on_hover_text(if target.is_some() {
-                "Text that follows the selected layer"
-            } else {
-                "Text on its own"
-            })
-            .clicked()
-        {
-            let id = match target {
-                Some(target) => self.scene.add_linked_text(new_id(), target),
-                None => self.scene.add_text(new_id()),
+        ui.label(egui::RichText::new("Or drop files onto the canvas.").color(color::INK_MUTED));
+        ui.add_space(8.0);
+        if ui.button("Load default project").clicked() {
+            // As Electron's: the default project if there is one, else the example scene.
+            let id = new_id();
+            let (scene, notice) = match storage::load_default(&self.place, id.clone()) {
+                Ok(Some(scene)) => (scene, "Default project loaded".to_owned()),
+                Ok(None) => (Scene::example(id), "Example scene loaded".to_owned()),
+                Err(error) => (
+                    Scene::example(id),
+                    format!(
+                        "The default project couldn't be opened ({error}); here's the example scene"
+                    ),
+                ),
             };
-            self.selected = Some(id);
+            self.open(scene);
             self.edited();
+            self.notice = Some(notice);
         }
         ui.separator();
-        if ui
-            .add_enabled(
-                self.selected.is_some(),
-                egui::Button::new("Duplicate selected"),
-            )
-            .on_hover_text("Ctrl+D")
-            .clicked()
-        {
-            self.clip_action(ClipAction::Duplicate);
+        ui.label(egui::RichText::new("New to animation?").font(font::bold(12.0)));
+        ui.label("Move the playhead, change a layer, then press play.");
+        if ui.link("Show the quick guide").clicked() {
+            self.show_help = true;
         }
-        if ui
-            .add_enabled(
-                self.selected.is_some(),
-                egui::Button::new("Delete selected"),
-            )
-            .on_hover_text("Delete")
-            .clicked()
-        {
-            self.clip_action(ClipAction::Delete);
-        }
+    }
+
+    fn drawer_layers(&mut self, ui: &mut Ui) {
+        let several = self.targets().len() > 1;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(self.selected.is_some(), egui::Button::new("Duplicate"))
+                .on_hover_text("Ctrl+D")
+                .clicked()
+            {
+                self.clip_action(ClipAction::Duplicate);
+            }
+            let label = if several { "Delete all picked" } else { "Delete" };
+            if ui
+                .add_enabled(self.selected.is_some(), egui::Button::new(label))
+                .on_hover_text("Delete")
+                .clicked()
+            {
+                self.clip_action(ClipAction::Delete);
+            }
+        });
+        let hint = if self.scene.shapes.is_empty() {
+            "No layers yet: add one from Add."
+        } else {
+            "Shift-click picks several; drag one to reorder."
+        };
+        ui.label(egui::RichText::new(hint).color(color::INK_MUTED));
         egui::ScrollArea::vertical()
             .id_salt("forma-layers")
             // The whole Layers panel scrolls (see `ui`), so the list grows with it and the tip below stays reachable.
@@ -817,38 +932,12 @@ impl Forma {
                     }
                 }
             });
-        ui.add_space(6.0);
-        if ui.button("Load default project").clicked() {
-            // As Electron's: the default project if there is one, else the example scene.
-            let id = new_id();
-            let (scene, notice) = match storage::load_default(&self.place, id.clone()) {
-                Ok(Some(scene)) => (scene, "Default project loaded".to_owned()),
-                Ok(None) => (Scene::example(id), "Example scene loaded".to_owned()),
-                Err(error) => (
-                    Scene::example(id),
-                    format!(
-                        "The default project couldn't be opened ({error}); here's the example scene"
-                    ),
-                ),
-            };
-            self.open(scene);
-            self.edited();
-            self.notice = Some(notice);
-        }
-        ui.separator();
-        ui.label(egui::RichText::new("New to animation?").font(font::bold(12.0)));
-        ui.label("Move the playhead, change a layer, then press play.");
-        if ui.link("Show the quick guide").clicked() {
-            self.show_help = true;
-        }
     }
 
+    /// The Scene tab: canvas size, background and length (Electron's Scene panel).
     fn scene_settings(&mut self, ui: &mut Ui) {
-        let open = std::mem::take(&mut self.open_scene).then_some(true);
-        let header = egui::CollapsingHeader::new("Scene settings")
-            .id_salt("forma-scene-settings")
-            .open(open)
-            .show(ui, |ui| {
+        section_label(ui, "Canvas");
+        ui.scope(|ui| {
                 let (mut width, mut height) = (self.scene.width as u32, self.scene.height as u32);
                 // Wrapped: the inspector is narrower than the three sizes side by side.
                 ui.horizontal_wrapped(|ui| {
@@ -944,9 +1033,6 @@ impl Forma {
                     self.edited();
                 }
             });
-        if open.is_some() {
-            header.header_response.scroll_to_me(Some(egui::Align::TOP));
-        }
     }
 
     /// The selected layers, in the order they were picked (the main one included once).
@@ -1167,19 +1253,60 @@ impl Forma {
         }
     }
 
+    /// The inspector, in Electron's three tabs: Layer (how it looks, when it shows, where it is), Animate (easing and
+    /// every animation) and Scene (canvas size, background, length).
     fn inspector(&mut self, ui: &mut Ui) {
-        self.scene_settings(ui);
-        self.arrange_panel(ui);
-        section_label(ui, "Layer");
+        if std::mem::take(&mut self.open_scene) {
+            self.tab = Tab::Scene;
+        }
+        // Picking a move or a spin on the timeline brings up its settings.
+        let picked = (self.selected_motion.clone(), self.selected_spin.clone());
+        if picked != self.last_picked {
+            if picked.0.is_some() || picked.1.is_some() {
+                self.tab = Tab::Animate;
+            }
+            self.last_picked = picked;
+        }
+        ui.horizontal(|ui| {
+            for (tab, label) in [
+                (Tab::Layer, "Layer"),
+                (Tab::Animate, "Animate"),
+                (Tab::Scene, "Scene"),
+            ] {
+                let text = egui::RichText::new(label).font(if self.tab == tab {
+                    font::bold(14.0)
+                } else {
+                    font::ui(14.0)
+                });
+                if ui.selectable_label(self.tab == tab, text).clicked() {
+                    self.tab = tab;
+                }
+            }
+        });
+        ui.separator();
+        if self.tab == Tab::Scene {
+            self.scene_settings(ui);
+            return;
+        }
         let Some(index) = self
             .scene
             .shapes
             .iter()
             .position(|s| Some(s.id.as_str()) == self.selected.as_deref())
         else {
-            ui.label("Select a shape to edit it.");
+            ui.label(
+                egui::RichText::new(
+                    "Select a layer on the canvas, in the timeline or in Layers to edit it.",
+                )
+                .color(color::INK_MUTED),
+            );
             return;
         };
+        if self.tab == Tab::Animate {
+            self.animate_tab(ui, index);
+            return;
+        }
+        self.arrange_panel(ui);
         self.clip_fields(ui, index);
         let mut pose = self
             .scene
@@ -1341,20 +1468,27 @@ impl Forma {
         }
         let mut posed = false;
         let before = pose;
-        for (label, value, range) in [
-            ("X", &mut pose.x, -4000.0..=4000.0),
-            ("Y", &mut pose.y, -4000.0..=4000.0),
-            ("Width", &mut pose.w, 1.0..=4000.0),
-            ("Height", &mut pose.h, 1.0..=4000.0),
-            ("Angle", &mut pose.r, -3600.0..=3600.0),
-            ("Opacity", &mut pose.o, 0.0..=100.0),
-        ] {
-            posed |= ui
-                .add(egui::Slider::new(value, range).text(label))
-                .changed();
-        }
-        ui.separator();
-        let added = ui.button("Add keyframe here").clicked();
+        // Exact numbers, folded away as in Electron: dragging on the canvas does the same.
+        egui::CollapsingHeader::new("Position & size")
+            .id_salt("forma-position")
+            .show(ui, |ui| {
+                for (label, value, range) in [
+                    ("X", &mut pose.x, -4000.0..=4000.0),
+                    ("Y", &mut pose.y, -4000.0..=4000.0),
+                    ("Width", &mut pose.w, 1.0..=4000.0),
+                    ("Height", &mut pose.h, 1.0..=4000.0),
+                    ("Angle", &mut pose.r, -3600.0..=3600.0),
+                    ("Opacity", &mut pose.o, 0.0..=100.0),
+                ] {
+                    posed |= ui
+                        .add(egui::Slider::new(value, range).text(label))
+                        .changed();
+                }
+            });
+        let added = ui
+            .button("Add keyframe here")
+            .on_hover_text("Remember the layer as it is now at the playhead")
+            .clicked();
         if posed || added {
             self.scene.set_pose(index, self.time, pose);
             changed = true;
@@ -1389,10 +1523,36 @@ impl Forma {
                 self.scene.set_pose(other, self.time, p);
             }
         }
+        ui.label(
+            egui::RichText::new(format!("{} keyframes", self.scene.shapes[index].keys.len()))
+                .color(color::INK_MUTED),
+        );
+        if changed || added {
+            self.edited();
+        }
+        ui.add_space(10.0);
+        if ui
+            .button(if self.targets().len() > 1 {
+                "Delete selected layers"
+            } else {
+                "Delete layer"
+            })
+            .on_hover_text("Delete")
+            .clicked()
+        {
+            self.clip_action(ClipAction::Delete);
+        }
+    }
+
+    /// The Animate tab: one-click animations, easing, and the moves, spins and fades on the layer.
+    fn animate_tab(&mut self, ui: &mut Ui, index: usize) {
+        let pose = self
+            .scene
+            .editable_pose(&self.scene.shapes[index], self.time);
+        let mut changed = false;
         let shape = &mut self.scene.shapes[index];
-        ui.label(format!("{} keyframes", shape.keys.len()));
         let mut animated = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Move →").clicked() {
                 shape.edit_pose(self.time, pose);
                 shape.edit_pose(
@@ -1424,7 +1584,7 @@ impl Forma {
         ui.horizontal(|ui| {
             ui.label("Easing");
             egui::ComboBox::from_id_salt(("ease", &shape.id))
-                .selected_text(&shape.ease)
+                .selected_text(EASES.iter().find(|(_, kind)| *kind == shape.ease).map_or(shape.ease.as_str(), |(name, _)| name))
                 .show_ui(ui, |ui| {
                     for (label, kind) in [
                         ("Smooth", "smooth"),
@@ -1445,7 +1605,7 @@ impl Forma {
         if animated {
             self.scene.duration = self.scene.duration.max(self.time + 1.0);
         }
-        if changed || added || animated {
+        if changed || animated {
             self.edited();
         }
         self.motion_panel(ui, index);
@@ -1703,12 +1863,16 @@ impl Forma {
                 .inner_margin(egui::Margin::symmetric(10, 4))
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
-                        let name: String = self.scene.shapes[index].name.chars().take(18).collect();
-                        ui.label(
-                            egui::RichText::new(format!("Animate {name}"))
-                                .font(font::ui(12.0))
-                                .color(color::INK_MUTED),
-                        );
+                        // In a narrow canvas only the four buttons fit.
+                        if bar.width() >= 380.0 {
+                            let name: String =
+                                self.scene.shapes[index].name.chars().take(18).collect();
+                            ui.label(
+                                egui::RichText::new(format!("Animate {name}"))
+                                    .font(font::ui(12.0))
+                                    .color(color::INK_MUTED),
+                            );
+                        }
                         if ui
                             .button("Move")
                             .on_hover_text("Draw where it should go")
@@ -2307,7 +2471,13 @@ impl Forma {
                     "Square"
                 };
                 let playing = if self.playing { " · Playing" } else { "" };
-                let size = ui.button(format!("{shape} · {w} × {h}{playing}")).on_hover_text("Canvas size, length, and background");
+                // A narrow canvas (a split pane) keeps just the size, so the zoom buttons still fit beside it.
+                let label = if bar.width() < 330.0 {
+                    format!("{w} × {h}")
+                } else {
+                    format!("{shape} · {w} × {h}{playing}")
+                };
+                let size = ui.button(label).on_hover_text("Canvas size, length, and background");
                 back(ui, backing[0], size.rect);
                 if size.clicked() {
                     self.open_scene = true;
@@ -2946,9 +3116,55 @@ impl Forma {
         groups.into_iter().flat_map(|(_, rows)| rows).collect()
     }
 
+    /// Playback above the timeline, as in Electron: back to start, play, loop, the time, and onion skin.
+    fn transport(&mut self, ui: &mut Ui) {
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if icon_button(ui, Icon::SkipBack, "Back to start (Home)", false).clicked() {
+                self.playing = false;
+                self.preview_end = None;
+                self.time = 0.0;
+            }
+            let play = if self.playing { Icon::Pause } else { Icon::Play };
+            let label = if self.playing { "Pause (Space)" } else { "Play (Space)" };
+            if icon_button(ui, play, label, self.playing).clicked() {
+                if !self.playing && self.time >= self.scene.duration {
+                    self.time = 0.0;
+                }
+                self.playing = !self.playing;
+                self.preview_end = None;
+                self.last_tick = Instant::now();
+            }
+            if pill(ui, "Loop", None, self.loop_playback)
+                .on_hover_text("Loop playback")
+                .clicked()
+            {
+                self.loop_playback = !self.loop_playback;
+            }
+            ui.label(
+                egui::RichText::new(format!("{:.2} / {:.2} s", self.time, self.scene.duration))
+                    .font(font::ui(13.0))
+                    .color(color::INK_SOFT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if pill(ui, "Onion skin", None, self.onion_skin)
+                    .on_hover_text("While editing a clip, faintly show the clip before it on the same track")
+                    .clicked()
+                {
+                    self.onion_skin = !self.onion_skin;
+                }
+            });
+        });
+    }
+
     fn timeline(&mut self, ui: &mut Ui) {
-        let rect = ui.max_rect();
-        ui.painter().add(pane_frame(Mood::Ember).paint(rect));
+        let full = ui.max_rect();
+        ui.painter().add(pane_frame(Mood::Ember).paint(full));
+        let bar = Rect::from_min_size(full.min, vec2(full.width(), 36.0));
+        ui.scope_builder(UiBuilder::new().max_rect(bar.shrink2(vec2(8.0, 2.0))), |ui| {
+            self.transport(ui)
+        });
+        let rect = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
         let left = rect.left() + 130.0;
         let width = (rect.width() - 150.0).max(1.0);
         let duration = self.scene.duration;
@@ -4704,26 +4920,72 @@ impl CanopyApp for Forma {
             UiBuilder::new().max_rect(top.shrink2(vec2(7.0, 4.0))),
             |ui| self.toolbar(ui, host),
         );
-        let timeline_h = (rect.height() * 0.28).clamp(150.0, 230.0);
+        // The timeline with its playback strip on top.
+        let timeline_h = (rect.height() * 0.3).clamp(186.0, 266.0);
         let middle = Rect::from_min_max(
             pos2(rect.left(), top.bottom() + 4.0),
             pos2(rect.right(), rect.bottom() - timeline_h - 6.0),
         );
-        // Wide enough for Canopy's outlined Add buttons.
-        let left = Rect::from_min_size(middle.min, vec2(205.0, middle.height()));
-        let right = Rect::from_min_max(pos2(middle.right() - 230.0, middle.top()), middle.max);
+        // The drawer starts open when there's room for it beside a good-sized canvas, closed in a narrow pane.
+        if !self.drawer_decided {
+            self.drawer_decided = true;
+            if rect.width() >= 1150.0 {
+                self.drawer = Some(Drawer::Add);
+            }
+        }
+        // The tool rail, the drawer when open, the canvas, and the inspector (narrower in a narrow pane).
+        let rail = Rect::from_min_size(middle.min, vec2(46.0, middle.height()));
+        let inspector_w = if rect.width() < 900.0 { 230.0 } else { 260.0 };
+        let right = Rect::from_min_max(pos2(middle.right() - inspector_w, middle.top()), middle.max);
+        let drawer = Rect::from_min_size(pos2(rail.right() + 5.0, middle.top()), vec2(215.0, middle.height()));
+        // Beside a canvas narrower than this (a split pane), the drawer floats over the canvas instead.
+        let docked = self.drawer.is_some() && right.left() - drawer.right() >= 330.0;
+        let left_edge = if docked { drawer.right() } else { rail.right() };
         let canvas = Rect::from_min_max(
-            pos2(left.right() + 5.0, middle.top()),
+            pos2(left_edge + 5.0, middle.top()),
             pos2(right.left() - 5.0, middle.bottom()),
         );
-        ui.painter().add(pane_frame(Mood::Ember).paint(left));
+        ui.painter().add(pane_frame(Mood::Ember).paint(rail));
         ui.painter().add(pane_frame(Mood::Ember).paint(right));
-        ui.scope_builder(UiBuilder::new().max_rect(left.shrink(8.0)), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("forma-layers-panel")
-                .auto_shrink(false)
-                .show(ui, |ui| self.layers(ui));
+        ui.scope_builder(UiBuilder::new().max_rect(rail.shrink2(vec2(4.0, 8.0))), |ui| {
+            self.rail(ui)
         });
+        if docked {
+            ui.painter().add(pane_frame(Mood::Ember).paint(drawer));
+            ui.scope_builder(UiBuilder::new().max_rect(drawer.shrink(8.0)), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("forma-drawer")
+                    .auto_shrink(false)
+                    .show(ui, |ui| self.drawer(ui));
+            });
+        } else if self.drawer.is_some() {
+            // Its own layer, so the canvas underneath neither zooms nor picks through it.
+            egui::Area::new(ui.scope_id().with("forma-drawer-float"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(drawer.min)
+                .constrain(false)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::new()
+                        .fill(Mood::Ember.pane_solid())
+                        .stroke(Stroke::new(1.0, color::HAIRLINE_STRONG))
+                        .corner_radius(10.0)
+                        .shadow(egui::Shadow {
+                            offset: [0, 6],
+                            blur: 18,
+                            spread: 0,
+                            color: color::SHADOW,
+                        })
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_width(drawer.width() - 16.0);
+                            ui.set_height(drawer.height() - 16.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("forma-drawer")
+                                .auto_shrink(false)
+                                .show(ui, |ui| self.drawer(ui));
+                        });
+                });
+        }
         ui.scope_builder(UiBuilder::new().max_rect(canvas), |ui| self.canvas(ui));
         ui.scope_builder(UiBuilder::new().max_rect(right.shrink(8.0)), |ui| {
             egui::ScrollArea::vertical()
