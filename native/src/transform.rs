@@ -1,5 +1,5 @@
 use crate::keyframes::Property;
-use crate::model::{Pose, Scene, Shape, is_linked};
+use crate::model::{MAX_BLUR, Pose, Scene, Shape, is_linked};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tiny_skia::{Point, Transform};
@@ -371,10 +371,11 @@ impl Shape {
                 }
             },
         );
-        if let Some(blur) = self.extra.get_mut("blur") {
-            if let Some(value) = blur.as_f64() {
-                *blur = serde_json::json!(value * f64::from(max_scale(basis)));
-            }
+        if let Some(blur) = self.extra.get_mut("blur")
+            && let Some(value) = blur.as_f64()
+        {
+            let scaled = value.clamp(0.0, MAX_BLUR) * f64::from(max_scale(basis));
+            *blur = serde_json::json!(scaled.clamp(0.0, MAX_BLUR));
         }
         self.parent_space = None;
     }
@@ -690,6 +691,32 @@ mod tests {
             scene.resize(600.0, 960.0);
             let p = scene.shapes[index].pose(0.0);
             assert_near((p.w, p.h), (size.0 * 0.625, size.1 * 0.625));
+        }
+    }
+
+    #[test]
+    fn unfollowing_bakes_blur_within_electrons_limit() {
+        for (blur, expected) in [(40, 80.0), (60, 100.0)] {
+            let mut scene = scene();
+            scene.shapes[1].extra.insert("blur".into(), blur.into());
+            scene.set_parent(1, Some(0), 0.0).unwrap();
+            let parent = &mut scene.shapes[0].keys[0];
+            parent.w *= 2.0;
+            parent.h *= 2.0;
+
+            scene.set_parent(1, None, 0.0).unwrap();
+            let child = &scene.shapes[1];
+            assert!(child.parent.is_none() && child.parent_space.is_none());
+            assert_eq!(child.extra["blur"].as_f64(), Some(expected));
+
+            let saved = serde_json::to_value(&scene).unwrap();
+            // Electron's src/model/validate.js allows an absent blur or a finite number in [0, 100].
+            for layer in saved["shapes"].as_array().unwrap() {
+                if let Some(blur) = layer.get("blur") {
+                    assert!(blur.as_f64().is_some_and(|v| (0.0..=100.0).contains(&v)));
+                }
+            }
+            assert_eq!(saved["shapes"][1]["blur"].as_f64(), Some(expected));
         }
     }
 

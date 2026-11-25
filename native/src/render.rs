@@ -1,7 +1,7 @@
 //! Frame-accurate software rendering of a scene, the way Electron Forma's canvas paints it (`src/render/paint.js`).
 //! Exports and the editor's preview both draw through it, so what the editor shows is what gets exported.
 
-use crate::model::{Scene, Shape};
+use crate::model::{MAX_BLUR, Scene, Shape};
 use crate::transform::LayerFrame;
 use crate::{assets, svg, text};
 use canopy_ui::Place;
@@ -396,7 +396,7 @@ pub(crate) fn blur(shape: &Shape) -> f32 {
         .get("blur")
         .and_then(|v| v.as_f64())
         .filter(|v| v.is_finite())
-        .map_or(0.0, |v| v.max(0.0) as f32)
+        .map_or(0.0, |v| v.clamp(0.0, MAX_BLUR) as f32)
 }
 
 /// Gaussian blur with standard deviation `sigma` (what CSS `blur()` means), as three box blurs each way, the
@@ -745,6 +745,18 @@ mod tests {
                 "x {x}: {} where Electron has {electron}",
                 darkness(x)
             );
+        }
+    }
+
+    #[test]
+    fn stored_blur_is_clamped_to_electrons_range() {
+        let mut scene = Scene::empty("blur-limit".into());
+        scene.add_shape("a".into(), "rect");
+        let shape = &mut scene.shapes[0];
+        assert_eq!(blur(shape), 0.0);
+        for (stored, expected) in [(-1.0, 0.0), (60.0, 60.0), (1e100, 100.0)] {
+            shape.extra.insert("blur".into(), stored.into());
+            assert_eq!(blur(shape), expected);
         }
     }
 

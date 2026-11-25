@@ -604,7 +604,7 @@ mod tests {
         let mut scene = Scene::empty("svg-blur".into());
         scene.add_shape("parent".into(), "rect");
         scene.add_shape("child".into(), "circle");
-        scene.shapes[1].extra.insert("blur".into(), 8.into());
+        scene.shapes[1].extra.insert("blur".into(), 60.into());
         scene.set_parent(1, Some(0), 0.0).unwrap();
         let parent = &mut scene.shapes[0];
         let pose = parent.pose(0.0);
@@ -623,15 +623,15 @@ mod tests {
             .descendants()
             .find(|n| n.has_tag_name("feGaussianBlur"))
             .unwrap();
-        assert_eq!(blur.attribute("stdDeviation"), Some("8"));
+        assert_eq!(blur.attribute("stdDeviation"), Some("60"));
         let motion = blur.first_element_child().unwrap();
         assert_eq!(motion.attribute("attributeName"), Some("stdDeviation"));
         assert_eq!(
             motion.attribute("values").unwrap().rsplit(';').next(),
-            Some("16")
+            Some("120")
         );
         let svg = still(&scene, &place(), 1.0).unwrap();
-        assert!(svg.contains(r#"<feGaussianBlur stdDeviation="16"/>"#));
+        assert!(svg.contains(r#"<feGaussianBlur stdDeviation="120"/>"#));
         assert!(crate::svg::parse(&svg).is_ok());
     }
 

@@ -2,8 +2,11 @@
 
 use crate::keyframes::{Lane, Property};
 use crate::transform::Anchor;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+pub(crate) const MAX_BLUR: f64 = 100.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,8 +58,29 @@ pub struct Shape {
     pub parent_space: Option<[f32; 6]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<Anchor>,
-    #[serde(flatten)]
+    #[serde(flatten, serialize_with = "serialize_shape_extra")]
     pub extra: Map<String, Value>,
+}
+
+// Repair blur values from older native saves for Electron's project validator.
+fn serialize_shape_extra<S>(extra: &Map<String, Value>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut map = serializer.serialize_map(None)?;
+    for (name, value) in extra {
+        if name == "blur" {
+            let Some(blur) = value.as_f64().filter(|blur| blur.is_finite()) else {
+                continue;
+            };
+            if !(0.0..=MAX_BLUR).contains(&blur) {
+                map.serialize_entry(name, &blur.clamp(0.0, MAX_BLUR))?;
+                continue;
+            }
+        }
+        map.serialize_entry(name, value)?;
+    }
+    map.end()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1894,6 +1918,33 @@ mod tests {
             "Electron rejects null optional fields"
         );
         assert!(output["shapes"][0]["keys"][0].get("ease").is_none());
+    }
+
+    #[test]
+    fn saving_repairs_invalid_blur_from_older_projects() {
+        let mut scene = Scene::empty("blur-limit".into());
+        for (id, blur) in [
+            ("over", Some(120.into())),
+            ("under", Some((-1).into())),
+            ("invalid", Some("60".into())),
+            ("valid", Some(60.into())),
+            ("absent", None),
+        ] {
+            scene.add_shape(id.into(), "rect");
+            if let Some(blur) = blur {
+                let shape = scene.shapes.last_mut().unwrap();
+                shape.extra.insert("blur".into(), blur);
+            }
+        }
+
+        let bytes = serde_json::to_vec(&scene).unwrap();
+        let saved: Value = serde_json::from_slice(&bytes).unwrap();
+        let shapes = saved["shapes"].as_array().unwrap();
+        assert_eq!(shapes[0]["blur"].as_f64(), Some(100.0));
+        assert_eq!(shapes[1]["blur"].as_f64(), Some(0.0));
+        assert!(shapes[2].get("blur").is_none());
+        assert_eq!(shapes[3]["blur"].as_i64(), Some(60));
+        assert!(shapes[4].get("blur").is_none());
     }
 
     #[test]
