@@ -22,32 +22,31 @@ enum Edit {
 
 pub(crate) fn layer(ui: &mut Ui, shape: &mut Shape, time: f64, lanes_shown: bool) -> bool {
     ui.push_id(&shape.id.clone(), |ui| {
-        CollapsingHeader::new("Effects")
-            .show(ui, |ui| {
-                ui.spacing_mut().interact_size.y = 32.0;
-                ui.checkbox(&mut shape.motion_blur, "Motion blur");
-                let mut reveal = false;
-                if add_menu(ui, shape) {
-                    reveal = true;
-                }
-                if !shape.effects.is_empty()
-                    && ui
-                        .add(Button::selectable(
-                            lanes_shown,
-                            "Show effect animation lanes",
-                        ))
-                        .clicked()
-                {
-                    reveal = true;
-                }
-                let actions = draw_stack(ui, shape, time);
-                for action in actions {
-                    apply_edit(shape, action);
-                }
-                reveal
-            })
-            .body_returned
-            .unwrap_or(false)
+        crate::panel_widgets::section(ui, CollapsingHeader::new("Effects"), |ui| {
+            ui.spacing_mut().interact_size.y = 32.0;
+            ui.checkbox(&mut shape.motion_blur, "Motion blur");
+            let mut reveal = false;
+            if add_menu(ui, shape) {
+                reveal = true;
+            }
+            if !shape.effects.is_empty()
+                && ui
+                    .add(Button::selectable(
+                        lanes_shown,
+                        "Show effect animation lanes",
+                    ))
+                    .clicked()
+            {
+                reveal = true;
+            }
+            let actions = draw_stack(ui, shape, time);
+            for action in actions {
+                apply_edit(shape, action);
+            }
+            reveal
+        })
+        .body_returned
+        .unwrap_or(false)
     })
     .inner
 }
@@ -113,9 +112,13 @@ fn draw_stack(ui: &mut Ui, shape: &mut Shape, time: f64) -> Vec<Edit> {
     let count = shape.effects.len();
     for (index, effect) in shape.effects.iter_mut().enumerate() {
         ui.push_id(effect.id, |ui| {
-            let folded = CollapsingHeader::new(effect.kind.label()).show(ui, |ui| {
-                controls(ui, effect, &shape.ease, time);
-            });
+            let folded = crate::panel_widgets::section(
+                ui,
+                CollapsingHeader::new(effect.kind.label()),
+                |ui| {
+                    controls(ui, effect, &shape.ease, time);
+                },
+            );
             let header = ui
                 .horizontal_wrapped(|ui| {
                     ui.checkbox(&mut effect.enabled, "On")

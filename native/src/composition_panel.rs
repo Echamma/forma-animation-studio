@@ -176,37 +176,49 @@ impl Forma {
         let current = self.scene.project_id.clone();
         let main = self.main_id().to_owned();
         let breadcrumbs = self.composition_path.clone();
-        let modal = pane_modal(
-            ui.ctx(),
-            self.pane,
-            ui.scope_id().with("compositions"),
-            |ui| {
-                ui.set_width(500.0);
-                section_label(ui, "Compositions");
-                ui.horizontal_wrapped(|ui| {
-                    for (id, time) in breadcrumbs {
-                        let name = self
-                            .scene
-                            .composition(&id)
-                            .map_or("Main", |item| item.project_name.as_str());
-                        if quiet_button(ui, name, None).clicked() {
-                            open = Some((id, time));
-                        }
-                        ui.label("›");
+        let pane = self.pane;
+        let modal = pane_dialog(ui.ctx(), pane, ui.scope_id().with("compositions"), |ui| {
+            ui.set_width(500.0_f32.min(ui.available_width()));
+            section_label(ui, "Compositions");
+            ui.horizontal_wrapped(|ui| {
+                for (id, time) in breadcrumbs {
+                    let name = self
+                        .scene
+                        .composition(&id)
+                        .map_or("Main", |item| item.project_name.as_str());
+                    if quiet_button(ui, &abbreviated(name), None)
+                        .on_hover_text(name)
+                        .clicked()
+                    {
+                        open = Some((id, time));
                     }
-                    ui.label(&self.scene.project_name);
-                });
-                ui.horizontal_wrapped(|ui| {
-                    create = quiet_button(ui, "New composition", None).clicked();
-                    import = quiet_button(ui, "Import Lottie", None).clicked();
-                });
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(300.0)
-                    .show(ui, |ui| {
+                    ui.label("›");
+                }
+                ui.label(&self.scene.project_name);
+            });
+            ui.horizontal_wrapped(|ui| {
+                create = quiet_button(ui, "New composition", None).clicked();
+                import = quiet_button(ui, "Import Lottie", None).clicked();
+            });
+            ui.separator();
+            ui.spacing_mut().scroll.floating = false;
+            egui::ScrollArea::vertical()
+                .max_height((pane.height() - 196.0).clamp(0.0, 360.0))
+                .show(ui, |ui| {
+                    composition_row(
+                        ui,
+                        &mut self.scene,
+                        &main,
+                        &current,
+                        &mut open,
+                        &mut add,
+                        &mut duplicate,
+                        &mut delete,
+                    );
+                    for item in &mut self.scene.compositions {
                         composition_row(
                             ui,
-                            &mut self.scene,
+                            item,
                             &main,
                             &current,
                             &mut open,
@@ -214,22 +226,10 @@ impl Forma {
                             &mut duplicate,
                             &mut delete,
                         );
-                        for item in &mut self.scene.compositions {
-                            composition_row(
-                                ui,
-                                item,
-                                &main,
-                                &current,
-                                &mut open,
-                                &mut add,
-                                &mut duplicate,
-                                &mut delete,
-                            );
-                        }
-                    });
-                done = quiet_button(ui, "Done", None).clicked();
-            },
-        );
+                    }
+                });
+            done = quiet_button(ui, "Done", None).clicked();
+        });
         self.show_compositions = !(done || modal.close || open.is_some() || add.is_some());
         if let Some((id, time)) = open {
             self.go_to_composition(&id, time);
@@ -412,9 +412,10 @@ mod tests {
 
 pub(super) fn layer_settings(ui: &mut Ui, shape: &mut Shape) {
     if let Some(playback) = &mut shape.composition {
-        egui::CollapsingHeader::new("Composition playback")
-            .default_open(true)
-            .show(ui, |ui| {
+        crate::panel_widgets::section(
+            ui,
+            egui::CollapsingHeader::new("Composition playback").default_open(true),
+            |ui| {
                 ui.add(
                     egui::DragValue::new(&mut playback.offset)
                         .range(0.0..=86400.0)
@@ -430,41 +431,47 @@ pub(super) fn layer_settings(ui: &mut Ui, shape: &mut Shape) {
                         .suffix("×"),
                 );
                 ui.checkbox(&mut playback.looping, "Loop source");
-            });
+            },
+        );
     }
-    egui::CollapsingHeader::new("Editable in StreamCuts").show(ui, |ui| {
-        for target in template::Target::ALL {
-            let index = shape
-                .template_fields
-                .iter()
-                .position(|field| field.target == target);
-            if index.is_none() && !target.applies(shape) {
-                continue;
+    crate::panel_widgets::section(
+        ui,
+        egui::CollapsingHeader::new("Editable in StreamCuts"),
+        |ui| {
+            for target in template::Target::ALL {
+                let index = shape
+                    .template_fields
+                    .iter()
+                    .position(|field| field.target == target);
+                if index.is_none() && !target.applies(shape) {
+                    continue;
+                }
+                let mut enabled = index.is_some();
+                if ui.checkbox(&mut enabled, target.label()).changed() {
+                    if let Some(index) = index {
+                        shape.template_fields.remove(index);
+                    } else {
+                        shape.template_fields.push(template::Field {
+                            id: new_id(),
+                            label: format!("{} {}", shape.name, target.label()),
+                            target,
+                        });
+                    }
+                }
             }
-            let mut enabled = index.is_some();
-            if ui.checkbox(&mut enabled, target.label()).changed() {
-                if let Some(index) = index {
-                    shape.template_fields.remove(index);
-                } else {
-                    shape.template_fields.push(template::Field {
-                        id: new_id(),
-                        label: format!("{} {}", shape.name, target.label()),
-                        target,
+            if !shape.template_fields.is_empty() {
+                ui.separator();
+                for field in &mut shape.template_fields {
+                    ui.push_id(&field.id, |ui| {
+                        ui.label(format!("{} field name", field.target.label()));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut field.label)
+                                .char_limit(120)
+                                .desired_width(f32::INFINITY),
+                        );
                     });
                 }
             }
-            if enabled
-                && let Some(field) = shape
-                    .template_fields
-                    .iter_mut()
-                    .find(|field| field.target == target)
-            {
-                ui.add(
-                    egui::TextEdit::singleline(&mut field.label)
-                        .char_limit(120)
-                        .hint_text("Field label"),
-                );
-            }
-        }
-    });
+        },
+    );
 }

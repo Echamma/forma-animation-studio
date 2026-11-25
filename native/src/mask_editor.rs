@@ -134,9 +134,10 @@ impl MaskEditor {
         let id = scene.shapes[index].id.clone();
         self.sync(Some(&id));
         let open = std::mem::take(&mut self.open_panel).then_some(true);
-        let section = egui::CollapsingHeader::new("Blend & mask")
-            .open(open)
-            .show(ui, |ui| {
+        let section = crate::panel_widgets::section(
+            ui,
+            egui::CollapsingHeader::new("Blend & mask").open(open),
+            |ui| {
                 ui.spacing_mut().interact_size.y = 32.0;
                 let mut blend = scene.shapes[index].blend();
                 ui.label("Blend mode");
@@ -234,19 +235,23 @@ impl MaskEditor {
         ] {
             mask_number(ui, shape, selected, time, pose, property, 0, name, suffix);
         }
-        egui::CollapsingHeader::new("Mask position & size").show(ui, |ui| {
-            for (property, channel, name, suffix) in [
-                (MaskProperty::Position, 0, "X", " px"),
-                (MaskProperty::Position, 1, "Y", " px"),
-                (MaskProperty::Size, 0, "Width", " px"),
-                (MaskProperty::Size, 1, "Height", " px"),
-                (MaskProperty::Rotation, 0, "Rotation", "°"),
-            ] {
-                mask_number(
-                    ui, shape, selected, time, pose, property, channel, name, suffix,
-                );
-            }
-        });
+        crate::panel_widgets::section(
+            ui,
+            egui::CollapsingHeader::new("Mask position & size"),
+            |ui| {
+                for (property, channel, name, suffix) in [
+                    (MaskProperty::Position, 0, "X", " px"),
+                    (MaskProperty::Position, 1, "Y", " px"),
+                    (MaskProperty::Size, 0, "Width", " px"),
+                    (MaskProperty::Size, 1, "Height", " px"),
+                    (MaskProperty::Rotation, 0, "Rotation", "°"),
+                ] {
+                    mask_number(
+                        ui, shape, selected, time, pose, property, channel, name, suffix,
+                    );
+                }
+            },
+        );
         ui.horizontal_wrapped(|ui| {
             if ui.button("Show mask lanes").clicked() {
                 self.reveal_lanes = Some((shape.id.clone(), selected));

@@ -104,6 +104,18 @@ pub fn save(place: &Place, scene: &Scene) -> Result<(), String> {
     atomic(&place.data_dir.join("last-session.json"), &data)
 }
 
+pub(crate) fn timeline_height(place: &Place) -> Option<f32> {
+    let data = std::fs::read(place.data_dir.join("timeline-height.json")).ok()?;
+    let height: f32 = serde_json::from_slice::<Option<f32>>(&data).ok()??;
+    (height.is_finite() && height > 0.0).then_some(height)
+}
+
+pub(crate) fn save_timeline_height(place: &Place, height: Option<f32>) -> Result<(), String> {
+    std::fs::create_dir_all(&place.data_dir).map_err(|error| error.to_string())?;
+    let data = serde_json::to_vec(&height).map_err(|error| error.to_string())?;
+    atomic(&place.data_dir.join("timeline-height.json"), &data)
+}
+
 fn atomic(path: &Path, data: &[u8]) -> Result<(), String> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&temp, data).map_err(|e| e.to_string())?;

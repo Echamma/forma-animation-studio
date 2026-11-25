@@ -1,9 +1,10 @@
 use crate::keyframes::Lane;
 use crate::model::{Shape, hundredths};
+use crate::panel_widgets::combo;
 use crate::text_animator::{Alignment, Animator, RangeShape, TextLane, TextProperty, Units};
 use crate::text_layout::{BUNDLED_FAMILY, available_styles, font_families};
 use crate::text_presets::Preset;
-use egui::{Button, ComboBox, DragValue, RichText, Ui, vec2};
+use egui::{Button, DragValue, RichText, Ui, vec2};
 
 pub(crate) fn content(ui: &mut Ui, shape: &mut Shape) -> bool {
     let mut words = shape
@@ -59,41 +60,45 @@ pub(crate) fn layout(
             .as_ref()
             .and_then(|text| text.font.clone());
         let mut picked = None;
-        ComboBox::from_label("Font")
-            .selected_text(family.as_deref().unwrap_or(BUNDLED_FAMILY))
-            .height(280.0)
-            .show_ui(ui, |ui| {
-                let id = ui.scope_id().with("font-filter");
-                let mut search: String = ui.data_mut(|data| data.get_temp(id)).unwrap_or_default();
+        combo(
+            ui,
+            "font",
+            "Font",
+            family.as_deref().unwrap_or(BUNDLED_FAMILY),
+        )
+        .height(280.0)
+        .show_ui(ui, |ui| {
+            let id = ui.scope_id().with("font-filter");
+            let mut search: String = ui.data_mut(|data| data.get_temp(id)).unwrap_or_default();
+            if ui
+                .add(egui::TextEdit::singleline(&mut search).hint_text("Find a font"))
+                .changed()
+            {
+                ui.data_mut(|data| data.insert_temp(id, search.clone()));
+            }
+            let filter = search.trim().to_lowercase();
+            if BUNDLED_FAMILY.to_lowercase().contains(&filter)
+                && ui
+                    .selectable_label(family.is_none(), BUNDLED_FAMILY)
+                    .clicked()
+            {
+                picked = Some(None);
+            }
+            for name in font_families()
+                .iter()
+                .filter(|name| name.to_lowercase().contains(&filter))
+            {
                 if ui
-                    .add(egui::TextEdit::singleline(&mut search).hint_text("Find a font"))
-                    .changed()
+                    .selectable_label(family.as_ref() == Some(name), name)
+                    .clicked()
                 {
-                    ui.data_mut(|data| data.insert_temp(id, search.clone()));
+                    picked = Some(Some(name.clone()));
                 }
-                let filter = search.trim().to_lowercase();
-                if BUNDLED_FAMILY.to_lowercase().contains(&filter)
-                    && ui
-                        .selectable_label(family.is_none(), BUNDLED_FAMILY)
-                        .clicked()
-                {
-                    picked = Some(None);
-                }
-                for name in font_families()
-                    .iter()
-                    .filter(|name| name.to_lowercase().contains(&filter))
-                {
-                    if ui
-                        .selectable_label(family.as_ref() == Some(name), name)
-                        .clicked()
-                    {
-                        picked = Some(Some(name.clone()));
-                    }
-                }
-                if picked.is_some() {
-                    ui.data_mut(|data| data.remove::<String>(id));
-                }
-            });
+            }
+            if picked.is_some() {
+                ui.data_mut(|data| data.remove::<String>(id));
+            }
+        });
         if let Some(picked) = picked
             && picked != family
         {
@@ -131,12 +136,12 @@ pub(crate) fn layout(
                 .get_or_insert_with(Default::default)
                 .alignment = alignment;
         }
-        egui::CollapsingHeader::new("Spacing").show(ui, |ui| {
+        crate::panel_widgets::section(ui, egui::CollapsingHeader::new("Spacing"), |ui| {
             for p in [TextProperty::LineHeight, TextProperty::Tracking] {
                 show_lanes |= field(ui, shape, TextLane::Style(p), time);
             }
         });
-        egui::CollapsingHeader::new("Text along a path").show(ui, |ui| {
+        crate::panel_widgets::section(ui, egui::CollapsingHeader::new("Text along a path"), |ui| {
             let path = shape
                 .text_layout
                 .as_ref()
@@ -153,14 +158,12 @@ pub(crate) fn layout(
                     |(_, name)| name.as_str(),
                 );
             let mut pick = path.clone();
-            ComboBox::from_label("Path layer")
-                .selected_text(selected)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut pick, None, "None");
-                    for (id, name) in paths {
-                        ui.selectable_value(&mut pick, Some(id.clone()), name);
-                    }
-                });
+            combo(ui, "path-layer", "Path layer", selected).show_ui(ui, |ui| {
+                ui.selectable_value(&mut pick, None, "None");
+                for (id, name) in paths {
+                    ui.selectable_value(&mut pick, Some(id.clone()), name);
+                }
+            });
             if pick != path {
                 let text = shape.text_layout.get_or_insert_with(Default::default);
                 text.path = pick;
@@ -249,28 +252,38 @@ pub(crate) fn animate(
             .map(|a| (a.id, a.name.clone()))
             .collect();
         for (id, name) in animators {
-            egui::CollapsingHeader::new(name)
-                .id_salt(id)
-                .open((result.reveal == Some(id)).then_some(true))
-                .show(ui, |ui| {
+            crate::panel_widgets::section(
+                ui,
+                egui::CollapsingHeader::new(name)
+                    .id_salt(id)
+                    .open((result.reveal == Some(id)).then_some(true)),
+                |ui| {
                     if animator(ui, shape, id, time) {
                         result.reveal = Some(id);
                     }
-                });
+                },
+            );
         }
     });
     result
 }
 
 fn animator(ui: &mut Ui, shape: &mut Shape, id: u64, time: f64) -> bool {
-    let mut reveal = ui.button("Show animator lanes").clicked();
+    let (mut reveal, remove) = ui
+        .horizontal_wrapped(|ui| {
+            (
+                ui.button("Show animator lanes").clicked(),
+                ui.button("Remove animator").clicked(),
+            )
+        })
+        .inner;
     let Some(text) = &mut shape.text_layout else {
         return reveal;
     };
     let Some(animator) = text.animator_mut(id) else {
         return reveal;
     };
-    if ui.button("Remove animator").clicked() {
+    if remove {
         text.animators.retain(|a| a.id != id);
         return false;
     }
@@ -303,31 +316,36 @@ fn animator(ui: &mut Ui, shape: &mut Shape, id: u64, time: f64) -> bool {
     for property in [TextProperty::Start, TextProperty::End, TextProperty::Offset] {
         reveal |= field(ui, shape, TextLane::Animator(id, property), time);
     }
-    egui::CollapsingHeader::new("Range easing and order").show(ui, |ui| {
-        for property in [TextProperty::EaseLow, TextProperty::EaseHigh] {
-            reveal |= field(ui, shape, TextLane::Animator(id, property), time);
-        }
-        let Some(animator) = shape
-            .text_layout
-            .as_mut()
-            .and_then(|text| text.animator_mut(id))
-        else {
-            return;
-        };
-        let mut shuffled = animator.seed.is_some();
-        if ui.checkbox(&mut shuffled, "Randomize order").changed() {
-            animator.seed = shuffled.then_some(0);
-        }
-        if let Some(seed) = &mut animator.seed {
-            ui.horizontal(|ui| {
-                ui.label("Seed");
-                ui.add(DragValue::new(seed));
-            });
-        }
-    });
-    egui::CollapsingHeader::new("What changes")
-        .default_open(true)
-        .show(ui, |ui| {
+    crate::panel_widgets::section(
+        ui,
+        egui::CollapsingHeader::new("Range easing and order"),
+        |ui| {
+            for property in [TextProperty::EaseLow, TextProperty::EaseHigh] {
+                reveal |= field(ui, shape, TextLane::Animator(id, property), time);
+            }
+            let Some(animator) = shape
+                .text_layout
+                .as_mut()
+                .and_then(|text| text.animator_mut(id))
+            else {
+                return;
+            };
+            let mut shuffled = animator.seed.is_some();
+            if ui.checkbox(&mut shuffled, "Randomize order").changed() {
+                animator.seed = shuffled.then_some(0);
+            }
+            if let Some(seed) = &mut animator.seed {
+                ui.horizontal(|ui| {
+                    ui.label("Seed");
+                    ui.add(DragValue::new(seed));
+                });
+            }
+        },
+    );
+    crate::panel_widgets::section(
+        ui,
+        egui::CollapsingHeader::new("What changes").default_open(true),
+        |ui| {
             for property in TextProperty::EFFECTS {
                 let Some(animator) = shape
                     .text_layout
@@ -360,7 +378,8 @@ fn animator(ui: &mut Ui, shape: &mut Shape, id: u64, time: f64) -> bool {
                     });
                 }
             }
-        });
+        },
+    );
     reveal
 }
 
@@ -375,13 +394,11 @@ fn choice<T: Copy + PartialEq>(
         .iter()
         .find(|(v, _)| *v == old)
         .map_or("", |(_, name)| name);
-    ComboBox::from_label(label)
-        .selected_text(name)
-        .show_ui(ui, |ui| {
-            for &(value, name) in options {
-                ui.selectable_value(current, value, name);
-            }
-        });
+    combo(ui, label, label, name).wrap().show_ui(ui, |ui| {
+        for &(value, name) in options {
+            ui.selectable_value(current, value, name);
+        }
+    });
     old != *current
 }
 
@@ -391,10 +408,10 @@ fn field(ui: &mut Ui, shape: &mut Shape, lane: TextLane, time: f64) -> bool {
         let mut value = lane.values(shape, time);
         let mut changed = false;
         let mut key = false;
+        if !matches!(property, TextProperty::Fill | TextProperty::Stroke) {
+            ui.label(property.label());
+        }
         ui.horizontal_wrapped(|ui| {
-            if !matches!(property, TextProperty::Fill | TextProperty::Stroke) {
-                ui.label(property.label());
-            }
             if matches!(property, TextProperty::Fill | TextProperty::Stroke) {
                 let mut rgb = value.map(|v| v.round() as u8);
                 changed = ui.color_edit_button_srgb(&mut rgb).changed();

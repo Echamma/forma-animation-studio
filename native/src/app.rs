@@ -47,6 +47,7 @@ enum Gesture {
         pose: Pose,
         inverse: tiny_skia::Transform,
         anchor: Anchor,
+        height_factor: f32,
     },
     Anchor {
         start: Pos2,
@@ -73,7 +74,7 @@ struct SvgEdit {
 }
 
 /// The inspector's tabs (Electron's Layer, Animate and Scene).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
     Layer,
     Animate,
@@ -106,6 +107,7 @@ enum Row {
     Mask(usize, u64, usize),
     TextAnimator(usize, u64),
     Effects(usize),
+    Effect(usize, u64),
     Fade(usize),
     Motion(usize, usize),
     Spin(usize, usize),
@@ -148,17 +150,112 @@ fn disclosure_symbol(open: bool) -> egui::RichText {
     control_symbol(if open { DISCLOSURE_OPEN } else { DISCLOSURE_CLOSED })
 }
 
-fn rail_button(ui: &mut Ui, label: &str, active: bool, enabled: bool) -> egui::Response {
-    ui.scope(|ui| {
-        ui.spacing_mut().button_padding.x = 4.0;
-        ui.add_enabled(
-            enabled,
-            egui::Button::selectable(active, egui::RichText::new(label).font(font::ui(12.0)))
-                .min_size(vec2(38.0, 40.0))
-                .wrap_mode(egui::TextWrapMode::Extend),
-        )
-    })
-    .inner
+enum RailMark {
+    Symbol(Icon),
+    Pen,
+    Mask,
+    Move,
+}
+
+fn rail_button(
+    ui: &mut Ui,
+    mark: RailMark,
+    label: &str,
+    tip: &str,
+    active: bool,
+    enabled: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), 52.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, enabled, active, label));
+    let painter = ui.painter();
+    if active || response.hovered() && enabled {
+        painter.rect_filled(
+            rect,
+            8.0,
+            if active {
+                color::SELECT_FILL
+            } else {
+                color::VEIL_HOVER
+            },
+        );
+    }
+    if active || response.has_focus() {
+        let stroke = if response.has_focus() {
+            color::LEAF
+        } else {
+            color::SELECT_LINE
+        };
+        painter.rect_stroke(
+            rect,
+            8.0,
+            Stroke::new(1.5, stroke),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let ink = if active {
+        color::SELECT_INK
+    } else if enabled {
+        color::INK
+    } else {
+        color::INK_MUTED
+    };
+    let center = rect.center_top() + vec2(0.0, 17.0);
+    let line = |points: &[(f32, f32)]| {
+        painter.add(egui::Shape::line(
+            points.iter().map(|&(x, y)| center + vec2(x, y)).collect(),
+            Stroke::new(1.5, ink),
+        ));
+    };
+    match mark {
+        RailMark::Symbol(icon) => canopy_ui::icon(
+            painter,
+            Rect::from_center_size(center, Vec2::splat(20.0)),
+            icon,
+            ink,
+        ),
+        RailMark::Pen => line(&[
+            (-7.0, 7.0),
+            (-5.0, 1.0),
+            (4.0, -8.0),
+            (8.0, -4.0),
+            (-1.0, 5.0),
+            (-7.0, 7.0),
+        ]),
+        RailMark::Mask => {
+            painter.circle_stroke(center, 7.0, Stroke::new(1.5, ink));
+            for offset in [
+                vec2(7.0, 0.0),
+                vec2(0.0, 7.0),
+                vec2(-7.0, 0.0),
+                vec2(0.0, -7.0),
+            ] {
+                painter.rect_filled(
+                    Rect::from_center_size(center + offset, Vec2::splat(3.5)),
+                    0.5,
+                    ink,
+                );
+            }
+        }
+        RailMark::Move => {
+            line(&[(-8.0, 5.0), (-2.0, -1.0), (2.0, 3.0), (8.0, -5.0)]);
+            line(&[(3.0, -5.0), (8.0, -5.0), (8.0, 0.0)]);
+        }
+    }
+    painter.text(
+        rect.center_bottom() - vec2(0.0, 13.0),
+        Align2::CENTER_CENTER,
+        label,
+        font::bold(12.0),
+        ink,
+    );
+    response.on_hover_text(tip)
 }
 
 /// The pointer over a timeline bar: a resize arrow on an end that can be dragged, else a hand.
@@ -351,6 +448,8 @@ pub struct Forma {
     /// The drawer beside the tool rail, if open; `None` until the pane's width first decides it.
     drawer: Option<Drawer>,
     drawer_decided: bool,
+    timeline_height: Option<f32>,
+    timeline_at_drag_start: Option<f32>,
     /// Where playing a new animation's preview stops.
     preview_end: Option<f64>,
     /// Files picked with the Add button, taken in like dropped files on the next frame.
@@ -383,6 +482,7 @@ impl Forma {
             .first()
             .and_then(|doc| storage::load_document(&place, &doc.id).ok());
         let first_launch = restored.is_none();
+        let timeline_height = storage::timeline_height(&place);
         let scene = restored.unwrap_or_else(|| Scene::empty(new_id()));
         Self {
             place,
@@ -448,6 +548,8 @@ impl Forma {
             last_picked: (None, None),
             drawer: None,
             drawer_decided: false,
+            timeline_height,
+            timeline_at_drag_start: None,
             preview_end: None,
             pending_import: Vec::new(),
             pending_poses: Vec::new(),
@@ -799,26 +901,71 @@ impl Forma {
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             let drawer = self.drawer;
-            if icon_button(ui, Icon::Plus, "Add a shape, text, or picture", drawer == Some(Drawer::Add)).clicked() {
-                self.drawer = if drawer == Some(Drawer::Add) { None } else { Some(Drawer::Add) };
+            if rail_button(
+                ui,
+                RailMark::Symbol(Icon::Plus),
+                "Add",
+                "Add a shape, text, or picture",
+                drawer == Some(Drawer::Add),
+                true,
+            )
+            .clicked()
+            {
+                self.drawer = if drawer == Some(Drawer::Add) {
+                    None
+                } else {
+                    Some(Drawer::Add)
+                };
             }
-            if icon_button(ui, Icon::Grid, "All layers", drawer == Some(Drawer::Layers)).clicked() {
-                self.drawer = if drawer == Some(Drawer::Layers) { None } else { Some(Drawer::Layers) };
+            if rail_button(
+                ui,
+                RailMark::Symbol(Icon::Sidebar),
+                "Layers",
+                "View and reorder all layers",
+                drawer == Some(Drawer::Layers),
+                true,
+            )
+            .clicked()
+            {
+                self.drawer = if drawer == Some(Drawer::Layers) {
+                    None
+                } else {
+                    Some(Drawer::Layers)
+                };
             }
             ui.separator();
-            if icon_button(ui, Icon::Text, "Add text. With a layer selected, the text follows it.", false).clicked() {
+            if rail_button(
+                ui,
+                RailMark::Symbol(Icon::Text),
+                "Text",
+                "Add text. With a layer selected, the text follows it.",
+                false,
+                true,
+            )
+            .clicked()
+            {
                 self.add_text();
             }
-            if icon_button(ui, Icon::Image, "Add pictures, SVG artwork, or video", false).clicked() {
+            if rail_button(
+                ui,
+                RailMark::Symbol(Icon::Image),
+                "Picture",
+                "Add pictures, SVG artwork, or video",
+                false,
+                true,
+            )
+            .clicked()
+            {
                 self.pick_media();
             }
             if rail_button(
                 ui,
+                RailMark::Pen,
                 "Pen",
+                "Draw an editable path",
                 self.vector_tools.tool == Some(VectorTool::Pen),
                 true,
             )
-            .on_hover_text("Draw an editable path")
             .clicked()
             {
                 self.camera_tool = false;
@@ -831,9 +978,15 @@ impl Forma {
             }
             self.mask_editor.sync(self.selected.as_deref());
             let masking = self.mask_editor.active();
-            if rail_button(ui, "Mask", masking, self.selected.is_some())
-                .on_hover_text("Draw and edit masks on the selected layer")
-                .clicked()
+            if rail_button(
+                ui,
+                RailMark::Mask,
+                "Mask",
+                "Draw and edit masks on the selected layer",
+                masking,
+                self.selected.is_some(),
+            )
+            .clicked()
             {
                 self.camera_tool = false;
                 self.mask_editor.toggle(&self.scene);
@@ -847,23 +1000,35 @@ impl Forma {
             }
             let drawing = self.motion_mode.is_some();
             let can_draw = self.selected.is_some();
-            ui.add_enabled_ui(can_draw || drawing, |ui| {
-                if icon_button(ui, Icon::Chevron, "Draw a move for the selected layer (Escape stops)", drawing)
-                    .clicked()
-                {
-                    self.camera_tool = false;
-                    if drawing {
-                        (self.motion_mode, self.motion_draft) = (None, None);
-                    } else {
-                        self.mask_editor.stop();
-                        self.vector_tools.set(None, None);
-                        self.motion_mode = Some("arrow");
-                        self.tab = Tab::Animate;
-                    }
+            if rail_button(
+                ui,
+                RailMark::Move,
+                "Draw move",
+                "Draw a move for the selected layer (Escape stops)",
+                drawing,
+                can_draw || drawing,
+            )
+            .clicked()
+            {
+                self.camera_tool = false;
+                if drawing {
+                    (self.motion_mode, self.motion_draft) = (None, None);
+                } else {
+                    self.mask_editor.stop();
+                    self.vector_tools.set(None, None);
+                    self.motion_mode = Some("arrow");
+                    self.tab = Tab::Animate;
                 }
-            });
-            if icon_button(ui, Icon::Project, "Canvas size, length, and background", self.tab == Tab::Scene)
-                .clicked()
+            }
+            if rail_button(
+                ui,
+                RailMark::Symbol(Icon::Project),
+                "Scene",
+                "Canvas size, length, and background",
+                self.tab == Tab::Scene,
+                true,
+            )
+            .clicked()
             {
                 self.tab = Tab::Scene;
             }
@@ -909,8 +1074,15 @@ impl Forma {
         ui.horizontal(|ui| {
             for (which, label) in [(Drawer::Add, "Add"), (Drawer::Layers, "Layers")] {
                 let on = self.drawer == Some(which);
-                let text = egui::RichText::new(label).font(if on { font::bold(14.0) } else { font::ui(14.0) });
-                if ui.selectable_label(on, text).clicked() {
+                let text = egui::RichText::new(label).font(if on {
+                    font::bold(14.0)
+                } else {
+                    font::ui(14.0)
+                });
+                if ui
+                    .add(egui::Button::selectable(on, text).min_size(vec2(0.0, 40.0)))
+                    .clicked()
+                {
                     self.drawer = Some(which);
                 }
             }
@@ -921,11 +1093,11 @@ impl Forma {
             });
         });
         ui.separator();
-        match self.drawer {
+        crate::panel_widgets::scroll("drawer-content", ui, |ui| match self.drawer {
             Some(Drawer::Add) => self.drawer_add(ui),
             Some(Drawer::Layers) => self.drawer_layers(ui),
             None => {}
-        }
+        });
     }
 
     fn drawer_add(&mut self, ui: &mut Ui) {
@@ -1044,69 +1216,64 @@ impl Forma {
             self.precompose_selection();
         }
         ui.label(egui::RichText::new(hint).color(color::INK_MUTED));
-        egui::ScrollArea::vertical()
-            .id_salt("forma-layers")
-            // The whole Layers panel scrolls (see `ui`), so the list grows with it and the tip below stays reachable.
-            .max_height(f32::INFINITY)
-            .show(ui, |ui| {
-                let mut destination = None;
-                let mut clicked = None;
-                let mut open = None;
-                for (index, shape) in self.scene.shapes.iter().enumerate() {
-                    let response = ui.add(
-                        egui::Button::selectable(
-                            self.multi_selected.contains(&shape.id)
-                                || self.selected.as_deref() == Some(&shape.id),
-                            &shape.name,
-                        )
-                        .sense(Sense::click_and_drag()),
-                    );
-                    if response.double_clicked() {
-                        open = Some(shape.id.clone());
-                    }
-                    if response.clicked() {
-                        clicked = Some(shape.id.clone());
-                    }
-                    if response.drag_started() {
-                        self.layer_drag = Some(shape.id.clone());
-                    }
-                    if self.layer_drag.is_some()
-                        && ui.input(|i| i.pointer.any_released())
-                        && response
-                            .rect
-                            .contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or_default())
-                    {
-                        destination = Some(index);
-                    }
-                    if self.layer_drag.is_some() && response.hovered() {
-                        ui.painter().rect_stroke(
-                            response.rect,
-                            3.0,
-                            egui::Stroke::new(1.0, color::INK),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                }
-                if let Some(id) = clicked {
-                    self.select_layer(Some(id), ui.input(|i| i.modifiers.shift));
-                }
-                if let Some(id) = open {
-                    self.queue_composition(&id);
-                }
-                if ui.input(|i| i.pointer.any_released()) {
-                    if let (Some(id), Some(target)) = (self.layer_drag.take(), destination) {
-                        if let Some(from) =
-                            self.scene.shapes.iter().position(|shape| shape.id == id)
-                        {
-                            if from != target {
-                                let shape = self.scene.shapes.remove(from);
-                                self.scene.shapes.insert(target, shape);
-                                self.edited();
-                            }
-                        }
+        let mut destination = None;
+        let mut clicked = None;
+        let mut open = None;
+        for (index, shape) in self.scene.shapes.iter().enumerate() {
+            let response = ui
+                .add(
+                    egui::Button::selectable(
+                        self.multi_selected.contains(&shape.id)
+                            || self.selected.as_deref() == Some(&shape.id),
+                        &shape.name,
+                    )
+                    .sense(Sense::click_and_drag())
+                    .truncate(),
+                )
+                .on_hover_text(&shape.name);
+            if response.double_clicked() {
+                open = Some(shape.id.clone());
+            }
+            if response.clicked() {
+                clicked = Some(shape.id.clone());
+            }
+            if response.drag_started() {
+                self.layer_drag = Some(shape.id.clone());
+            }
+            if self.layer_drag.is_some()
+                && ui.input(|i| i.pointer.any_released())
+                && response
+                    .rect
+                    .contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or_default())
+            {
+                destination = Some(index);
+            }
+            if self.layer_drag.is_some() && response.hovered() {
+                ui.painter().rect_stroke(
+                    response.rect,
+                    3.0,
+                    egui::Stroke::new(1.0, color::INK),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        if let Some(id) = clicked {
+            self.select_layer(Some(id), ui.input(|i| i.modifiers.shift));
+        }
+        if let Some(id) = open {
+            self.queue_composition(&id);
+        }
+        if ui.input(|i| i.pointer.any_released()) {
+            if let (Some(id), Some(target)) = (self.layer_drag.take(), destination) {
+                if let Some(from) = self.scene.shapes.iter().position(|shape| shape.id == id) {
+                    if from != target {
+                        let shape = self.scene.shapes.remove(from);
+                        self.scene.shapes.insert(target, shape);
+                        self.edited();
                     }
                 }
-            });
+            }
+        }
     }
 
     /// The Scene tab: canvas size, background and length (Electron's Scene panel).
@@ -1135,9 +1302,9 @@ impl Forma {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Width");
-                    ui.add(egui::DragValue::new(&mut width).range(64..=4096).speed(1));
+                    ui.add(egui::DragValue::new(&mut width).range(100..=4000).speed(1));
                     ui.label("Height");
-                    ui.add(egui::DragValue::new(&mut height).range(64..=4096).speed(1));
+                    ui.add(egui::DragValue::new(&mut height).range(100..=4000).speed(1));
                 });
                 if width as f32 != self.scene.width || height as f32 != self.scene.height {
                     self.scene.resize(width as f32, height as f32);
@@ -1216,7 +1383,7 @@ impl Forma {
     }
 
     fn motion_blur_settings(&mut self, ui: &mut Ui) {
-        egui::CollapsingHeader::new("Motion blur").show(ui, |ui| {
+        crate::panel_widgets::section(ui, egui::CollapsingHeader::new("Motion blur"), |ui| {
             ui.spacing_mut().interact_size.y = 32.0;
             let mut settings = self.scene.motion_blur.unwrap_or_default();
             let previous = settings;
@@ -1492,12 +1659,21 @@ impl Forma {
                 } else {
                     font::ui(14.0)
                 });
-                if ui.selectable_label(self.tab == tab, text).clicked() {
+                if ui
+                    .add(egui::Button::selectable(self.tab == tab, text).min_size(vec2(0.0, 40.0)))
+                    .clicked()
+                {
                     self.tab = tab;
                 }
             }
         });
         ui.separator();
+        crate::panel_widgets::scroll(("forma-inspector", self.tab), ui, |ui| {
+            self.inspector_content(ui)
+        });
+    }
+
+    fn inspector_content(&mut self, ui: &mut Ui) {
         if self.tab == Tab::Scene {
             self.scene_settings(ui);
             return;
@@ -1532,7 +1708,17 @@ impl Forma {
             self.animate_tab(ui, index);
             return;
         }
-        let size = self.scene.layer_frame(&self.scene.shapes[index], self.time).pose;
+        ui.label("Layer name");
+        let shape = &mut self.scene.shapes[index];
+        let mut changed = ui.text_edit_singleline(&mut shape.name).changed();
+        if shape.kind == "text" {
+            changed |= text_panel::content(ui, shape);
+            ui.separator();
+        }
+        let size = self
+            .scene
+            .layer_frame(&self.scene.shapes[index], self.time)
+            .pose;
         let shape = &mut self.scene.shapes[index];
         let tool_before = self.vector_tools.tool;
         let has_paint = shape.is_vector() || shape.kind == "text";
@@ -1545,7 +1731,7 @@ impl Forma {
                     &mut self.vector_tools,
                     self.time,
                 ));
-        let mut changed = show_solid && solid_fill_color(ui, shape, self.time);
+        changed |= show_solid && solid_fill_color(ui, shape, self.time);
         if has_paint {
             shape_panel::stroke_and_trim(ui, shape, &mut self.vector_tools, self.time);
         }
@@ -1572,10 +1758,8 @@ impl Forma {
             .scene
             .inspector_pose(&self.scene.shapes[index], self.time);
         let shape = &mut self.scene.shapes[index];
-        changed |= ui.text_edit_singleline(&mut shape.name).changed();
         composition_panel::layer_settings(ui, shape);
         if shape.kind == "text" {
-            changed |= text_panel::content(ui, shape);
             let linked = shape
                 .extra
                 .get("linkId")
@@ -1598,11 +1782,16 @@ impl Forma {
                 .find(|(_, id, _)| *id == linked)
                 .map_or("Nothing".to_owned(), |(.., name)| name.clone());
             let mut relink = None;
-            egui::ComboBox::from_label("Text linked to")
-                .selected_text(follows)
-                .show_ui(ui, |ui| {
+            crate::panel_widgets::combo(ui, "text-linked-to", "Text linked to", follows).show_ui(
+                ui,
+                |ui| {
                     for (i, id, name) in &others {
-                        if ui.selectable_label(*id == linked, name).clicked() && *id != linked {
+                        if ui
+                            .add(egui::Button::selectable(*id == linked, name).truncate())
+                            .on_hover_text(name)
+                            .clicked()
+                            && *id != linked
+                        {
                             relink = Some(*i);
                         }
                     }
@@ -1657,23 +1846,24 @@ impl Forma {
             .get("blur")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32;
-        if shape.kind != "adjustment"
-            && ui
+        if shape.kind != "adjustment" {
+            ui.label("Blur");
+            if ui
                 .add(
                     egui::Slider::new(&mut blur, 0.0..=100.0)
                         .clamping(egui::SliderClamping::Edits)
                         .step_by(1.0)
-                        .text("Blur")
                         .suffix(" px"),
                 )
                 .changed()
-        {
-            if blur > 0.0 {
-                shape.extra.insert("blur".into(), serde_json::json!(blur));
-            } else {
-                shape.extra.remove("blur");
+            {
+                if blur > 0.0 {
+                    shape.extra.insert("blur".into(), serde_json::json!(blur));
+                } else {
+                    shape.extra.remove("blur");
+                }
+                changed = true;
             }
-            changed = true;
         }
         let mut posed = false;
         let before = pose;
@@ -1681,9 +1871,10 @@ impl Forma {
         let old_anchor = self.scene.shapes[index].anchor.unwrap_or_default();
         let mut anchor = old_anchor;
         // Exact numbers, folded away as in Electron: dragging on the canvas does the same.
-        egui::CollapsingHeader::new("Position & size")
-            .id_salt("forma-position")
-            .show(ui, |ui| {
+        crate::panel_widgets::section(
+            ui,
+            egui::CollapsingHeader::new("Position & size").id_salt("forma-position"),
+            |ui| {
                 ui.label(
                     egui::RichText::new("Measured on the canvas")
                         .small()
@@ -1698,12 +1889,9 @@ impl Forma {
                     ("Angle", &mut pose.r, -3600.0..=3600.0),
                     ("Opacity", &mut pose.o, 0.0..=100.0),
                 ] {
+                    ui.label(label);
                     posed |= ui
-                        .add(
-                            egui::Slider::new(value, range)
-                                .text(label)
-                                .clamping(egui::SliderClamping::Edits),
-                        )
+                        .add(egui::Slider::new(value, range).clamping(egui::SliderClamping::Edits))
                         .changed();
                 }
                 Self::anchor_controls(ui, &mut anchor);
@@ -1788,7 +1976,7 @@ impl Forma {
             }
         }
         if enabled {
-            egui::CollapsingHeader::new("3D transform").show(ui, |ui| {
+            crate::panel_widgets::section(ui, egui::CollapsingHeader::new("3D transform"), |ui| {
                 for property in Property::LAYER {
                     spatial_field(ui, shape, property, self.time);
                 }
@@ -1798,6 +1986,7 @@ impl Forma {
 
     fn camera_panel(&mut self, ui: &mut Ui, index: usize) {
         use crate::spatial::Property;
+        ui.label("Camera name");
         ui.add(egui::TextEdit::singleline(
             &mut self.scene.shapes[index].name,
         ));
@@ -1836,7 +2025,7 @@ impl Forma {
             )
         };
         ui.label(egui::RichText::new(zoom_text(shape)).color(color::INK_MUTED));
-        egui::CollapsingHeader::new("Aim and focus").show(ui, |ui| {
+        crate::panel_widgets::section(ui, egui::CollapsingHeader::new("Aim and focus"), |ui| {
             let spatial = shape.spatial.get_or_insert_with(Default::default);
             ui.add_sized(
                 [100.0, 32.0],
@@ -1889,6 +2078,9 @@ impl Forma {
             .into_iter()
             .filter(|p| p.values(old) != p.values(pose))
             .collect();
+        if properties.is_empty() {
+            return;
+        }
         self.playing = false;
         let at = model::hundredths(self.time);
         self.time = if at <= self.scene.duration {
@@ -1939,7 +2131,11 @@ impl Forma {
             for (i, other) in self.scene.shapes.iter().enumerate() {
                 if self.scene.can_follow(index, i)
                     && ui
-                        .selectable_label(parent == Some(&other.id), &other.name)
+                        .add(
+                            egui::Button::selectable(parent == Some(&other.id), &other.name)
+                                .truncate(),
+                        )
+                        .on_hover_text(&other.name)
                         .clicked()
                 {
                     pick = Some(Some(i));
@@ -1950,13 +2146,8 @@ impl Forma {
         if menu {
             ui.menu_button("Follows", choices);
         } else {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().interact_size.y = 32.0;
-                ui.label("Follows");
-                egui::ComboBox::from_id_salt(("parent", &shape.id))
-                    .selected_text(current)
-                    .show_ui(ui, choices);
-            });
+            crate::panel_widgets::combo(ui, ("parent", &shape.id), "Follows", current)
+                .show_ui(ui, choices);
         }
         if let Some(parent) = pick {
             match self.scene.set_parent(index, parent, self.time) {
@@ -2062,26 +2253,32 @@ impl Forma {
                 animated = true;
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Easing");
-            egui::ComboBox::from_id_salt(("ease", &shape.id))
-                .selected_text(EASES.iter().find(|(_, kind)| *kind == shape.ease).map_or(shape.ease.as_str(), |(name, _)| name))
-                .show_ui(ui, |ui| {
-                    for (label, kind) in [
-                        ("Smooth", "smooth"),
-                        ("Steady", "linear"),
-                        ("Hold", "hold"),
-                        ("Speed up", "ease-in"),
-                        ("Slow down", "ease-out"),
-                    ] {
-                        if ui
-                            .selectable_value(&mut shape.ease, kind.into(), label)
-                            .changed()
-                        {
-                            changed = true;
-                        }
+        ui.scope(|ui| {
+            crate::panel_widgets::combo(
+                ui,
+                ("ease", &shape.id),
+                "Easing",
+                EASES
+                    .iter()
+                    .find(|(_, kind)| *kind == shape.ease)
+                    .map_or(shape.ease.as_str(), |(name, _)| name),
+            )
+            .show_ui(ui, |ui| {
+                for (label, kind) in [
+                    ("Smooth", "smooth"),
+                    ("Steady", "linear"),
+                    ("Hold", "hold"),
+                    ("Speed up", "ease-in"),
+                    ("Slow down", "ease-out"),
+                ] {
+                    if ui
+                        .selectable_value(&mut shape.ease, kind.into(), label)
+                        .changed()
+                    {
+                        changed = true;
                     }
-                });
+                }
+            });
         });
         if animated {
             self.scene.duration = self.scene.duration.max(self.time + 1.0);
@@ -3385,15 +3582,20 @@ impl Forma {
             let (x, y) = transform::point(frame.transform, x, y);
             to_screen(x, y)
         };
-        let corners = |frame: LayerFrame| {
+        let corners = |frame: LayerFrame, height: f32| {
             [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
-                .map(|(x, y)| from_layer(frame, x * frame.pose.w, y * frame.pose.h))
+                .map(|(x, y)| from_layer(frame, x * frame.pose.w, y * height))
         };
         let overlays = if self.playing {
             std::borrow::Cow::Borrowed(&self.scene)
         } else {
             crate::expressions::at_time(&self.scene, time)
         };
+        let height_factors: Vec<_> = overlays
+            .shapes
+            .iter()
+            .map(|shape| crate::text_render::selection_height_factor(shape, time))
+            .collect();
         let camera = crate::spatial::Camera::at(&overlays, time);
         let mut hits = Vec::new();
         let mut depths = Vec::new();
@@ -3422,7 +3624,13 @@ impl Forma {
                 };
                 let quad: Option<Vec<_>> = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
                     .into_iter()
-                    .map(|(x, y)| map(x * frame.pose.w, y * frame.pose.h, 0.0))
+                    .map(|(x, y)| {
+                        map(
+                            x * frame.pose.w,
+                            y * frame.pose.h * height_factors[index],
+                            0.0,
+                        )
+                    })
                     .collect();
                 if let Some(quad) = quad {
                     if !self.playing && self.multi_selected.contains(&shape.id) {
@@ -3479,7 +3687,7 @@ impl Forma {
             }
             if renderer.leaves_out(shape) {
                 painter.add(egui::Shape::convex_polygon(
-                    corners(frame).to_vec(),
+                    corners(frame, frame.pose.h * height_factors[index]).to_vec(),
                     hex(
                         &shape.color_at(self.time),
                         (frame.pose.o * 2.55).round() as u8,
@@ -3501,7 +3709,7 @@ impl Forma {
                 && self.selected.as_deref() != Some(&shape.id)
             {
                 painter.add(egui::Shape::closed_line(
-                    corners(frame).to_vec(),
+                    corners(frame, frame.pose.h * height_factors[index]).to_vec(),
                     Stroke::new(1.5, color::SUN),
                 ));
             }
@@ -3543,14 +3751,14 @@ impl Forma {
                 );
             }
         }
-        if let (Some((_, frame)), false, false, None) = (
+        if let (Some((index, frame)), false, false, None) = (
             selected.filter(|_| selected_path.is_none()),
             self.playing,
             self.mask_editor.active(),
             self.vector_tools.tool,
         ) {
             let w = frame.pose.w;
-            let h = frame.pose.h;
+            let h = frame.pose.h * height_factors[index];
             let center = from_layer(frame, 0.0, 0.0);
             let x_axis = (from_layer(frame, w, 0.0) - center).normalized();
             let y_axis = (from_layer(frame, 0.0, h) - center).normalized();
@@ -3561,7 +3769,7 @@ impl Forma {
             let knob = (size.x.min(size.y) * 0.28).clamp(8.0, 12.0);
             let reach = (size.x.min(size.y) * 0.5).clamp(12.0, 28.0);
             painter.add(egui::Shape::closed_line(
-                corners(frame).to_vec(),
+                corners(frame, h).to_vec(),
                 Stroke::new(1.5, color::SUN),
             ));
             for (sx, sy) in HANDLES {
@@ -3846,7 +4054,8 @@ impl Forma {
                         }
                         frame.transform.invert().is_some_and(|inverse| {
                             let (x, y) = transform::point(inverse, p.x, p.y);
-                            x.abs() <= frame.pose.w / 2.0 && y.abs() <= frame.pose.h / 2.0
+                            x.abs() <= frame.pose.w / 2.0
+                                && y.abs() <= frame.pose.h * height_factors[*index] / 2.0
                         })
                     })
                     .map(|(index, _)| *index)
@@ -3936,6 +4145,7 @@ impl Forma {
                             pose: self.scene.editable_pose(shape, self.time),
                             inverse,
                             anchor: shape.anchor.unwrap_or_default(),
+                            height_factor: height_factors[index],
                         });
                     }
                 } else {
@@ -4027,6 +4237,7 @@ impl Forma {
                         pose,
                         inverse,
                         anchor,
+                        height_factor,
                     } => {
                         let Some(index) = self.scene.shapes.iter().position(|shape| shape.id == id)
                         else {
@@ -4034,9 +4245,15 @@ impl Forma {
                             return;
                         };
                         let delta = point - start;
-                        let delta = transform::vector(inverse, delta.x, delta.y);
-                        let (w, h) =
-                            transform::resize_about_anchor(pose, anchor, handle, delta, lock_ratio);
+                        let (dx, dy) = transform::vector(inverse, delta.x, delta.y);
+                        let (w, h) = transform::resize_about_anchor(
+                            pose,
+                            anchor,
+                            handle,
+                            (dx, dy),
+                            height_factor,
+                            lock_ratio,
+                        );
                         self.scene.set_property_pose(
                             index,
                             self.time,
@@ -4182,11 +4399,12 @@ impl Forma {
                 if !shape.effects.is_empty() {
                     rows.push(Row::Effects(index));
                     if self.key_editor.effects_expanded(&shape.id) {
-                        rows.extend(shape.effects.iter().flat_map(|effect| {
-                            effect.kind.controls().iter().map(move |control| {
+                        for effect in &shape.effects {
+                            rows.push(Row::Effect(index, effect.id));
+                            rows.extend(effect.kind.controls().iter().map(|control| {
                                 Row::Property(index, Lane::Effect(effect.id, control.parameter))
-                            })
-                        }));
+                            }));
+                        }
                     }
                 }
                 for (number, mask) in shape.masks.iter().enumerate() {
@@ -4209,10 +4427,165 @@ impl Forma {
         groups.into_iter().flat_map(|(_, rows)| rows).collect()
     }
 
-    /// Playback above the timeline, as in Electron: back to start, play, loop, the time, and onion skin.
+    fn workspace(&mut self, ui: &mut Ui, rect: Rect) {
+        let rail = Rect::from_min_size(rect.min, vec2(88.0, rect.height()));
+        let inspector_w = if rect.width() < 1150.0 { 250.0 } else { 310.0 };
+        let right = Rect::from_min_max(pos2(rect.right() - inspector_w, rect.top()), rect.max);
+        let drawer = Rect::from_min_size(
+            pos2(rail.right() + 5.0, rect.top()),
+            vec2(220.0, rect.height()),
+        );
+        let can_dock = right.left() - drawer.right() >= 530.0;
+        if !self.drawer_decided {
+            self.drawer_decided = true;
+            self.drawer = can_dock.then_some(Drawer::Add);
+        }
+        let docked = can_dock && self.drawer.is_some();
+        let left = if docked { drawer.right() } else { rail.right() };
+        let center = Rect::from_min_max(
+            pos2(left + 5.0, rect.top()),
+            pos2(right.left() - 5.0, rect.bottom()),
+        );
+        let (canvas, timeline) = self.split_workspace(ui, center);
+
+        for panel in [rail, right] {
+            ui.painter().add(pane_frame(Mood::Ember).paint(panel));
+        }
+        ui.scope_builder(
+            UiBuilder::new().id_salt("rail").max_rect(rail.shrink(8.0)),
+            |ui| {
+                crate::panel_widgets::scroll("tools", ui, |ui| self.rail(ui));
+            },
+        );
+        ui.scope_builder(
+            UiBuilder::new()
+                .id_salt("inspector")
+                .max_rect(right.shrink(12.0)),
+            |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(right));
+                self.inspector(ui);
+            },
+        );
+        ui.scope_builder(UiBuilder::new().id_salt("canvas").max_rect(canvas), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(canvas));
+            self.canvas(ui)
+        });
+        let reveal_mask = self.mask_editor.reveal_lanes.take();
+        if let Some((id, mask)) = &reveal_mask {
+            self.key_editor.reveal_mask(id.clone(), *mask);
+        }
+        ui.scope_builder(
+            UiBuilder::new().id_salt("timeline").max_rect(timeline),
+            |ui| self.timeline(ui, reveal_mask.as_ref()),
+        );
+
+        if docked {
+            ui.painter().add(pane_frame(Mood::Ember).paint(drawer));
+            ui.scope_builder(
+                UiBuilder::new()
+                    .id_salt("drawer")
+                    .max_rect(drawer.shrink(10.0)),
+                |ui| {
+                    self.drawer(ui);
+                },
+            );
+        } else if self.drawer.is_some() {
+            // The floating drawer owns its hit region above the canvas and timeline.
+            egui::Area::new(ui.scope_id().with("forma-drawer-float"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(drawer.min)
+                .constrain_to(rect)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_width(drawer.width() - 16.0);
+                        ui.set_height((drawer.height() - 16.0).max(0.0));
+                        self.drawer(ui);
+                    });
+                });
+        }
+    }
+
+    fn split_workspace(&mut self, ui: &mut Ui, rect: Rect) -> (Rect, Rect) {
+        const DIVIDER: f32 = 8.0;
+        let usable = (rect.height() - DIVIDER).max(0.0);
+        let max = (usable - 180.0).max(usable * 0.5);
+        let min = 160.0_f32.min(max);
+        // Electron budgets 26% of the viewport for tracks, plus the transport, ruler and footer.
+        let default = (ui.ctx().content_rect().height() * 0.26).clamp(124.0, 300.0) + 100.0;
+        let mut height = self.timeline_height.unwrap_or(default).clamp(min, max);
+        let divider = |height| {
+            Rect::from_min_size(
+                pos2(rect.left(), rect.bottom() - height - DIVIDER),
+                vec2(rect.width(), DIVIDER),
+            )
+        };
+        let response = ui
+            .interact(
+                divider(height),
+                ui.scope_id().with("timeline-divider"),
+                Sense::click_and_drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical)
+            .on_hover_text(
+                "Drag to resize the timeline. Double-click to reset. Use Up or Down when focused.",
+            );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::Role::Splitter, true, "Timeline height")
+        });
+        if response.drag_started() {
+            self.timeline_at_drag_start = Some(height);
+        }
+        if let (Some(start), Some(delta)) =
+            (self.timeline_at_drag_start, response.total_drag_delta())
+        {
+            height = (start - delta.y).clamp(min, max);
+            self.timeline_height = Some(height);
+        }
+        let mut remember = response.drag_stopped() && self.timeline_at_drag_start.take().is_some();
+        if response.has_focus() {
+            let step = ui.input(|input| {
+                f32::from(input.key_pressed(egui::Key::ArrowUp))
+                    - f32::from(input.key_pressed(egui::Key::ArrowDown))
+            });
+            if step != 0.0 {
+                height = (height + step * 24.0).clamp(min, max);
+                self.timeline_height = Some(height);
+                remember = true;
+            }
+        }
+        if response.double_clicked() {
+            self.timeline_height = None;
+            height = default.clamp(min, max);
+            remember = true;
+        }
+        if remember
+            && let Err(error) = storage::save_timeline_height(&self.place, self.timeline_height)
+        {
+            self.notice = Some(format!("Forma couldn't remember timeline height: {error}"));
+        }
+        let divider = divider(height);
+        let ink = if response.hovered() || response.dragged() || response.has_focus() {
+            color::SUN
+        } else {
+            color::HAIRLINE_STRONG
+        };
+        ui.painter()
+            .hline(divider.x_range(), divider.center().y, Stroke::new(1.0, ink));
+        ui.painter().rect_filled(
+            Rect::from_center_size(divider.center(), vec2(40.0, 3.0)),
+            2.0,
+            ink,
+        );
+        (
+            Rect::from_min_max(rect.min, pos2(rect.right(), divider.top())),
+            Rect::from_min_max(pos2(rect.left(), divider.bottom()), rect.max),
+        )
+    }
+
+    /// The timeline toolbar stays visible while the tracks scroll.
     fn transport(&mut self, ui: &mut Ui) {
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
             if icon_button(ui, Icon::SkipBack, "Back to start (Home)", false).clicked() {
                 self.playing = false;
                 self.preview_end = None;
@@ -4256,25 +4629,30 @@ impl Forma {
                     .on_hover_text("Last frame render time and playback cache fill");
             }
             self.key_editor.toolbar(ui, &mut self.scene, self.selected.as_deref());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if pill(ui, "Onion skin", None, self.onion_skin)
-                    .on_hover_text("While editing a clip, faintly show the clip before it on the same track")
-                    .clicked()
-                {
-                    self.onion_skin = !self.onion_skin;
-                }
-            });
+            if pill(ui, "Onion skin", None, self.onion_skin)
+                .on_hover_text("While editing a clip, faintly show the clip before it on the same track")
+                .clicked()
+            {
+                self.onion_skin = !self.onion_skin;
+            }
         });
     }
 
     fn timeline(&mut self, ui: &mut Ui, reveal_mask: Option<&(String, u64)>) {
         let full = ui.max_rect();
         ui.painter().add(pane_frame(Mood::Ember).paint(full));
-        let bar = Rect::from_min_size(full.min, vec2(full.width(), 36.0));
-        ui.scope_builder(UiBuilder::new().max_rect(bar.shrink2(vec2(8.0, 2.0))), |ui| {
-            self.transport(ui)
-        });
-        let rect = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
+        ui.set_clip_rect(ui.clip_rect().intersect(full));
+        let bar = ui
+            .scope_builder(
+                UiBuilder::new()
+                    .id_salt("transport")
+                    .max_rect(full.shrink(8.0)),
+                |ui| self.transport(ui),
+            )
+            .response
+            .rect;
+        let ruler_top = (bar.bottom() + 4.0).min(full.bottom());
+        let rect = Rect::from_min_max(pos2(full.left(), ruler_top), full.max);
         self.key_editor.begin_frame(&self.scene);
         let reveal_animator = self.key_editor.animator_to_reveal.take();
         let reveal_effects = self.key_editor.effects_to_reveal.take();
@@ -4310,13 +4688,13 @@ impl Forma {
             } else {
                 format!("{:.2}s", model::hundredths(tick)).replace(".00s", "s")
             };
-            ui.painter().text(
-                pos2(pos + 3.0, rect.top() + 4.0),
-                Align2::LEFT_TOP,
-                label,
-                font::ui(10.0),
-                color::INK_MUTED,
-            );
+            let galley = ui
+                .painter()
+                .layout_no_wrap(label, font::ui(10.0), color::INK_MUTED);
+            if pos + 3.0 + galley.size().x <= plot.right() {
+                ui.painter()
+                    .galley(pos2(pos + 3.0, rect.top() + 4.0), galley, color::INK_MUTED);
+            }
         }
         let ruler = Rect::from_min_max(plot.min, pos2(plot.right(), rect.top() + 25.0));
         let response = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag());
@@ -4330,73 +4708,67 @@ impl Forma {
         let rows = self.rows();
         let area = Rect::from_min_max(pos2(rect.left(), rect.top() + 27.0), rect.max);
         ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("forma-timeline")
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    // Each row advances the cursor once. Its controls use absolute positions.
-                    for row in &rows {
-                        if let Row::Property(index, lane) = *row {
-                            let id = self.scene.shapes[index].id.clone();
-                            let height = self.key_editor.row_height(&id, lane);
-                            let (mut line, _) = ui.allocate_exact_size(
-                                vec2(ui.available_width(), height),
-                                Sense::hover(),
-                            );
-                            line.max.x = rect.right();
-                            if ui.is_rect_visible(line)
-                                && self.key_editor.row(
-                                    ui,
-                                    &mut self.scene,
-                                    index,
-                                    lane,
-                                    line,
-                                    view,
-                                    &mut self.time,
-                                    &mut self.playing,
-                                )
-                            {
-                                self.selected = Some(id.clone());
-                                if let Lane::Mask(mask, _) = lane {
-                                    self.mask_editor.select(&id, mask);
-                                }
-                                self.multi_selected = vec![id];
-                                self.tab = Tab::Animate;
+            crate::panel_widgets::scroll("forma-timeline", ui, |ui| {
+                // Each row advances the cursor once. Its controls use absolute positions.
+                for row in &rows {
+                    if let Row::Property(index, lane) = *row {
+                        let id = self.scene.shapes[index].id.clone();
+                        let height = self.key_editor.row_height(&id, lane);
+                        let (mut line, _) = ui.allocate_exact_size(
+                            vec2(ui.available_width(), height),
+                            Sense::hover(),
+                        );
+                        line.max.x = rect.right();
+                        if ui.is_rect_visible(line)
+                            && self.key_editor.row(
+                                ui,
+                                &mut self.scene,
+                                index,
+                                lane,
+                                line,
+                                view,
+                                &mut self.time,
+                                &mut self.playing,
+                            )
+                        {
+                            self.selected = Some(id.clone());
+                            if let Lane::Mask(mask, _) = lane {
+                                self.mask_editor.select(&id, mask);
                             }
-                        } else {
-                            let (line, _) = ui.allocate_exact_size(
-                                vec2(ui.available_width(), 32.0),
-                                Sense::hover(),
-                            );
-                            if let (Row::Mask(index, mask, _), Some((id, reveal))) =
-                                (row, reveal_mask)
-                                && mask == reveal
-                                && self.scene.shapes[*index].id == *id
-                            {
-                                ui.scroll_to_rect(line, Some(egui::Align::TOP));
-                            }
-                            if let (Row::Effects(index), Some(id)) = (row, reveal_effects.as_ref())
-                                && self
-                                    .scene
-                                    .shapes
-                                    .get(*index)
-                                    .is_some_and(|shape| &shape.id == id)
-                            {
-                                ui.scroll_to_rect(line, Some(egui::Align::TOP));
-                            }
-                            if let (Row::TextAnimator(index, animator), Some((id, reveal))) =
-                                (row, reveal_animator.as_ref())
-                                && animator == reveal
-                                && self.scene.shapes[*index].id == *id
-                            {
-                                ui.scroll_to_rect(line, Some(egui::Align::TOP));
-                            }
-                            if ui.is_rect_visible(line) {
-                                self.timeline_row(ui, row, line, &x, width, view);
-                            }
+                            self.multi_selected = vec![id];
+                            self.tab = Tab::Animate;
+                        }
+                    } else {
+                        let (line, _) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+                        if let (Row::Mask(index, mask, _), Some((id, reveal))) = (row, reveal_mask)
+                            && mask == reveal
+                            && self.scene.shapes[*index].id == *id
+                        {
+                            ui.scroll_to_rect(line, Some(egui::Align::TOP));
+                        }
+                        if let (Row::Effects(index), Some(id)) = (row, reveal_effects.as_ref())
+                            && self
+                                .scene
+                                .shapes
+                                .get(*index)
+                                .is_some_and(|shape| &shape.id == id)
+                        {
+                            ui.scroll_to_rect(line, Some(egui::Align::TOP));
+                        }
+                        if let (Row::TextAnimator(index, animator), Some((id, reveal))) =
+                            (row, reveal_animator.as_ref())
+                            && animator == reveal
+                            && self.scene.shapes[*index].id == *id
+                        {
+                            ui.scroll_to_rect(line, Some(egui::Align::TOP));
+                        }
+                        if ui.is_rect_visible(line) {
+                            self.timeline_row(ui, row, line, &x, width, view);
                         }
                     }
-                });
+                }
+            });
         });
         self.key_editor
             .finish_frame(ui, &mut self.scene, area, self.time, self.lock_ratio);
@@ -4457,12 +4829,16 @@ impl Forma {
                 );
                 at += 15.0;
             }
-            painter.text(
-                pos2(at, line.center().y),
-                Align2::LEFT_CENTER,
-                text,
-                font::ui(11.0),
-                if sub { color::INK_MUTED } else { color::INK },
+            let ink = if sub { color::INK_MUTED } else { color::INK };
+            let mut job =
+                egui::text::LayoutJob::simple_singleline(text.to_owned(), font::ui(11.0), ink);
+            job.wrap =
+                egui::text::TextWrapping::truncate_at_width(line.left() + LABEL_WIDTH - 10.0 - at);
+            let galley = painter.layout_job(job);
+            painter.galley(
+                pos2(at, line.center().y - galley.size().y * 0.5),
+                galley,
+                ink,
             );
         };
         ui.painter().rect_filled(
@@ -4515,11 +4891,13 @@ impl Forma {
                     Some(hex(&self.scene.shapes[first].color, 255)),
                     false,
                 );
-                let head = ui.interact(
-                    label_rect,
-                    ui.scope_id().with(("track", &id)),
-                    Sense::click(),
-                );
+                let head = ui
+                    .interact(
+                        label_rect,
+                        ui.scope_id().with(("track", &id)),
+                        Sense::click(),
+                    )
+                    .on_hover_text(name);
                 if head.double_clicked() {
                     self.queue_composition(&id);
                 }
@@ -4580,6 +4958,11 @@ impl Forma {
                     self.tab = Tab::Animate;
                 }
             }
+            Row::Effect(index, effect) => {
+                if let Some(effect) = self.scene.shapes[*index].effect(*effect) {
+                    label(ui.painter(), effect.kind.label(), None, true);
+                }
+            }
             Row::Mask(index, mask, number) => {
                 let id = self.scene.shapes[*index].id.clone();
                 let open = self.key_editor.mask_expanded(&id, *mask);
@@ -4613,13 +4996,7 @@ impl Forma {
                 }
                 let span = bar(d.start_time, bar_end);
                 ui.painter().rect_filled(span, 4.0, Accent::Berry.color());
-                ui.painter().text(
-                    span.left_center() + vec2(5.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    "Hidden",
-                    font::ui(10.0),
-                    color::INK,
-                );
+                paint_clip_label(ui, span, "Hidden".into(), color::INK);
                 let timed = d.reappear_mode == "time";
                 let tip = format!(
                     "Fade out {:.2}–{:.2} s{}. Drag to move it{}.",
@@ -4675,11 +5052,10 @@ impl Forma {
                 }
                 let span = bar(start, start + length);
                 ui.painter().rect_filled(span, 4.0, Accent::Sky.color());
-                ui.painter().text(
-                    span.left_center() + vec2(5.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    if path { "Mouse path" } else { "Arrow move" },
-                    font::ui(10.0),
+                paint_clip_label(
+                    ui,
+                    span,
+                    if path { "Mouse path" } else { "Arrow move" }.into(),
                     color::INK,
                 );
                 let id = shape.id.clone();
@@ -4689,11 +5065,14 @@ impl Forma {
                     .as_ref()
                     .is_some_and(|d| d.shape.id == id && matches!(d.part, Part::Motion(i) | Part::MotionStart(i) | Part::MotionEnd(i) if i == *m));
                 if dragging {
-                    ui.painter().text(
-                        span.right_center() + vec2(6.0, 0.0),
-                        Align2::LEFT_CENTER,
-                        format!("{start:.2}–{:.2} s · {length:.2} s", start + length),
-                        font::ui(10.0),
+                    let after = Rect::from_min_max(
+                        span.right_top(),
+                        pos2(line.right() - TIME_MARGIN, span.bottom()),
+                    );
+                    paint_clip_label(
+                        ui,
+                        after,
+                        format!("{start:.2}\u{2013}{:.2} s", start + length),
                         color::INK,
                     );
                 }
@@ -4734,11 +5113,10 @@ impl Forma {
                 }
                 let span = bar(clip.start_time, clip.start_time + clip.duration);
                 ui.painter().rect_filled(span, 4.0, Accent::Clay.color());
-                ui.painter().text(
-                    span.left_center() + vec2(5.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    format!("Spin {}°", clip.degrees),
-                    font::ui(10.0),
+                paint_clip_label(
+                    ui,
+                    span,
+                    format!("Spin {}\u{00b0}", clip.degrees),
                     color::INK,
                 );
                 let tip = format!(
@@ -4822,17 +5200,12 @@ impl Forma {
             } else {
                 shape.name.clone()
             };
-            ui.painter().text(
-                span.left_center() + vec2(6.0, 0.0),
-                Align2::LEFT_CENTER,
-                text,
-                font::ui(10.0),
-                if selected {
-                    Mood::Ember.ground()
-                } else {
-                    color::INK
-                },
-            );
+            let ink = if selected {
+                Mood::Ember.ground()
+            } else {
+                color::INK
+            };
+            paint_clip_label(ui, span, text, ink);
         }
         let tip = format!(
             "{}: visible {start:.2}–{end:.2} s. Drag to move, drag an edge to trim.",
@@ -5275,146 +5648,17 @@ impl Forma {
             return;
         }
         let mut run = false;
-        let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-export"), |ui| {
-            ui.set_width(380.0);
+        let pane = self.pane;
+        let modal = pane_dialog(ui.ctx(), pane, ui.scope_id().with("forma-export"), |ui| {
+            ui.set_width(400.0_f32.min(ui.available_width()));
             ui.label(
                 egui::RichText::new("Export")
                     .font(font::bold(18.0))
                     .color(color::INK),
             );
-            ui.add_space(6.0);
-            let old_kind = self.export_kind;
-            for (kind, title, detail) in [
-                (
-                    ExportKind::Video,
-                    "Video",
-                    "MP4, WebM, MOV, GIF or PNG frames.",
-                ),
-                (
-                    ExportKind::Svg,
-                    "Animated SVG",
-                    "A small looping file for websites.",
-                ),
-                (
-                    ExportKind::Picture,
-                    "Picture",
-                    "A PNG of the frame at the playhead.",
-                ),
-                (
-                    ExportKind::Project,
-                    "Project file",
-                    "Everything, to open in Forma elsewhere.",
-                ),
-                (ExportKind::Lottie, "Lottie", "An animation in Bodymovin JSON."),
-                (ExportKind::StreamCuts, "StreamCuts template", "An animated title with editable fields."),
-            ] {
-                ui.radio_value(
-                    &mut self.export_kind,
-                    kind,
-                    egui::RichText::new(format!("{title}  ·  {detail}")).font(font::ui(13.0)),
-                );
-            }
-            if self.export_kind != old_kind {
-                self.export_error = None;
-            }
             ui.separator();
-            let scene = &self.scene;
-            if self.export_kind == ExportKind::Video {
-                let settings = &mut self.video_settings;
-                egui::Grid::new("forma-video-options")
-                    .num_columns(2)
-                    .spacing([12.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Format");
-                        let formats = [
-                            (video::Format::Mp4, "MP4"),
-                            (video::Format::WebM, "WebM (VP9)"),
-                            (video::Format::Mov, "MOV (ProRes 4444)"),
-                            (video::Format::PngSequence, "PNG sequence (ZIP)"),
-                            (video::Format::Gif, "GIF"),
-                        ];
-                        egui::ComboBox::from_id_salt("video-format")
-                            .selected_text(formats.iter().find(|(format, _)| *format == settings.format).map_or("MP4", |(_, name)| *name))
-                            .show_ui(ui, |ui| {
-                                for (format, name) in formats {
-                                    ui.selectable_value(&mut settings.format, format, name);
-                                }
-                        });
-                        ui.end_row();
-                        if settings.format == video::Format::Mp4 {
-                            settings.transparent = false;
-                        }
-                        ui.label("Background");
-                        ui.add_enabled(settings.format != video::Format::Mp4,
-                            egui::Checkbox::new(&mut settings.transparent, "Transparent"));
-                        ui.end_row();
-                        ui.label("Smoothness");
-                        ui.horizontal(|ui| {
-                            for fps in [24, 30, 60] {
-                                ui.selectable_value(&mut settings.fps, fps, fps.to_string());
-                            }
-                            ui.label(
-                                egui::RichText::new("frames per second").color(color::INK_MUTED),
-                            );
-                        });
-                        ui.end_row();
-                        ui.label("Size");
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut settings.scale, 1, "Normal");
-                            ui.selectable_value(&mut settings.scale, 2, "Large");
-                            let (w, h) = settings.size(scene);
-                            ui.label(
-                                egui::RichText::new(format!("{w} × {h} pixels"))
-                                    .color(color::INK_MUTED),
-                            );
-                        });
-                        ui.end_row();
-                    });
-                ui.separator();
-            }
-            let summary = match self.export_kind {
-                ExportKind::Video => {
-                    let sound = if !matches!(self.video_settings.format, video::Format::Gif | video::Format::PngSequence)
-                        && scene.shapes.iter().any(|s| s.kind == "video") {
-                        "  ·  Includes sound"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "{:.1} seconds · {} frames{sound}",
-                        scene.duration,
-                        self.video_settings.frames(scene)
-                    )
-                }
-                ExportKind::Svg => {
-                    let video = if scene.shapes.iter().any(|s| s.kind == "video") {
-                        "  ·  Video layers show their first frame."
-                    } else {
-                        ""
-                    };
-                    format!("{:.1} seconds, looping{video}", scene.duration)
-                }
-                ExportKind::Picture => format!(
-                    "The frame at {:.2} s · {} × {}",
-                    self.time, scene.width, scene.height
-                ),
-                ExportKind::Project => {
-                    let n = scene.shapes.len();
-                    format!(
-                        "{n} layer{} with their pictures and video",
-                        if n == 1 { "" } else { "s" }
-                    )
-                }
-                ExportKind::Lottie => format!("{:.1} seconds at 30 frames per second", scene.duration),
-                ExportKind::StreamCuts => "Saves the open composition and its editable fields.".into(),
-            };
-            ui.label(egui::RichText::new(summary).font(font::bold(13.0)));
-            if let Some(error) = &self.export_error {
-                egui::ScrollArea::vertical().max_height(155.0).show(ui, |ui| {
-                    ui.label(error);
-                });
-            }
-            ui.add_space(6.0);
+            dialog_body(ui, pane, |ui| self.export_options(ui));
+            ui.separator();
             let label = match self.export_kind {
                 ExportKind::Video => "Export video",
                 ExportKind::Svg => "Export SVG",
@@ -5431,6 +5675,156 @@ impl Forma {
         } else if modal.close {
             self.show_export = false;
         }
+    }
+
+    fn export_options(&mut self, ui: &mut Ui) {
+        ui.add_space(6.0);
+        let old_kind = self.export_kind;
+        for (kind, title, detail) in [
+            (
+                ExportKind::Video,
+                "Video",
+                "MP4, WebM, MOV, GIF or PNG frames.",
+            ),
+            (
+                ExportKind::Svg,
+                "Animated SVG",
+                "A small looping file for websites.",
+            ),
+            (
+                ExportKind::Picture,
+                "Picture",
+                "A PNG of the frame at the playhead.",
+            ),
+            (
+                ExportKind::Project,
+                "Project file",
+                "Everything, to open in Forma elsewhere.",
+            ),
+            (
+                ExportKind::Lottie,
+                "Lottie",
+                "An animation in Bodymovin JSON.",
+            ),
+            (
+                ExportKind::StreamCuts,
+                "StreamCuts template",
+                "An animated title with editable fields.",
+            ),
+        ] {
+            ui.radio_value(
+                &mut self.export_kind,
+                kind,
+                egui::RichText::new(format!("{title}  ·  {detail}")).font(font::ui(13.0)),
+            );
+        }
+        if self.export_kind != old_kind {
+            self.export_error = None;
+        }
+        ui.separator();
+        let scene = &self.scene;
+        if self.export_kind == ExportKind::Video {
+            let settings = &mut self.video_settings;
+            egui::Grid::new("forma-video-options")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Format");
+                    let formats = [
+                        (video::Format::Mp4, "MP4"),
+                        (video::Format::WebM, "WebM (VP9)"),
+                        (video::Format::Mov, "MOV (ProRes 4444)"),
+                        (video::Format::PngSequence, "PNG sequence (ZIP)"),
+                        (video::Format::Gif, "GIF"),
+                    ];
+                    egui::ComboBox::from_id_salt("video-format")
+                        .selected_text(
+                            formats
+                                .iter()
+                                .find(|(format, _)| *format == settings.format)
+                                .map_or("MP4", |(_, name)| *name),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (format, name) in formats {
+                                ui.selectable_value(&mut settings.format, format, name);
+                            }
+                        });
+                    ui.end_row();
+                    if settings.format == video::Format::Mp4 {
+                        settings.transparent = false;
+                    }
+                    ui.label("Background");
+                    ui.add_enabled(
+                        settings.format != video::Format::Mp4,
+                        egui::Checkbox::new(&mut settings.transparent, "Transparent"),
+                    );
+                    ui.end_row();
+                    ui.label("Smoothness");
+                    ui.horizontal(|ui| {
+                        for fps in [24, 30, 60] {
+                            ui.selectable_value(&mut settings.fps, fps, fps.to_string());
+                        }
+                        ui.label(egui::RichText::new("frames per second").color(color::INK_MUTED));
+                    });
+                    ui.end_row();
+                    ui.label("Size");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut settings.scale, 1, "Normal");
+                        ui.selectable_value(&mut settings.scale, 2, "Large");
+                        let (w, h) = settings.size(scene);
+                        ui.label(
+                            egui::RichText::new(format!("{w} × {h} pixels"))
+                                .color(color::INK_MUTED),
+                        );
+                    });
+                    ui.end_row();
+                });
+            ui.separator();
+        }
+        let summary = match self.export_kind {
+            ExportKind::Video => {
+                let sound = if !matches!(
+                    self.video_settings.format,
+                    video::Format::Gif | video::Format::PngSequence
+                ) && scene.shapes.iter().any(|s| s.kind == "video")
+                {
+                    "  ·  Includes sound"
+                } else {
+                    ""
+                };
+                format!(
+                    "{:.1} seconds · {} frames{sound}",
+                    scene.duration,
+                    self.video_settings.frames(scene)
+                )
+            }
+            ExportKind::Svg => {
+                let video = if scene.shapes.iter().any(|s| s.kind == "video") {
+                    "  ·  Video layers show their first frame."
+                } else {
+                    ""
+                };
+                format!("{:.1} seconds, looping{video}", scene.duration)
+            }
+            ExportKind::Picture => format!(
+                "The frame at {:.2} s · {} × {}",
+                self.time, scene.width, scene.height
+            ),
+            ExportKind::Project => {
+                let n = scene.shapes.len();
+                format!(
+                    "{n} layer{} with their pictures and video",
+                    if n == 1 { "" } else { "s" }
+                )
+            }
+            ExportKind::Lottie => format!("{:.1} seconds at 30 frames per second", scene.duration),
+            ExportKind::StreamCuts => "Saves the open composition and its editable fields.".into(),
+        };
+        ui.label(egui::RichText::new(summary).font(font::bold(13.0)));
+        if let Some(error) = &self.export_error {
+            ui.label(error);
+        }
+        ui.add_space(6.0);
     }
 
     /// Makes the export chosen in the dialog, named after the project, into Files (a video on its own thread).
@@ -5501,157 +5895,168 @@ impl Forma {
             return;
         };
         let mut apply = false;
-        let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-svg"), |ui| {
-            ui.set_width(520.0);
+        let pane = self.pane;
+        let modal = pane_dialog(ui.ctx(), pane, ui.scope_id().with("forma-svg"), |ui| {
+            ui.set_width(520.0_f32.min(ui.available_width()));
             ui.label(
                 egui::RichText::new("Edit SVG")
                     .font(font::bold(18.0))
                     .color(color::INK),
             );
             let tree = svg::parse(&edit.source);
-            // The preview is drawn again only when the markup changes.
-            let hash = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                edit.source.hash(&mut hasher);
-                hasher.finish()
-            };
-            if self.svg_preview.as_ref().is_none_or(|(h, _)| *h != hash) {
-                self.svg_preview = tree.as_ref().ok().and_then(|tree| {
-                    let (w, h) = svg::size(tree);
-                    let fit = (480.0 / w).min(180.0 / h);
-                    let pixmap =
-                        svg::rasterize(tree, (w * fit).max(1.0) as u32, (h * fit).max(1.0) as u32)?;
-                    let image = egui::ColorImage::from_rgba_premultiplied(
-                        [pixmap.width() as usize, pixmap.height() as usize],
-                        pixmap.data(),
-                    );
-                    Some((
-                        hash,
-                        ui.ctx()
-                            .load_texture("forma-svg-preview", image, TextureOptions::LINEAR),
-                    ))
-                });
-            }
-            match (&tree, &self.svg_preview) {
-                (Ok(_), Some((_, texture))) => {
-                    let response = ui.add(
-                        egui::Image::new(texture)
-                            .max_size(vec2(480.0, 180.0))
-                            .sense(egui::Sense::click()),
-                    );
-                    if let Some(pos) = response
-                        .interact_pointer_pos()
-                        .filter(|_| response.clicked())
-                    {
-                        let uv = (pos - response.rect.min) / response.rect.size();
-                        let size = texture.size();
-                        edit.selected_part = svg::hit_part(
-                            &edit.source,
-                            (uv.x * size[0] as f32) as u32,
-                            (uv.y * size[1] as f32) as u32,
-                            size[0] as u32,
-                            size[1] as u32,
+            dialog_body(ui, pane, |ui| {
+                // The preview is drawn again only when the markup changes.
+                let hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    edit.source.hash(&mut hasher);
+                    hasher.finish()
+                };
+                if self.svg_preview.as_ref().is_none_or(|(h, _)| *h != hash) {
+                    self.svg_preview = tree.as_ref().ok().and_then(|tree| {
+                        let (w, h) = svg::size(tree);
+                        let fit = (480.0 / w).min(180.0 / h);
+                        let pixmap = svg::rasterize(
+                            tree,
+                            (w * fit).max(1.0) as u32,
+                            (h * fit).max(1.0) as u32,
+                        )?;
+                        let image = egui::ColorImage::from_rgba_premultiplied(
+                            [pixmap.width() as usize, pixmap.height() as usize],
+                            pixmap.data(),
                         );
-                        if let Some(index) = edit.selected_part {
-                            if let Some(hex) = svg::part_color(&edit.source, index, "fill") {
-                                if hex.len() == 7 && hex.starts_with('#') {
-                                    if let Ok(rgb) = u32::from_str_radix(&hex[1..], 16) {
-                                        edit.color =
-                                            [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8];
+                        Some((
+                            hash,
+                            ui.ctx().load_texture(
+                                "forma-svg-preview",
+                                image,
+                                TextureOptions::LINEAR,
+                            ),
+                        ))
+                    });
+                }
+                match (&tree, &self.svg_preview) {
+                    (Ok(_), Some((_, texture))) => {
+                        let response = ui.add(
+                            egui::Image::new(texture)
+                                .max_size(vec2(ui.available_width().min(480.0), 180.0))
+                                .sense(egui::Sense::click()),
+                        );
+                        if let Some(pos) = response
+                            .interact_pointer_pos()
+                            .filter(|_| response.clicked())
+                        {
+                            let uv = (pos - response.rect.min) / response.rect.size();
+                            let size = texture.size();
+                            edit.selected_part = svg::hit_part(
+                                &edit.source,
+                                (uv.x * size[0] as f32) as u32,
+                                (uv.y * size[1] as f32) as u32,
+                                size[0] as u32,
+                                size[1] as u32,
+                            );
+                            if let Some(index) = edit.selected_part {
+                                if let Some(hex) = svg::part_color(&edit.source, index, "fill") {
+                                    if hex.len() == 7 && hex.starts_with('#') {
+                                        if let Ok(rgb) = u32::from_str_radix(&hex[1..], 16) {
+                                            edit.color =
+                                                [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8];
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                _ => {
-                    ui.label(
-                        egui::RichText::new("Fix the SVG markup to preview it.")
-                            .color(color::INK_MUTED),
-                    );
-                }
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("forma-svg-source")
-                .max_height(200.0)
-                .show(ui, |ui| {
-                    if ui
-                        .add(
-                            egui::TextEdit::multiline(&mut edit.source)
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(8),
-                        )
-                        .changed()
-                    {
-                        edit.selected_part = None;
+                    _ => {
+                        ui.label(
+                            egui::RichText::new("Fix the SVG markup to preview it.")
+                                .color(color::INK_MUTED),
+                        );
                     }
-                });
-            ui.horizontal(|ui| {
-                egui::color_picker::color_edit_button_srgb(ui, &mut edit.color);
-                if ui
-                    .button("Recolor")
-                    .on_hover_text("Paint every fill and stroke this color")
-                    .clicked()
-                {
-                    let color = format!(
-                        "#{:02x}{:02x}{:02x}",
-                        edit.color[0], edit.color[1], edit.color[2]
-                    );
-                    match svg::recolor(&edit.source, &color) {
-                        Ok(source) => {
-                            (edit.source, edit.status) = (
-                                source,
-                                "Artwork recolored. Apply the changes to update the layer.".into(),
+                }
+                ui.spacing_mut().scroll.floating = false;
+                egui::ScrollArea::vertical()
+                    .id_salt("forma-svg-source")
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        if ui
+                            .add(
+                                egui::TextEdit::multiline(&mut edit.source)
+                                    .code_editor()
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(8),
                             )
+                            .changed()
+                        {
+                            edit.selected_part = None;
                         }
-                        Err(error) => edit.status = error,
-                    }
-                }
-            });
-            if let Some(index) = edit.selected_part {
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "Selected: {}",
-                        svg::part_name(&edit.source, index).unwrap_or_default()
-                    ));
-                    let color = format!(
-                        "#{:02x}{:02x}{:02x}",
-                        edit.color[0], edit.color[1], edit.color[2]
-                    );
-                    for (label, paint) in [("Set fill", "fill"), ("Set stroke", "stroke")] {
-                        if ui.button(label).clicked() {
-                            match svg::set_part_paint(&edit.source, index, paint, &color) {
-                                Ok(source) => {
-                                    edit.source = source;
-                                    edit.status = format!("{label} updated. Apply to save.");
-                                }
-                                Err(error) => edit.status = error,
-                            }
-                        }
-                    }
-                    if ui.button("Delete part").clicked() {
-                        match svg::delete_part(&edit.source, index) {
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    egui::color_picker::color_edit_button_srgb(ui, &mut edit.color);
+                    if ui
+                        .button("Recolor")
+                        .on_hover_text("Paint every fill and stroke this color")
+                        .clicked()
+                    {
+                        let color = format!(
+                            "#{:02x}{:02x}{:02x}",
+                            edit.color[0], edit.color[1], edit.color[2]
+                        );
+                        match svg::recolor(&edit.source, &color) {
                             Ok(source) => {
-                                edit.source = source;
-                                edit.selected_part = None;
-                                edit.status = "Part deleted. Apply to save.".into();
+                                (edit.source, edit.status) = (
+                                    source,
+                                    "Artwork recolored. Apply the changes to update the layer."
+                                        .into(),
+                                )
                             }
                             Err(error) => edit.status = error,
                         }
                     }
                 });
-            }
-            if !edit.status.is_empty() {
-                ui.label(egui::RichText::new(&edit.status).color(color::INK_MUTED));
-            }
+                if let Some(index) = edit.selected_part {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!(
+                            "Selected: {}",
+                            svg::part_name(&edit.source, index).unwrap_or_default()
+                        ));
+                        let color = format!(
+                            "#{:02x}{:02x}{:02x}",
+                            edit.color[0], edit.color[1], edit.color[2]
+                        );
+                        for (label, paint) in [("Set fill", "fill"), ("Set stroke", "stroke")] {
+                            if ui.button(label).clicked() {
+                                match svg::set_part_paint(&edit.source, index, paint, &color) {
+                                    Ok(source) => {
+                                        edit.source = source;
+                                        edit.status = format!("{label} updated. Apply to save.");
+                                    }
+                                    Err(error) => edit.status = error,
+                                }
+                            }
+                        }
+                        if ui.button("Delete part").clicked() {
+                            match svg::delete_part(&edit.source, index) {
+                                Ok(source) => {
+                                    edit.source = source;
+                                    edit.selected_part = None;
+                                    edit.status = "Part deleted. Apply to save.".into();
+                                }
+                                Err(error) => edit.status = error,
+                            }
+                        }
+                    });
+                }
+                if !edit.status.is_empty() {
+                    ui.label(egui::RichText::new(&edit.status).color(color::INK_MUTED));
+                }
+            });
+            ui.separator();
             apply = ui
                 .add_enabled(tree.is_ok(), egui::Button::new("Apply"))
                 .clicked();
         });
-        if apply {
-            let edit = self.svg_edit.take().unwrap();
+        if apply && let Some(edit) = self.svg_edit.take() {
             if let Some(shape) = self.scene.shapes.iter_mut().find(|s| s.id == edit.id) {
                 shape.extra.remove("svgSourceRef");
                 shape.extra.insert("svgSource".into(), edit.source.into());
@@ -5694,32 +6099,29 @@ impl Forma {
         }
         let mut choice = None;
         let current = self.main_id().to_owned();
-        let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-projects"), |ui| {
-            ui.set_width(620.0_f32.min(ui.ctx().content_rect().width() - 60.0));
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
+        let modal = pane_modal(
+            ui.ctx(),
+            self.pane,
+            ui.scope_id().with("forma-projects"),
+            |ui| {
+                ui.set_width(620.0_f32.min(ui.available_width()));
+                ui.horizontal_wrapped(|ui| {
                     ui.heading("What would you like to make?");
-                    ui.label(
-                        egui::RichText::new(
-                            "Pick a starting point. You can mix shapes, text, pictures, and video in any project.",
-                        )
-                        .color(color::INK_MUTED),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui.button("Back to the editor").clicked() {
                         choice = Some(Choice::Back);
                     }
                 });
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.start_portrait, false, "Landscape");
-                ui.selectable_value(&mut self.start_portrait, true, "Portrait for phones");
-            });
-            ui.add_space(8.0);
-            ui.columns(3, |columns| {
-                for (column, (title, about, pick)) in columns.iter_mut().zip([
+                ui.label(egui::RichText::new(
+                "Pick a starting point. You can mix shapes, text, pictures, and video in any project.",
+            ).color(color::INK_MUTED));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.start_portrait, false, "Landscape");
+                    ui.selectable_value(&mut self.start_portrait, true, "Portrait for phones");
+                });
+                ui.add_space(8.0);
+                let wide = ui.available_width() >= 540.0;
+                let cards = [
                     (
                         "Animate shapes",
                         "Move, spin, and fade shapes and text. Forma fills in the motion between the moments you set.",
@@ -5735,7 +6137,8 @@ impl Forma {
                         "Add your own shapes, text, pictures, or video.",
                         Choice::Empty,
                     ),
-                ]) {
+                ];
+                let mut draw_card = |column: &mut Ui, (title, about, pick)| {
                     let card = egui::Frame::new()
                         .fill(color::VEIL)
                         .corner_radius(10.0)
@@ -5744,8 +6147,16 @@ impl Forma {
                             ui.set_min_height(96.0);
                             // Left-aligned: the columns' justified layout would spread the words out.
                             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                                ui.label(egui::RichText::new(title).font(font::bold(14.0)).color(color::INK));
-                                ui.label(egui::RichText::new(about).font(font::ui(12.0)).color(color::INK_MUTED));
+                                ui.label(
+                                    egui::RichText::new(title)
+                                        .font(font::bold(14.0))
+                                        .color(color::INK),
+                                );
+                                ui.label(
+                                    egui::RichText::new(about)
+                                        .font(font::ui(12.0))
+                                        .color(color::INK_MUTED),
+                                );
                             });
                         })
                         .response
@@ -5762,44 +6173,73 @@ impl Forma {
                     if card.clicked() {
                         choice = Some(pick);
                     }
-                }
-            });
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Your projects").font(font::bold(14.0)).color(color::INK));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button("Open a file")
-                        .on_hover_text("A .forma file or an editable JSON project")
-                        .clicked()
-                    {
-                        choice = Some(Choice::File);
+                };
+                if wide {
+                    ui.columns(3, |uis| {
+                        for (column, card) in uis.iter_mut().zip(cards) {
+                            draw_card(column, card);
+                        }
+                    });
+                } else {
+                    for card in cards {
+                        draw_card(ui, card);
                     }
-                });
-            });
-            let projects = storage::list(&self.place);
-            if projects.is_empty() {
-                ui.label(
-                    egui::RichText::new("Nothing saved yet. Projects appear here as you work.")
-                        .color(color::INK_MUTED),
-                );
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("forma-start-projects")
-                .max_height(240.0)
-                .show(ui, |ui| {
-                    for doc in projects {
-                        let open_now = if doc.id == current { " · open now" } else { "" };
-                        let text = format!("{}{open_now}  ·  {}  ·  {}", doc.name, doc.detail, saved_ago(doc.saved_at));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Your projects")
+                            .font(font::bold(14.0))
+                            .color(color::INK),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new(text).min_size(vec2(ui.available_width(), 26.0)))
+                            .button("Open a file")
+                            .on_hover_text("A .forma file or an editable JSON project")
                             .clicked()
                         {
-                            choice = Some(Choice::Open(doc.id));
+                            choice = Some(Choice::File);
                         }
-                    }
+                    });
                 });
-        });
+                let projects = storage::list(&self.place);
+                if projects.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Nothing saved yet. Projects appear here as you work.")
+                            .color(color::INK_MUTED),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("forma-start-projects")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for doc in projects {
+                            let open_now = if doc.id == current {
+                                " · open now"
+                            } else {
+                                ""
+                            };
+                            let text = format!(
+                                "{}{open_now}  ·  {}  ·  {}",
+                                doc.name,
+                                doc.detail,
+                                saved_ago(doc.saved_at)
+                            );
+                            if ui
+                                .add(
+                                    egui::Button::new(&text)
+                                        .min_size(vec2(ui.available_width(), 32.0))
+                                        .truncate(),
+                                )
+                                .on_hover_text(text)
+                                .clicked()
+                            {
+                                choice = Some(Choice::Open(doc.id));
+                            }
+                        }
+                    });
+            },
+        );
         let close = match choice {
             Some(Choice::Shapes) => {
                 self.new_project(true);
@@ -5961,24 +6401,28 @@ impl Forma {
             return;
         }
         let mut close = false;
-        let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-help"), |ui| {
-            ui.set_width(470.0);
+        let pane = self.pane;
+        let modal = pane_dialog(ui.ctx(), pane, ui.scope_id().with("forma-help"), |ui| {
+            ui.set_width(470.0_f32.min(ui.available_width()));
             ui.heading("Make your first animation");
-            ui.add_space(8.0);
-            for step in [
-                "1. Add a layer. Use + Circle, + Text, or + Picture, SVG or video on the left.",
-                "2. Set a moment. Drag the playhead in the timeline, then drag, resize, or recolor the layer. Forma remembers it as a keyframe.",
-                "3. Make it move. Use Move, Spin, Fade, or Drop under the canvas, or set another moment.",
-                "4. Stop-motion. Give a picture an end time, press Next pose after this, and drag the copy.",
-            ] {
-                ui.label(step);
-                ui.add_space(6.0);
-            }
+            dialog_body(ui, pane, |ui| {
+                ui.add_space(8.0);
+                for step in [
+                    "1. Add a layer. Use + Circle, + Text, or + Picture, SVG or video on the left.",
+                    "2. Set a moment. Drag the playhead in the timeline, then drag, resize, or recolor the layer. Forma remembers it as a keyframe.",
+                    "3. Make it move. Use Move, Spin, Fade, or Drop under the canvas, or set another moment.",
+                    "4. Stop-motion. Give a picture an end time, press Next pose after this, and drag the copy.",
+                ] {
+                    ui.label(step);
+                    ui.add_space(6.0);
+                }
+                ui.separator();
+                ui.label("Press Ctrl + Z to undo and S to split a clip at the playhead. Press play to preview, then Export.");
+                ui.add_space(4.0);
+                ui.label("Keys: Space plays. Arrows nudge the selected layers (Shift: 10 px), or step the playhead with none selected. [ and ] move a layer back and forward. Home and End go to the ends. Ctrl + and Ctrl - zoom, Ctrl+0 resets.");
+                ui.add_space(8.0);
+            });
             ui.separator();
-            ui.label("Press Ctrl + Z to undo and S to split a clip at the playhead. Press play to preview, then Export.");
-            ui.add_space(4.0);
-            ui.label("Keys: Space plays. Arrows nudge the selected layers (Shift: 10 px), or step the playhead with none selected. [ and ] move a layer back and forward. Home and End go to the ends. Ctrl + and Ctrl - zoom, Ctrl+0 resets.");
-            ui.add_space(8.0);
             close = ui.button("Got it").clicked();
         });
         if close || modal.close {
@@ -6174,89 +6618,13 @@ impl CanopyApp for Forma {
             UiBuilder::new().max_rect(top.shrink2(vec2(7.0, 4.0))),
             |ui| self.toolbar(ui, host),
         );
-        // The timeline with its playback strip on top.
-        let timeline_h = (rect.height() * 0.3).clamp(186.0, 266.0);
-        let middle = Rect::from_min_max(
-            pos2(rect.left(), top.bottom() + 4.0),
-            pos2(rect.right(), rect.bottom() - timeline_h - 6.0),
+        self.workspace(
+            ui,
+            Rect::from_min_max(pos2(rect.left(), top.bottom() + 4.0), rect.max),
         );
-        // The drawer starts open when there's room for it beside a good-sized canvas, closed in a narrow pane.
-        if !self.drawer_decided {
-            self.drawer_decided = true;
-            if rect.width() >= 1150.0 {
-                self.drawer = Some(Drawer::Add);
-            }
-        }
-        // The tool rail, the drawer when open, the canvas, and the inspector (narrower in a narrow pane).
-        let rail = Rect::from_min_size(middle.min, vec2(46.0, middle.height()));
-        let inspector_w = if rect.width() < 900.0 { 230.0 } else { 260.0 };
-        let right = Rect::from_min_max(pos2(middle.right() - inspector_w, middle.top()), middle.max);
-        let drawer = Rect::from_min_size(pos2(rail.right() + 5.0, middle.top()), vec2(215.0, middle.height()));
-        // Beside a canvas narrower than this (a split pane), the drawer floats over the canvas instead.
-        let docked = self.drawer.is_some() && right.left() - drawer.right() >= 330.0;
-        let left_edge = if docked { drawer.right() } else { rail.right() };
-        let canvas = Rect::from_min_max(
-            pos2(left_edge + 5.0, middle.top()),
-            pos2(right.left() - 5.0, middle.bottom()),
-        );
-        ui.painter().add(pane_frame(Mood::Ember).paint(rail));
-        ui.painter().add(pane_frame(Mood::Ember).paint(right));
-        ui.scope_builder(UiBuilder::new().max_rect(rail.shrink2(vec2(4.0, 8.0))), |ui| {
-            self.rail(ui)
-        });
-        if docked {
-            ui.painter().add(pane_frame(Mood::Ember).paint(drawer));
-            ui.scope_builder(UiBuilder::new().max_rect(drawer.shrink(8.0)), |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("forma-drawer")
-                    .auto_shrink(false)
-                    .show(ui, |ui| self.drawer(ui));
-            });
-        } else if self.drawer.is_some() {
-            // Its own layer, so the canvas underneath neither zooms nor picks through it.
-            egui::Area::new(ui.scope_id().with("forma-drawer-float"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(drawer.min)
-                .constrain(false)
-                .show(ui.ctx(), |ui| {
-                    egui::Frame::new()
-                        .fill(Mood::Ember.pane_solid())
-                        .stroke(Stroke::new(1.0, color::HAIRLINE_STRONG))
-                        .corner_radius(10.0)
-                        .shadow(egui::Shadow {
-                            offset: [0, 6],
-                            blur: 18,
-                            spread: 0,
-                            color: color::SHADOW,
-                        })
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
-                            ui.set_width(drawer.width() - 16.0);
-                            ui.set_height(drawer.height() - 16.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("forma-drawer")
-                                .auto_shrink(false)
-                                .show(ui, |ui| self.drawer(ui));
-                        });
-                });
-        }
-        ui.scope_builder(UiBuilder::new().max_rect(canvas), |ui| self.canvas(ui));
-        ui.scope_builder(UiBuilder::new().max_rect(right.shrink(8.0)), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("forma-inspector")
-                .show(ui, |ui| self.inspector(ui));
-        });
         if let Some(notice) = self.notice.take() {
             host.toast(notice);
         }
-        let timeline = Rect::from_min_max(pos2(rect.left(), middle.bottom() + 6.0), rect.max);
-        let reveal_mask = self.mask_editor.reveal_lanes.take();
-        if let Some((id, mask)) = &reveal_mask {
-            self.key_editor.reveal_mask(id.clone(), *mask);
-        }
-        ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| {
-            self.timeline(ui, reveal_mask.as_ref())
-        });
         self.projects_window(ui);
         self.compositions_window(ui);
         self.help_window(ui);
@@ -6403,7 +6771,33 @@ fn pane_modal<R>(
     id: egui::Id,
     content: impl FnOnce(&mut Ui) -> R,
 ) -> PaneModal<R> {
-    let pane = if pane.is_positive() { pane } else { ctx.content_rect() };
+    pane_dialog(ctx, pane, id, |ui| {
+        ui.spacing_mut().scroll.floating = false;
+        egui::ScrollArea::vertical()
+            .max_height((pane.height() - 60.0).max(0.0))
+            .show(ui, content)
+            .inner
+    })
+}
+
+fn dialog_body(ui: &mut Ui, pane: Rect, content: impl FnOnce(&mut Ui)) {
+    ui.spacing_mut().scroll.floating = false;
+    egui::ScrollArea::vertical()
+        .max_height((pane.height() - 134.0).max(0.0))
+        .show(ui, content);
+}
+
+fn pane_dialog<R>(
+    ctx: &egui::Context,
+    pane: Rect,
+    id: egui::Id,
+    content: impl FnOnce(&mut Ui) -> R,
+) -> PaneModal<R> {
+    let pane = if pane.is_positive() {
+        pane
+    } else {
+        ctx.content_rect()
+    };
     let backdrop = egui::Area::new(id.with("backdrop"))
         .order(egui::Order::Middle)
         .fixed_pos(pane.min)
@@ -6416,6 +6810,7 @@ fn pane_modal<R>(
         .inner;
     let inner = egui::Area::new(id)
         .order(egui::Order::Foreground)
+        .sense(Sense::hover())
         .pivot(Align2::CENTER_CENTER)
         .fixed_pos(pane.center())
         .constrain_to(pane.shrink(8.0))
@@ -6423,16 +6818,30 @@ fn pane_modal<R>(
             egui::Frame::popup(ui.style())
                 .show(ui, |ui| {
                     ui.set_max_width((pane.width() - 48.0).max(200.0));
-                    egui::ScrollArea::vertical()
-                        .max_height((pane.height() - 60.0).max(120.0))
-                        .show(ui, content)
-                        .inner
+                    ui.set_clip_rect(ui.clip_rect().intersect(pane));
+                    ui.spacing_mut().interact_size.y = 32.0;
+                    content(ui)
                 })
                 .inner
         })
         .inner;
     let close = backdrop.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape));
     PaneModal { inner, close }
+}
+
+fn paint_clip_label(ui: &Ui, rect: Rect, label: String, ink: Color32) {
+    if rect.width() < 24.0 {
+        return;
+    }
+    let rect = rect.shrink2(vec2(5.0, 0.0));
+    let mut job = egui::text::LayoutJob::simple_singleline(label, font::ui(10.0), ink);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width());
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        rect.left_center() - vec2(0.0, galley.size().y / 2.0),
+        galley,
+        ink,
+    );
 }
 
 fn point_in_quad(point: Pos2, quad: &[Pos2]) -> bool {
@@ -6500,6 +6909,10 @@ fn hex(value: &str, alpha: u8) -> Color32 {
         Color32::from_rgba_unmultiplied(170, 160, 206, alpha)
     }
 }
+
+#[cfg(test)]
+#[path = "layout_tests.rs"]
+mod layout_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6582,7 +6995,7 @@ mod tests {
         let mut forma = test_forma();
         forma.selected = Some(forma.scene.add_layer("rect".into(), "rect"));
         forma.zoom = 0.9;
-        let rail = Rect::from_min_size(Pos2::ZERO, vec2(46.0, 600.0));
+        let rail = Rect::from_min_size(Pos2::ZERO, vec2(88.0, 600.0));
         let canvas = Rect::from_min_size(pos2(270.0, 0.0), vec2(922.0, 600.0));
         let output = layout_at_default_width(920.0, |ui| {
             let mut tools = ui.new_child(UiBuilder::new().max_rect(rail.shrink2(vec2(4.0, 8.0))));

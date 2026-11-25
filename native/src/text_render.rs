@@ -304,6 +304,21 @@ struct GlyphInk {
     bounds: Rect,
 }
 
+fn leading(shape: &Shape, size: f32, time: f64) -> f32 {
+    size * TextLane::Style(TextProperty::LineHeight).values(shape, time)[0] / 100.0
+}
+
+pub(crate) fn selection_height_factor(shape: &Shape, time: f64) -> f32 {
+    if !TextInk::used_by(shape) {
+        return 1.0;
+    }
+    let extra_lines = crate::text::content(shape)
+        .bytes()
+        .filter(|&byte| byte == b'\n')
+        .count();
+    1.0 + extra_lines as f32 * leading(shape, 1.0, time)
+}
+
 impl TextInk {
     pub(crate) fn used_by(shape: &Shape) -> bool {
         shape.kind == "text" && (shape.text_layout.is_some() || shape.vector.is_some())
@@ -350,7 +365,7 @@ impl TextInk {
             width: frame.pose.w,
             size,
             stretch: frame.pose.w / shaped.width.max(0.001),
-            leading: size * style_value(TextProperty::LineHeight) / 100.0,
+            leading: leading(shape, size, time),
             tracking: style_value(TextProperty::Tracking),
             alignment: layout.alignment,
         };

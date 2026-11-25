@@ -25,6 +25,7 @@ pub mod model;
 pub mod motion;
 pub mod motion_blur;
 pub mod paths;
+mod panel_widgets;
 mod path_editor;
 mod preview_cache;
 mod project_keys;

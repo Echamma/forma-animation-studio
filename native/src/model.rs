@@ -611,16 +611,36 @@ impl Scene {
         id
     }
 
+    fn new_text_color(&self) -> String {
+        // Use Electron's dark green on light artwork. Switch to white on dark backgrounds.
+        let [r, g, b] = crate::render::rgb(&self.bg);
+        let linear = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+        if self.transparent_background || luminance < 0.25 {
+            "#ffffff".into()
+        } else {
+            "#1F3D2B".into()
+        }
+    }
+
     pub fn add_text(&mut self, id: String) -> String {
         let font_size = (self.width.min(self.height) * 0.08)
             .clamp(24.0, 320.0)
             .round();
         let text_width = font_size * 4.2;
+        let color = self.new_text_color();
         self.add_shape(id.clone(), "text");
         let shape = self.shapes.last_mut().unwrap();
         shape.name = "Your text".into();
         shape.text_layout = Some(Default::default());
-        shape.color = "#1F3D2B".into();
+        shape.color = color;
         shape.keys[0].w = text_width;
         shape.keys[0].h = font_size;
         shape.extra.insert("text".into(), "Your text".into());
@@ -656,9 +676,10 @@ impl Scene {
         );
         let font_size = (self.width.min(self.height) * 0.07).max(24.0);
         let (text_width, offset_y) = (font_size * 4.2, -(p.h / 2.0 + font_size));
+        let color = self.new_text_color();
         self.add_shape(id.clone(), "text");
         let shape = self.shapes.last_mut().unwrap();
-        (shape.name, shape.color) = (format!("Text for {target_name}"), "#ffffff".into());
+        (shape.name, shape.color) = (format!("Text for {target_name}"), color);
         shape.text_layout = Some(Default::default());
         shape.keys[0] = Key {
             t: 0.0,

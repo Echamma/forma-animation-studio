@@ -295,6 +295,18 @@ impl KeyEditor {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_graph_expression_for_test(&mut self, id: &str, lane: Lane) {
+        let track = Track {
+            layer: id.to_owned(),
+            lane,
+        };
+        self.expanded.insert(id.to_owned());
+        self.graph = true;
+        self.graph_tracks.insert(track.clone());
+        self.expression_open.insert(track);
+    }
+
     pub fn row_height(&self, id: &str, lane: Lane) -> f32 {
         let is_track = |t: &Track| t.layer == id && t.lane == lane;
         let keys = if self.graph && self.graph_tracks.iter().any(is_track) {
@@ -391,8 +403,8 @@ impl KeyEditor {
         if let Some(rect) = expression_line {
             self.expression_editor(ui, scene, &track, index, rect, *playhead);
         }
-        let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(87.0, 32.0));
-        let add = Rect::from_min_size(label.right_top() + vec2(3.0, 0.0), vec2(50.0, 32.0));
+        let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(105.0, 32.0));
+        let add = Rect::from_min_size(label.right_top() + vec2(3.0, 0.0), vec2(42.0, 32.0));
         let toggle = Rect::from_min_size(add.right_top() + vec2(2.0, 0.0), vec2(32.0, 32.0));
         let has_expression = scene.shapes[index].expression(lane).is_some();
         if ui
@@ -412,16 +424,17 @@ impl KeyEditor {
             Lane::Vector(crate::shape_style::VectorProperty::GradientStop(_, i)) => {
                 format!("{} {}", lane.label(), i + 1)
             }
-            Lane::Effect(id, parameter) => scene.shapes[index].effect(id).map_or_else(
-                || parameter.label().to_owned(),
-                |effect| format!("{} · {}", effect.kind.label(), parameter.label()),
-            ),
             _ => lane.label().to_owned(),
+        };
+        let full_title = if matches!(lane, Lane::Effect(..)) {
+            expression_link_label(&scene.shapes[index], lane)
+        } else {
+            title.clone()
         };
         let label_response = ui
             .place(label, egui::Button::selectable(active, &title).truncate())
             .on_hover_text(format!(
-                "{title}. Select for the graph. Shift or Ctrl selects several lanes."
+                "{full_title}. Select for the graph. Shift or Ctrl selects several lanes."
             ));
         let mut selected_layer = label_response.clicked();
         if selected_layer {
@@ -469,7 +482,7 @@ impl KeyEditor {
         let painter = ui.painter().with_clip_rect(hit_rect);
         painter.rect_filled(hit_rect, 4.0, color::VEIL);
         let response = ui.interact(
-            hit_rect,
+            Rect::from_min_max(rect.left_top(), hit_rect.right_bottom()),
             ui.scope_id().with(("property", &track)),
             Sense::click_and_drag(),
         );

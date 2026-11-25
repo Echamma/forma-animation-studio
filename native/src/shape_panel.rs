@@ -192,7 +192,7 @@ pub(crate) fn fill_panel(
 
 pub(crate) fn stroke_and_trim(ui: &mut Ui, shape: &mut Shape, tools: &mut VectorTools, t: f64) {
     let id = shape.id.clone();
-    egui::CollapsingHeader::new("Stroke").show(ui, |ui| {
+    crate::panel_widgets::section(ui, egui::CollapsingHeader::new("Stroke"), |ui| {
         let mut mode = shape
             .vector
             .as_ref()
@@ -290,7 +290,7 @@ pub(crate) fn stroke_and_trim(ui: &mut Ui, shape: &mut Shape, tools: &mut Vector
 }
 
 fn trim_panel(ui: &mut Ui, shape: &mut Shape, t: f64) {
-    egui::CollapsingHeader::new("Trim paths").show(ui, |ui| {
+    crate::panel_widgets::section(ui, egui::CollapsingHeader::new("Trim paths"), |ui| {
         let mut enabled = shape
             .vector
             .as_ref()
@@ -366,9 +366,10 @@ fn gradient_panel(
     {
         tools.toggle(tool, Some(layer));
     }
-    egui::CollapsingHeader::new("Gradient stops")
-        .id_salt(target)
-        .show(ui, |ui| {
+    crate::panel_widgets::section(
+        ui,
+        egui::CollapsingHeader::new("Gradient stops").id_salt(target),
+        |ui| {
             for i in 0..count {
                 let property = VectorProperty::GradientStop(target, i);
                 let Some(mut values) = vector.numbers_at(property, t, ease) else {

@@ -738,3 +738,35 @@ fn basic_multiline_text_exports_as_shaped_vector_contours() {
         "pixel error {pixel_error}"
     );
 }
+
+#[test]
+fn new_text_and_linked_text_use_colors_that_contrast_with_the_canvas() {
+    let mut scene = Scene::empty("text-colors".into());
+    scene.add_layer("shape".into(), "rect");
+    scene.add_text("title".into());
+    scene.add_linked_text("caption".into(), 0);
+    assert_eq!(scene.shapes[1].color, "#1F3D2B");
+    assert_eq!(scene.shapes[2].color, "#1F3D2B");
+    scene.bg = "#141617".into();
+    scene.add_text("dark-title".into());
+    scene.add_linked_text("dark-caption".into(), 0);
+    assert_eq!(scene.shapes[3].color, "#ffffff");
+    assert_eq!(scene.shapes[4].color, "#ffffff");
+}
+
+#[test]
+fn multiline_selection_uses_animated_leading_and_keeps_single_line_height() {
+    let factor = crate::text_render::selection_height_factor;
+    let mut scene = scene("Hello Forma");
+    assert_eq!(factor(&scene.shapes[0], 0.0), 1.0);
+    scene.shapes[0]
+        .extra
+        .insert("text".into(), "Hello Forma\nsecond line".into());
+    assert_eq!(factor(&scene.shapes[0], 0.0), 2.2);
+    let lane = TextLane::Style(TextProperty::LineHeight);
+    let shape = &mut scene.shapes[0];
+    shape.add_lane_key(Lane::Text(lane), 0.0);
+    lane.set(shape, 1.0, [200.0, 0.0, 0.0]);
+    assert_eq!(factor(shape, 0.0), 2.2);
+    assert_eq!(factor(shape, 1.0), 3.0);
+}

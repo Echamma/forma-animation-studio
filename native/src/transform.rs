@@ -563,6 +563,7 @@ pub(crate) fn resize_about_anchor(
     anchor: Anchor,
     handle: (i8, i8),
     (dx, dy): (f32, f32),
+    height_factor: f32,
     lock_ratio: bool,
 ) -> (f32, f32) {
     let x = if handle.0 == 0 {
@@ -573,7 +574,7 @@ pub(crate) fn resize_about_anchor(
     let y = if handle.1 == 0 {
         0.0
     } else {
-        f32::from(handle.1) / 2.0 + 0.5 - anchor.y
+        f32::from(handle.1) * height_factor / 2.0 + 0.5 - anchor.y
     };
     let (w, h) = (pose.w, pose.h);
     if lock_ratio {
