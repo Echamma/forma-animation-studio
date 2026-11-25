@@ -175,11 +175,14 @@ pub fn dispatch(e: &mut Editor, name: &str, args: &Value) -> Result<Outcome, Too
             };
             // x/y move the copy (keys and drawn moves alike), which makes the picture jump there: stop motion.
             let copy = &mut next.shapes[at];
-            let first = (copy.keys[0].x, copy.keys[0].y);
+            let first = copy.pose(0.0);
             let (dx, dy) = (
-                args["x"].as_f64().map_or(0.0, |x| x as f32 - first.0),
-                args["y"].as_f64().map_or(0.0, |y| y as f32 - first.1),
+                args["x"].as_f64().map_or(0.0, |x| x as f32 - first.x),
+                args["y"].as_f64().map_or(0.0, |y| y as f32 - first.y),
             );
+            if let Some(pose) = &mut copy.rest_pose {
+                (pose.x, pose.y) = (pose.x + dx, pose.y + dy);
+            }
             for key in &mut copy.keys {
                 (key.x, key.y) = (key.x + dx, key.y + dy);
             }
@@ -439,6 +442,8 @@ fn key_at(t: f64, p: Pose) -> Key {
         o: p.o,
         ease: None,
         curve: None,
+        props: None,
+        linked_space: false,
         extra: Map::new(),
     }
 }
@@ -552,6 +557,8 @@ fn clip_timing(scene: &mut Scene, layer: &mut Shape, args: &Value) -> Result<(),
             .map(|k| ColorKey {
                 t: k["t"].as_f64().unwrap_or(0.0),
                 color: k["color"].as_str().unwrap_or("#000000").into(),
+                ease: None,
+                curve: None,
                 extra: Map::new(),
             })
             .collect();

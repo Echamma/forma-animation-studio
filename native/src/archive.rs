@@ -225,4 +225,30 @@ mod tests {
         );
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn phase_one_data_travels_in_the_project_archive() {
+        use crate::keyframes::{Lane, Property};
+        use crate::transform::Anchor;
+
+        let root = std::env::temp_dir().join(format!("forma-phase-one-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut scene = Scene::example("phase-one".into());
+        scene.set_parent(1, Some(0), 1.0).unwrap();
+        scene.set_anchor(1, Anchor { x: 1.0, y: 0.0 }, 1.0);
+        let shape = &mut scene.shapes[1];
+        let lane = Lane::Pose(Property::Rotation);
+        shape.add_lane_key(lane, 1.0);
+        let mut key = shape.lane_key(lane, 1.0).unwrap();
+        key.move_handle(&shape.ease, 1, 0.85, 1.2);
+        shape.put_lane_key(1.0, key);
+        shape
+            .extra
+            .insert("futureValue".into(), serde_json::json!({"keep": [1, 2, 3]}));
+        let file = root.join("scene.forma");
+        pack(&scene, &place(&root), &file).unwrap();
+        assert_eq!(unpack(&file, &place(&root)).unwrap(), scene);
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 }

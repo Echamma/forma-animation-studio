@@ -1,7 +1,8 @@
 //! Frame-accurate software rendering of a scene, the way Electron Forma's canvas paints it (`src/render/paint.js`).
 //! Exports and the editor's preview both draw through it, so what the editor shows is what gets exported.
 
-use crate::model::{Pose, Scene, Shape};
+use crate::model::{Scene, Shape};
+use crate::transform::LayerFrame;
 use crate::{assets, svg, text};
 use canopy_ui::Place;
 use std::collections::HashMap;
@@ -258,8 +259,8 @@ impl Renderer {
             if !shape.visible(t, scene.duration) {
                 continue;
             }
-            let pose = scene.render_pose(shape, t);
-            if pose.o <= 0.0 {
+            let frame = scene.layer_frame(shape, t);
+            if frame.pose.o <= 0.0 {
                 continue;
             }
             if strict {
@@ -268,7 +269,7 @@ impl Renderer {
                     return Err(format!("{}: no video frame", shape.name));
                 }
             }
-            let Some(ink) = self.ink(shape, pose, &shape.color_at(t), view, frames) else {
+            let Some(ink) = self.ink(shape, frame, &shape.color_at(t), view, frames) else {
                 continue;
             };
             let blur = blur(shape) * scale;
@@ -320,14 +321,13 @@ impl Renderer {
     fn ink<'a>(
         &'a self,
         shape: &Shape,
-        pose: Pose,
+        frame: LayerFrame,
         color: &str,
         view: Transform,
         frames: &'a Frames,
     ) -> Option<Ink<'a>> {
-        let place = Transform::from_rotate(pose.r)
-            .post_translate(pose.x, pose.y)
-            .post_concat(view);
+        let pose = frame.pose;
+        let place = frame.transform.post_concat(view);
         if let Some(pixmap) = frames.get(&shape.id).or_else(|| self.images.get(&shape.id)) {
             let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
             let mut paint = PixmapPaint::default();
@@ -547,10 +547,13 @@ pub fn scene_size(scene: &Scene) -> (u32, u32) {
 
 /// The size to decode a video layer's frames at for an export `scale` times the scene's size: its largest size.
 pub fn video_size(shape: &Shape, scale: f32) -> (u32, u32) {
+    let rest = shape
+        .rest_pose
+        .map_or((2.0f32, 2.0f32), |p| (p.w.max(2.0), p.h.max(2.0)));
     let (w, h) = shape
         .keys
         .iter()
-        .fold((2.0f32, 2.0f32), |(w, h), key| (w.max(key.w), h.max(key.h)));
+        .fold(rest, |(w, h), key| (w.max(key.w), h.max(key.h)));
     ((w * scale).round() as u32, (h * scale).round() as u32)
 }
 
@@ -605,6 +608,39 @@ mod tests {
             "circle should be coral on the pale background"
         );
         assert_eq!(corner.alpha(), 255);
+    }
+
+    #[test]
+    fn a_parented_rotated_child_has_the_same_pixels_in_preview_and_export() {
+        let mut scene = Scene::empty("parent-pixels".into());
+        scene.add_shape("parent".into(), "rect");
+        scene.add_shape("child".into(), "rect");
+        let parent = &mut scene.shapes[0];
+        (parent.keys[0].x, parent.keys[0].y, parent.keys[0].o) = (100.0, 100.0, 0.0);
+        let child = &mut scene.shapes[1];
+        child.color = "#ff0000".into();
+        (
+            child.keys[0].x,
+            child.keys[0].y,
+            child.keys[0].w,
+            child.keys[0].h,
+        ) = (170.0, 100.0, 65.0, 20.0);
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        scene.shapes[0].keys[0].r = 90.0;
+        let renderer = Renderer::new(&scene, &place(std::env::temp_dir()));
+        let frames = Frames::default();
+        let export = renderer
+            .frame(&scene, 0.0, scene_size(&scene), &frames)
+            .unwrap();
+        let preview = renderer.preview(&scene, 0.0, 1.0, &frames).unwrap();
+        assert_eq!(export.data(), preview.data());
+        let red = |x, y| {
+            let pixel = export.pixel(x, y).unwrap();
+            (pixel.red(), pixel.green(), pixel.blue()) == (255, 0, 0)
+        };
+        assert!(red(100, 192));
+        assert!(!red(123, 170));
+        assert!(!red(170, 100));
     }
 
     #[test]

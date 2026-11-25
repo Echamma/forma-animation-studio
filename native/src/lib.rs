@@ -7,6 +7,8 @@ pub mod assets;
 pub mod automation;
 pub mod bridge;
 pub mod contract;
+mod key_editor;
+pub mod keyframes;
 pub mod mcp;
 pub mod media;
 pub mod model;
@@ -16,6 +18,7 @@ pub mod sound;
 pub mod storage;
 pub mod svg;
 pub mod text;
+pub mod transform;
 pub mod video;
 pub mod videos;
 

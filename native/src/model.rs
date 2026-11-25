@@ -1,5 +1,7 @@
 //! Version-one Forma scenes, preserving fields the native editor does not handle yet on every save.
 
+use crate::keyframes::{Lane, Property};
+use crate::transform::Anchor;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -43,6 +45,16 @@ pub struct Shape {
     pub disappear: Option<Disappear>,
     #[serde(default)]
     pub color_keys: Vec<ColorKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest_pose: Option<Pose>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_rest: Option<Pose>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_space: Option<[f32; 6]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Anchor>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -79,6 +91,10 @@ pub struct Disappear {
 pub struct ColorKey {
     pub t: f64,
     pub color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ease: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curve: Option<[f32; 4]>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -106,6 +122,10 @@ pub struct Key {
     pub ease: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curve: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub props: Option<Vec<Property>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linked_space: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -204,6 +224,8 @@ impl Scene {
                     o: 100.0,
                     ease: None,
                     curve: None,
+                    props: None,
+                    linked_space: false,
                     extra: Map::new(),
                 })
                 .collect();
@@ -225,7 +247,7 @@ impl Scene {
             || scene.duration < 1.0
             || scene.shapes.len() > 500
             || scene.shapes.iter().any(|shape| {
-                shape.keys.is_empty()
+                (shape.keys.is_empty() && shape.rest_pose.is_none())
                     || shape
                         .keys
                         .iter()
@@ -260,6 +282,8 @@ impl Scene {
                 o: 100.0,
                 ease: None,
                 curve: None,
+                props: None,
+                linked_space: false,
                 extra: Map::new(),
             }],
             in_time: None,
@@ -268,6 +292,11 @@ impl Scene {
             rotation_clips: Vec::new(),
             disappear: None,
             color_keys: Vec::new(),
+            rest_pose: None,
+            linked_rest: None,
+            parent: None,
+            parent_space: None,
+            anchor: None,
             extra: Map::new(),
         });
         id
@@ -350,6 +379,8 @@ impl Scene {
             o: p.o,
             ease: None,
             curve: None,
+            props: None,
+            linked_space: false,
             extra: Map::new(),
         };
         for (field, value) in [
@@ -371,29 +402,55 @@ impl Scene {
     /// Makes the text at `index` follow the layer at `target`, staying where it is on screen at `t` (Electron's
     /// text-link change).
     pub fn link_text(&mut self, index: usize, target: usize, t: f64) {
-        let visible = self.render_pose(&self.shapes[index], t);
-        let p = self.shapes[target].pose(t);
+        if !self.can_follow(index, target) {
+            return;
+        }
+        let shape = &self.shapes[index];
+        let target_shape = &self.shapes[target];
+        let visible = self.layer_frame(shape, t);
+        let p = pose_with_spin(target_shape, t);
+        let animated = if is_linked(shape) {
+            shape.lane_pose(t)
+        } else {
+            crate::keyframes::LINKED_NEUTRAL
+        };
+        let opacity = self.editable_pose(shape, t).o;
+        let rotation =
+            visible.pose.r - p.r - shape.rotation_at(t) - shape.base_rotation - animated.r;
+        let basis = self.relink_text_space(shape, target_shape, t, visible.space);
         let angle = (-p.r).to_radians();
-        let (dx, dy) = (visible.x - p.x, visible.y - p.y);
-        let target_id = self.shapes[target].id.clone();
-        let extra = &mut self.shapes[index].extra;
+        let (dx, dy) = (visible.pose.x - p.x, visible.pose.y - p.y);
+        let target_id = target_shape.id.clone();
+        let shape = &mut self.shapes[index];
+        shape.parent_space = basis;
+        let extra = &mut shape.extra;
         for (field, value) in [
             ("linkId", target_id.into()),
             ("linkBase", serde_json::json!({"w": p.w, "h": p.h})),
             (
                 "offsetX",
-                serde_json::json!(dx * angle.cos() - dy * angle.sin()),
+                serde_json::json!(dx * angle.cos() - dy * angle.sin() - animated.x),
             ),
             (
                 "offsetY",
-                serde_json::json!(dx * angle.sin() + dy * angle.cos()),
+                serde_json::json!(dx * angle.sin() + dy * angle.cos() - animated.y),
             ),
-            ("textWidth", serde_json::json!(visible.w)),
-            ("fontSize", serde_json::json!(visible.h)),
-            ("rotationOffset", serde_json::json!(visible.r - p.r)),
+            (
+                "textWidth",
+                serde_json::json!(visible.pose.w / (animated.w / 100.0).max(0.001)),
+            ),
+            (
+                "fontSize",
+                serde_json::json!(visible.pose.h / (animated.h / 100.0).max(0.001)),
+            ),
+            ("rotationOffset", serde_json::json!(rotation)),
             (
                 "opacityFactor",
-                serde_json::json!(if p.o != 0.0 { visible.o / p.o } else { 1.0 }),
+                serde_json::json!(if p.o != 0.0 && animated.o != 0.0 {
+                    opacity / (p.o * (animated.o / 100.0))
+                } else {
+                    1.0
+                }),
             ),
         ] {
             extra.insert(field.into(), value);
@@ -403,8 +460,27 @@ impl Scene {
     pub fn resize(&mut self, width: f32, height: f32) {
         let (sx, sy) = (width / self.width, height / self.height);
         let scale = sx.min(sy);
+        let ids: std::collections::HashSet<_> = self.shapes.iter().map(|s| s.id.clone()).collect();
         for shape in &mut self.shapes {
+            if shape.parent.as_ref().is_some_and(|id| ids.contains(id)) {
+                continue;
+            }
+            if shape.parent_space.is_some() {
+                shape.resize_world_space(sx, sy);
+                continue;
+            }
+            if let Some(pose) = &mut shape.rest_pose {
+                (pose.x, pose.y, pose.w, pose.h) =
+                    (pose.x * sx, pose.y * sy, pose.w * scale, pose.h * scale);
+            }
+            if let Some(pose) = &mut shape.linked_rest {
+                (pose.x, pose.y) = (pose.x * scale, pose.y * scale);
+            }
             for key in &mut shape.keys {
+                if key.linked_space {
+                    (key.x, key.y) = (key.x * scale, key.y * scale);
+                    continue;
+                }
                 key.x *= sx;
                 key.y *= sy;
                 key.w *= scale;
@@ -435,8 +511,17 @@ impl Scene {
                 .into_iter()
                 .flatten()
             {
+                let linked = motion
+                    .get("linkedSpace")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let (mx, my, size) = if linked {
+                    (scale, scale, 1.0)
+                } else {
+                    (sx, sy, scale)
+                };
                 if let Some(start) = motion.get_mut("startPose") {
-                    for (field, factor) in [("x", sx), ("y", sy), ("w", scale), ("h", scale)] {
+                    for (field, factor) in [("x", mx), ("y", my), ("w", size), ("h", size)] {
                         scaled_field(start, field, factor);
                     }
                 }
@@ -446,8 +531,8 @@ impl Scene {
                     .into_iter()
                     .flatten()
                 {
-                    scaled_field(point, "x", sx);
-                    scaled_field(point, "y", sy);
+                    scaled_field(point, "x", mx);
+                    scaled_field(point, "y", my);
                 }
                 for key in motion
                     .get_mut("baseKeys")
@@ -455,7 +540,7 @@ impl Scene {
                     .into_iter()
                     .flatten()
                 {
-                    for (field, factor) in [("x", sx), ("y", sy), ("w", scale), ("h", scale)] {
+                    for (field, factor) in [("x", mx), ("y", my), ("w", size), ("h", size)] {
                         scaled_field(key, field, factor);
                     }
                 }
@@ -473,6 +558,7 @@ impl Scene {
                     .keys
                     .iter()
                     .map(|key| key.t)
+                    .chain(shape.color_keys.iter().map(|key| key.t))
                     .chain(shape.out_time)
                     .chain(
                         shape
@@ -485,37 +571,22 @@ impl Scene {
     }
 
     /// The pose drawn on Forma's canvas: keyframes, rotation clips, disappearance, and linked text.
-    pub fn render_pose(&self, shape: &Shape, t: f64) -> Pose {
+    pub(crate) fn local_pose(&self, shape: &Shape, t: f64) -> Pose {
         let mut own = shape.pose(t);
         own.r += shape.rotation_at(t) + shape.base_rotation;
         own.o *= self.visibility(shape, t);
-        if shape.kind != "text" {
+        let Some(target) = self.linked_target(shape) else {
             return own;
+        };
+        let p = pose_with_spin(target, t);
+        let (sx, sy) = link_scale(shape, p);
+        let mut ox = value_f32(&shape.extra, "offsetX", 0.0);
+        let mut oy = value_f32(&shape.extra, "offsetY", 0.0);
+        let animated = shape.has_link_animation().then(|| shape.lane_pose(t));
+        if let Some(a) = animated {
+            (ox, oy) = (ox + a.x, oy + a.y);
         }
-        let Some(target_id) = shape.extra.get("linkId").and_then(Value::as_str) else {
-            return own;
-        };
-        let Some(target) = self.shapes.iter().find(|s| s.id == target_id) else {
-            return own;
-        };
-        let mut p = target.pose(t);
-        p.r += target.rotation_at(t) + target.base_rotation;
-        let base_w = shape
-            .extra
-            .get("linkBase")
-            .and_then(|v| v.get("w"))
-            .and_then(Value::as_f64)
-            .unwrap_or(p.w as f64) as f32;
-        let base_h = shape
-            .extra
-            .get("linkBase")
-            .and_then(|v| v.get("h"))
-            .and_then(Value::as_f64)
-            .unwrap_or(p.h as f64) as f32;
-        let sx = p.w / base_w.max(0.001);
-        let sy = p.h / base_h.max(0.001);
-        let ox = value_f32(&shape.extra, "offsetX", 0.0) * sx;
-        let oy = value_f32(&shape.extra, "offsetY", 0.0) * sy;
+        let (ox, oy) = (ox * sx, oy * sy);
         let angle = p.r.to_radians();
         own.x = p.x + ox * angle.cos() - oy * angle.sin();
         own.y = p.y + ox * angle.sin() + oy * angle.cos();
@@ -525,12 +596,51 @@ impl Scene {
             + value_f32(&shape.extra, "rotationOffset", 0.0)
             + shape.rotation_at(t)
             + shape.base_rotation;
-        own.o = (p.o
-            * value_f32(&shape.extra, "opacityFactor", 1.0)
-            * self.visibility(target, t)
-            * self.visibility(shape, t))
-        .clamp(0.0, 100.0);
+        let mut opacity = p.o * value_f32(&shape.extra, "opacityFactor", 1.0);
+        if let Some(a) = animated {
+            own.w *= (a.w / 100.0).max(0.001);
+            own.h *= (a.h / 100.0).max(0.001);
+            own.r += a.r;
+            opacity *= a.o / 100.0;
+        }
+        own.o =
+            (opacity * self.visibility(target, t) * self.visibility(shape, t)).clamp(0.0, 100.0);
         own
+    }
+
+    fn linked_target(&self, shape: &Shape) -> Option<&Shape> {
+        let id = shape.extra.get("linkId")?.as_str()?;
+        (shape.kind == "text")
+            .then(|| self.shapes.iter().find(|s| s.id == id))
+            .flatten()
+    }
+
+    pub(crate) fn shift_linked_position(&mut self, index: usize, t: f64, delta: (f32, f32)) {
+        let shape = &self.shapes[index];
+        if let Some(target) = self.linked_target(shape) {
+            let (dx, dy) = link_offset(shape, pose_with_spin(target, t), delta);
+            let extra = &mut self.shapes[index].extra;
+            let x = value_f32(extra, "offsetX", 0.0) + dx;
+            let y = value_f32(extra, "offsetY", 0.0) + dy;
+            extra.insert("offsetX".into(), serde_json::json!(x));
+            extra.insert("offsetY".into(), serde_json::json!(y));
+        }
+    }
+
+    pub(crate) fn motion_space(&self, shape: &Shape, t: f64) -> tiny_skia::Transform {
+        use tiny_skia::Transform;
+
+        let frame = self.layer_frame(shape, t);
+        let Some(target) = self.linked_target(shape) else {
+            return frame.space;
+        };
+        let p = pose_with_spin(target, t);
+        let (sx, sy) = link_scale(shape, p);
+        let axes = Transform::from_scale(sx, sy).post_rotate(p.r);
+        let animation = shape.lane_pose(t);
+        let (dx, dy) = crate::transform::vector(axes, animation.x, animation.y);
+        axes.post_translate(frame.pose.x - dx, frame.pose.y - dy)
+            .post_concat(frame.space)
     }
 
     fn visibility(&self, shape: &Shape, t: f64) -> f32 {
@@ -555,11 +665,18 @@ impl Scene {
     /// The pose the editor changes: what's drawn, except opacity from the layer's own keys, and for anything but
     /// linked text, rotation without rotation clips and base rotation (Electron's `editableState`).
     pub fn editable_pose(&self, shape: &Shape, t: f64) -> Pose {
-        let mut pose = self.render_pose(shape, t);
+        let frame = self.layer_frame(shape, t);
+        let mut pose = frame.pose;
+        (pose.x, pose.y) = frame.anchor();
         let own = shape.pose(t);
-        pose.o = own.o;
-        if !is_linked(shape) {
+        if let Some(target) = self.linked_target(shape) {
+            pose.o = (target.pose(t).o
+                * value_f32(&shape.extra, "opacityFactor", 1.0)
+                * (shape.lane_pose(t).o / 100.0))
+                .clamp(0.0, 100.0);
+        } else {
             pose.r = own.r;
+            pose.o = own.o;
         }
         pose
     }
@@ -567,58 +684,118 @@ impl Scene {
     /// Sets the editable pose of the layer at `index`: linked text keeps it as offsets from what it's linked to
     /// (Electron's `setLinkedTextPose`), anything else as a keyframe at `t`.
     pub fn set_pose(&mut self, index: usize, t: f64, pose: Pose) {
+        self.set_pose_inner(index, t, pose, &Property::ALL, false);
+    }
+
+    pub fn set_property_pose(&mut self, index: usize, t: f64, pose: Pose, property: Property) {
+        self.set_pose_inner(index, t, pose, &[property], true);
+    }
+
+    fn set_pose_inner(
+        &mut self,
+        index: usize,
+        t: f64,
+        mut pose: Pose,
+        properties: &[Property],
+        key_linked: bool,
+    ) {
         let shape = &self.shapes[index];
-        let target = shape
-            .extra
-            .get("linkId")
-            .and_then(Value::as_str)
-            .filter(|_| shape.kind == "text")
-            .and_then(|id| self.shapes.iter().find(|s| s.id == id));
-        let Some(target) = target else {
-            return self.shapes[index].edit_pose(t, pose);
+        let frame = self.layer_frame(shape, t);
+        let Some(inverse) = frame.space.invert() else {
+            return;
         };
-        let mut p = target.pose(t);
-        p.r += target.rotation_at(t) + target.base_rotation;
-        let base_w = shape
-            .extra
-            .get("linkBase")
-            .and_then(|v| v.get("w"))
-            .and_then(Value::as_f64)
-            .unwrap_or(p.w as f64) as f32;
-        let base_h = shape
-            .extra
-            .get("linkBase")
-            .and_then(|v| v.get("h"))
-            .and_then(Value::as_f64)
-            .unwrap_or(p.h as f64) as f32;
-        let (sx, sy) = (
-            p.w / if base_w == 0.0 { p.w } else { base_w },
-            p.h / if base_h == 0.0 { p.h } else { base_h },
-        );
-        let or_one = |v: f32| if v == 0.0 || !v.is_finite() { 1.0 } else { v };
-        let angle = (-p.r).to_radians();
-        let (dx, dy) = (pose.x - p.x, pose.y - p.y);
+        let anchor = frame.anchor();
+        if (pose.x - anchor.0).abs().max((pose.y - anchor.1).abs()) < 0.0001 {
+            (pose.x, pose.y) = (frame.pose.x, frame.pose.y);
+        } else {
+            (pose.x, pose.y) = crate::transform::point(inverse, pose.x, pose.y);
+        }
+        let Some(target) = self.linked_target(shape) else {
+            let own = shape.pose(t);
+            for &property in properties {
+                if property.values(own) != property.values(pose) {
+                    self.shapes[index].key_property(t, property, pose);
+                }
+            }
+            return;
+        };
+        let p = pose_with_spin(target, t);
+        let linked = frame.pose;
+        let extra = &shape.extra;
+        let factor = value_f32(extra, "opacityFactor", 1.0);
+        if key_linked || t > 0.0 || shape.has_link_animation() {
+            self.key_linked_pose(index, t, properties, pose, linked, p);
+            return;
+        }
+
+        let (sx, sy) = link_scale(shape, p);
         let rotation = pose.r - p.r - shape.rotation_at(t) - shape.base_rotation;
         let opacity = if p.o != 0.0 { pose.o / p.o } else { 1.0 };
+        let (x, y) = link_offset(shape, p, (pose.x - p.x, pose.y - p.y));
         let extra = &mut self.shapes[index].extra;
-        extra.insert(
-            "offsetX".into(),
-            serde_json::json!((dx * angle.cos() - dy * angle.sin()) / or_one(sx)),
-        );
-        extra.insert(
-            "offsetY".into(),
-            serde_json::json!((dx * angle.sin() + dy * angle.cos()) / or_one(sy)),
-        );
-        extra.insert(
-            "textWidth".into(),
-            serde_json::json!(pose.w / or_one(sx.abs())),
-        );
-        extra.insert(
-            "fontSize".into(),
-            serde_json::json!(pose.h / or_one(sy.abs())),
-        );
-        extra.insert("rotationOffset".into(), serde_json::json!(rotation));
-        extra.insert("opacityFactor".into(), serde_json::json!(opacity));
+        if properties.contains(&Property::Position) && (pose.x, pose.y) != (linked.x, linked.y) {
+            extra.insert("offsetX".into(), serde_json::json!(x));
+            extra.insert("offsetY".into(), serde_json::json!(y));
+        }
+        if properties.contains(&Property::Size) && (pose.w, pose.h) != (linked.w, linked.h) {
+            extra.insert(
+                "textWidth".into(),
+                serde_json::json!(pose.w / or_one(sx.abs())),
+            );
+            extra.insert(
+                "fontSize".into(),
+                serde_json::json!(pose.h / or_one(sy.abs())),
+            );
+        }
+        if properties.contains(&Property::Rotation) && pose.r != linked.r {
+            extra.insert("rotationOffset".into(), serde_json::json!(rotation));
+        }
+        if properties.contains(&Property::Opacity) {
+            let current = (p.o * factor).clamp(0.0, 100.0);
+            if pose.o != current {
+                extra.insert("opacityFactor".into(), serde_json::json!(opacity));
+            }
+        }
+    }
+
+    fn key_linked_pose(
+        &mut self,
+        index: usize,
+        t: f64,
+        properties: &[Property],
+        pose: Pose,
+        shown: Pose,
+        target: Pose,
+    ) {
+        let shape = &self.shapes[index];
+        let own = shape.lane_pose(t);
+        let (dx, dy) = link_offset(shape, target, (pose.x - shown.x, pose.y - shown.y));
+        let opacity = target.o * value_f32(&shape.extra, "opacityFactor", 1.0);
+        let keyed = Pose {
+            x: own.x + dx,
+            y: own.y + dy,
+            w: own.w * pose.w / or_one(shown.w),
+            h: own.h * pose.h / or_one(shown.h),
+            r: own.r + (pose.r - shown.r),
+            o: if opacity > 0.0 {
+                (pose.o * 100.0 / opacity).clamp(0.0, 100.0)
+            } else {
+                own.o
+            },
+        };
+        for &property in properties {
+            let [a, b] = property.values(own);
+            let [c, d] = property.values(keyed);
+            if (a - c).abs().max((b - d).abs()) < 0.0001 {
+                continue;
+            }
+            let shape = &mut self.shapes[index];
+            let lane = Lane::Pose(property);
+            if hundredths(t) > 0.0 && shape.lane_keys(lane).is_empty() {
+                shape.add_lane_key(lane, 0.0);
+            }
+            shape.key_property(t, property, keyed);
+        }
     }
 
     /// When a layer that disappears comes back (Electron's `reappearAt`); never is infinity.
@@ -892,8 +1069,14 @@ impl Scene {
             o: pose.o,
             ease: None,
             curve: None,
+            props: None,
+            linked_space: false,
             extra: Map::new(),
         }];
+        if is_linked(template) && template.has_link_animation() {
+            copy.linked_rest =
+                Some(template.lane_pose(if same { end } else { template.clip_start() }));
+        }
         copy.color = if same {
             source.color_at(end)
         } else {
@@ -933,15 +1116,52 @@ impl Scene {
     /// An independent copy at the same time, nudged so it doesn't hide the original (Electron's `duplicateLayer`).
     /// Returns its index.
     pub fn duplicate_layer(&mut self, index: usize, id: String) -> usize {
-        let copy = self.nudged_copy(&self.shapes[index], id);
+        let copy = self.nudged_copy(&self.shapes[index], id, 20.0);
         self.duration = self.duration.max(copy.latest_time());
         self.shapes.insert(index + 1, copy);
         index + 1
     }
 
+    pub fn duplicate_layers(&mut self, ids: &[(String, String)]) -> Vec<String> {
+        let mut copies = Vec::new();
+        for (source, id) in ids {
+            if let Some(index) = self.shapes.iter().position(|shape| &shape.id == source) {
+                let copy = self.copy_with_parents(&self.shapes[index], id.clone(), ids);
+                self.duration = self.duration.max(copy.latest_time());
+                copies.push(copy.id.clone());
+                self.shapes.insert(index + 1, copy);
+            }
+        }
+        copies
+    }
+
+    pub fn paste_layers(&mut self, layers: &[Shape], ids: &[(String, String)]) -> Vec<String> {
+        let mut copies = Vec::new();
+        for (layer, (_, id)) in layers.iter().zip(ids) {
+            let copy = self.copy_with_parents(layer, id.clone(), ids);
+            self.duration = self.duration.max(copy.latest_time());
+            copies.push(copy.id.clone());
+            self.shapes.push(copy);
+        }
+        copies
+    }
+
+    fn copy_with_parents(&self, layer: &Shape, id: String, ids: &[(String, String)]) -> Shape {
+        if let Some((_, parent)) = ids
+            .iter()
+            .find(|(source, _)| Some(source) == layer.parent.as_ref())
+        {
+            let mut copy = self.nudged_copy(layer, id, 0.0);
+            copy.parent = Some(parent.clone());
+            copy
+        } else {
+            self.nudged_copy(layer, id, 20.0)
+        }
+    }
+
     /// A copied layer pasted on top, nudged like a duplicate (Electron duplicates its clipboard). Returns its index.
     pub fn paste_layer(&mut self, layer: &Shape, id: String) -> usize {
-        let copy = self.nudged_copy(layer, id);
+        let copy = self.nudged_copy(layer, id, 20.0);
         self.duration = self.duration.max(copy.latest_time());
         self.shapes.push(copy);
         self.shapes.len() - 1
@@ -950,6 +1170,19 @@ impl Scene {
     /// Deletes these layers (Electron's Delete layer). Text that followed one of them and stays is left where it is
     /// at `t`, standing on its own. Returns how many layers went.
     pub fn delete_layers(&mut self, ids: &[String], t: f64) -> usize {
+        let children: Vec<_> = self
+            .shapes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, shape)| {
+                (!ids.contains(&shape.id)
+                    && shape.parent.as_ref().is_some_and(|id| ids.contains(id)))
+                .then_some(i)
+            })
+            .collect();
+        for child in children {
+            let _ = self.set_parent(child, None, t);
+        }
         let staying_linked: Vec<usize> = (0..self.shapes.len())
             .filter(|&i| {
                 let shape = &self.shapes[i];
@@ -963,70 +1196,51 @@ impl Scene {
             })
             .collect();
         for i in staying_linked {
-            let seen = self.render_pose(&self.shapes[i], t);
+            let seen = self.layer_frame(&self.shapes[i], t);
+            let basis = self.unlink_text_space(&self.shapes[i], t, seen.space);
             let shape = &mut self.shapes[i];
             let rotation = shape.rotation_at(t) + shape.base_rotation;
             let own = shape.pose(t);
-            let Some(mut key) = shape.keys.first().cloned() else {
-                continue;
-            };
-            (key.t, key.x, key.y, key.w, key.h) = (0.0, seen.x, seen.y, seen.w, seen.h);
-            (key.r, key.o) = (seen.r - rotation, own.o);
+            let p = seen.pose;
+            let mut key = shape
+                .keys
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Key::from_pose(0.0, p));
+            (key.t, key.x, key.y, key.w, key.h) = (0.0, p.x, p.y, p.w, p.h);
+            (key.r, key.o, key.props, key.linked_space) = (p.r - rotation, own.o, None, false);
+            shape.linked_rest = None;
             shape.keys = vec![key];
+            shape.parent_space = basis;
             shape.extra.insert("linkId".into(), "".into());
             shape.extra.remove("linkBase");
+            if let Some(motions) = shape.extra.get_mut("motions").and_then(Value::as_array_mut) {
+                motions.retain(|m| m.get("linkedSpace").and_then(Value::as_bool) != Some(true));
+            }
         }
         let before = self.shapes.len();
         self.shapes.retain(|shape| !ids.contains(&shape.id));
         before - self.shapes.len()
     }
 
-    fn nudged_copy(&self, layer: &Shape, id: String) -> Shape {
-        const NUDGE: f32 = 20.0;
+    fn nudged_copy(&self, layer: &Shape, id: String, nudge: f32) -> Shape {
         let mut copy = layer.clone();
         (copy.id, copy.name) = (id, self.numbered_name(&copy.name));
         copy.extra.remove("trackId");
+        if nudge == 0.0 {
+            return copy;
+        }
         if is_linked(&copy) {
             let offset = copy
                 .extra
                 .get("offsetX")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0)
-                + NUDGE as f64;
+                + f64::from(nudge);
             copy.extra
                 .insert("offsetX".into(), serde_json::json!(offset));
         } else {
-            for key in &mut copy.keys {
-                (key.x, key.y) = (key.x + NUDGE, key.y + NUDGE);
-            }
-            let nudge = |p: &mut Value| {
-                for axis in ["x", "y"] {
-                    if let Some(v) = p.get(axis).and_then(Value::as_f64) {
-                        p[axis] = serde_json::json!(v + NUDGE as f64);
-                    }
-                }
-            };
-            for m in copy
-                .extra
-                .get_mut("motions")
-                .and_then(Value::as_array_mut)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(start) = m.get_mut("startPose") {
-                    nudge(start)
-                }
-                for list in ["sourcePoints", "baseKeys"] {
-                    for p in m
-                        .get_mut(list)
-                        .and_then(Value::as_array_mut)
-                        .into_iter()
-                        .flatten()
-                    {
-                        nudge(p)
-                    }
-                }
-            }
+            copy.translate_keys(nudge, nudge);
         }
         copy
     }
@@ -1037,7 +1251,7 @@ impl Scene {
     /// `length` seconds in the first one's spot, named Pose 1, 2…, the scene as long as the poses (at least 1 s).
     pub fn arrange_as_poses(&mut self, layers: &[usize], length: f64, track: String) {
         let Some(&first) = layers.first() else { return };
-        let (x, y) = (self.shapes[first].keys[0].x, self.shapes[first].keys[0].y);
+        let Pose { x, y, .. } = self.shapes[first].pose(0.0);
         self.duration = (layers.len() as f64 * length).max(1.0);
         for (i, &index) in layers.iter().enumerate() {
             let start = hundredths(i as f64 * length);
@@ -1045,12 +1259,12 @@ impl Scene {
             shape.name = format!("Pose {}", i + 1);
             shape.extra.insert("trackId".into(), track.clone().into());
             (shape.in_time, shape.out_time) = (Some(start), Some(hundredths(start + length)));
-            let key = Key {
-                t: start,
-                x,
-                y,
-                ..shape.keys[0].clone()
-            };
+            let mut key = shape
+                .keys
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Key::from_pose(start, shape.pose(start)));
+            (key.t, key.x, key.y, key.props) = (start, x, y, None);
             shape.keys = vec![key];
         }
         self.duration = self.duration.max(hundredths(layers.len() as f64 * length));
@@ -1082,7 +1296,8 @@ impl Scene {
         // Posed as it ends, outside its clip: the scene with the clip open-ended.
         let mut open = previous.clone();
         (open.in_time, open.out_time) = (None, None);
-        let p = self.render_pose(&open, at);
+        let frame = self.layer_frame(&open, at);
+        let p = frame.pose;
         // It keeps its id, so the renderer finds its picture.
         let mut ghost = previous.clone();
         (
@@ -1094,6 +1309,8 @@ impl Scene {
         ghost.color = previous.color_at(at);
         ghost.color_keys.clear();
         ghost.rotation_clips.clear();
+        ghost.parent = None;
+        ghost.parent_space = crate::transform::matrix(frame.space);
         ghost.extra.insert("linkId".into(), "".into());
         ghost.keys = vec![Key {
             t: 0.0,
@@ -1105,6 +1322,8 @@ impl Scene {
             o: p.o * 0.3,
             ease: None,
             curve: None,
+            props: None,
+            linked_space: false,
             extra: Map::new(),
         }];
         Some(ghost)
@@ -1147,7 +1366,7 @@ pub fn motions(shape: &Shape) -> impl Iterator<Item = (&Value, f64, f64)> {
         })
 }
 
-fn is_linked(shape: &Shape) -> bool {
+pub(crate) fn is_linked(shape: &Shape) -> bool {
     shape.kind == "text"
         && shape
             .extra
@@ -1302,6 +1521,38 @@ pub fn outside(pose: Pose, side: Edge, width: f32, height: f32) -> Pose {
     }
 }
 
+fn pose_with_spin(shape: &Shape, t: f64) -> Pose {
+    let mut pose = shape.pose(t);
+    pose.r += shape.rotation_at(t) + shape.base_rotation;
+    pose
+}
+
+fn link_scale(shape: &Shape, target: Pose) -> (f32, f32) {
+    let axis = |name, value: f32| {
+        let base = shape
+            .extra
+            .get("linkBase")
+            .and_then(|base| base.get(name))
+            .and_then(Value::as_f64)
+            .unwrap_or(f64::from(value)) as f32;
+        value / base.max(0.001)
+    };
+    (axis("w", target.w), axis("h", target.h))
+}
+
+fn or_one(v: f32) -> f32 {
+    if v == 0.0 || !v.is_finite() { 1.0 } else { v }
+}
+
+fn link_offset(shape: &Shape, target: Pose, (x, y): (f32, f32)) -> (f32, f32) {
+    let (sx, sy) = link_scale(shape, target);
+    let angle = (-target.r).to_radians();
+    (
+        (x * angle.cos() - y * angle.sin()) / or_one(sx),
+        (x * angle.sin() + y * angle.cos()) / or_one(sy),
+    )
+}
+
 fn value_f32(map: &Map<String, Value>, field: &str, fallback: f32) -> f32 {
     map.get(field)
         .and_then(Value::as_f64)
@@ -1408,9 +1659,9 @@ impl Shape {
             return before.color.clone();
         }
         let f = ease_at(
-            &self.ease,
+            before.ease.as_deref().unwrap_or(&self.ease),
             ((t - before.t) / (after.t - before.t)).clamp(0.0, 1.0) as f32,
-            None,
+            before.curve,
         );
         let channel = |value: &str, i: usize| {
             u8::from_str_radix(value.get(i..i + 2).unwrap_or("00"), 16).unwrap_or(0) as f32
@@ -1425,6 +1676,14 @@ impl Shape {
     }
 
     pub fn pose(&self, t: f64) -> Pose {
+        if self.rest_pose.is_some() || self.keys.iter().any(|key| key.props.is_some()) {
+            let keys = self.keys.iter().filter(|key| !key.linked_space);
+            let rest = self
+                .rest_pose
+                .or_else(|| keys.clone().next().map(Pose::from))
+                .unwrap_or(crate::keyframes::LINKED_NEUTRAL);
+            return self.property_pose(t, keys, rest);
+        }
         let before = self
             .keys
             .iter()
@@ -1459,7 +1718,18 @@ impl Shape {
     /// `keyAt`, keys sit on hundredths of a second and a key within one of them is the one edited.
     pub fn edit_pose(&mut self, t: f64, pose: Pose) {
         let t = (t * 100.0).round() / 100.0;
-        let at = self.keys.iter().position(|key| (key.t - t).abs() < 0.011);
+        if !is_linked(self)
+            && (self.rest_pose.is_some() || self.keys.iter().any(|key| key.props.is_some()))
+        {
+            for property in Property::ALL {
+                self.key_property(t, property, pose);
+            }
+            return;
+        }
+        let at = self
+            .keys
+            .iter()
+            .position(|key| !key.linked_space && (key.t - t).abs() < 0.011);
         let index = match at {
             Some(index) => index,
             None => {
@@ -1476,6 +1746,8 @@ impl Shape {
                         o: pose.o,
                         ease: None,
                         curve: None,
+                        props: None,
+                        linked_space: false,
                         extra: Map::new(),
                     },
                 );
@@ -1494,7 +1766,7 @@ impl Shape {
     }
 }
 
-fn ease_at(kind: &str, f: f32, curve: Option<[f32; 4]>) -> f32 {
+pub(crate) fn ease_at(kind: &str, f: f32, curve: Option<[f32; 4]>) -> f32 {
     match kind {
         "linear" => f,
         "hold" => 0.0,
@@ -1641,11 +1913,15 @@ mod tests {
             ColorKey {
                 t: 0.0,
                 color: "#000000".into(),
+                ease: None,
+                curve: None,
                 extra: Map::new(),
             },
             ColorKey {
                 t: 4.0,
                 color: "#ffffff".into(),
+                ease: None,
+                curve: None,
                 extra: Map::new(),
             },
         ];
@@ -1728,7 +2004,10 @@ mod tests {
         let text = &scene.shapes[1];
         assert!(!is_linked(text), "the text stands on its own");
         let now = scene.render_pose(text, 0.0);
-        assert!((now.x - seen.x).abs() < 0.01 && (now.y - seen.y).abs() < 0.01, "{now:?} {seen:?}");
+        assert!(
+            (now.x - seen.x).abs() < 0.01 && (now.y - seen.y).abs() < 0.01,
+            "{now:?} {seen:?}"
+        );
     }
 
     #[test]

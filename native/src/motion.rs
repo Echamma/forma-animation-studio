@@ -3,6 +3,7 @@
 //! `motions` (with the keyframes it replaced), so it can be retimed, rescaled or removed later. Its keyframes carry its
 //! `motionId`.
 
+use crate::keyframes::{Lane, LaneKey, Property};
 use crate::model::{Key, Pose, Scene, Shape};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -32,6 +33,10 @@ pub struct Motion {
     pub source_points: Vec<Point>,
     #[serde(default)]
     pub base_keys: Vec<Key>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub property_keys: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linked_space: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -90,6 +95,17 @@ pub fn scaled_points(m: &Motion) -> Vec<Point> {
 /// Puts back the keyframes a move replaced (Electron's `restoreMotionKeys`).
 fn restore_keys(shape: &mut Shape, m: &Motion) {
     shape.keys.retain(|k| motion_id(k) != Some(&m.id));
+    if m.property_keys {
+        for key in &m.base_keys {
+            for property in Property::ALL.into_iter().filter(|p| key.sets(*p)) {
+                let lane = Lane::Pose(property);
+                if shape.lane_key(lane, key.t).is_none() {
+                    shape.put_lane_key(key.t, LaneKey::Pose(property, key.clone()));
+                }
+            }
+        }
+        return;
+    }
     let near = |a: f32, b: f32| (a - b).abs() < 0.011;
     if !m
         .base_keys
@@ -108,7 +124,9 @@ fn restore_keys(shape: &mut Shape, m: &Motion) {
         });
     }
     for key in &m.base_keys {
-        shape.keys.retain(|x| (x.t - key.t).abs() > 0.001);
+        shape
+            .keys
+            .retain(|x| x.props.is_some() || (x.t - key.t).abs() > 0.001);
         shape.keys.push(key.clone());
     }
     shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
@@ -124,6 +142,7 @@ fn apply(shape: &mut Shape, m: &Motion, scene_duration: f64) {
     if span <= 0.01 {
         return;
     }
+    let properties = moved_properties(m);
     let key = |t: f64, p: Pose| {
         let mut extra = Map::new();
         extra.insert("motionId".into(), m.id.clone().into());
@@ -137,12 +156,20 @@ fn apply(shape: &mut Shape, m: &Motion, scene_duration: f64) {
             o: p.o,
             ease: None,
             curve: None,
+            props: m.property_keys.then(|| properties.clone()),
+            linked_space: m.linked_space,
             extra,
         }
     };
-    shape
-        .keys
-        .retain(|k| k.t < m.start_time - 0.001 || k.t > end + 0.001);
+    if m.property_keys {
+        for &property in &properties {
+            shape.exclude_keys(property, |k| in_move(k, m.start_time, end));
+        }
+    } else {
+        shape
+            .keys
+            .retain(|k| k.props.is_some() || !in_move(k, m.start_time, end));
+    }
     shape.keys.push(key(m.start_time, m.start_pose));
     let samples: Vec<Point> = if m.kind == "arrow" {
         points
@@ -184,7 +211,10 @@ fn apply(shape: &mut Shape, m: &Motion, scene_duration: f64) {
     shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
     let mut i = 0;
     while i + 1 < shape.keys.len() {
-        if (shape.keys[i].t - shape.keys[i + 1].t).abs() <= 0.001 {
+        if motion_id(&shape.keys[i]) == Some(&m.id)
+            && motion_id(&shape.keys[i + 1]) == Some(&m.id)
+            && (shape.keys[i].t - shape.keys[i + 1].t).abs() <= 0.001
+        {
             shape.keys.remove(i);
         } else {
             i += 1;
@@ -193,12 +223,43 @@ fn apply(shape: &mut Shape, m: &Motion, scene_duration: f64) {
 }
 
 /// The keyframes a move at `start`..`end` replaces: the layer's own ones (not another move's) inside it.
-fn base_keys(shape: &Shape, start: f64, end: f64) -> Vec<Key> {
+fn in_move(key: &Key, start: f64, end: f64) -> bool {
+    key.t >= start - 0.001 && key.t <= end + 0.001
+}
+
+fn moved_properties(m: &Motion) -> Vec<Property> {
+    let mut properties = vec![Property::Position];
+    if m.face || m.spin != 0.0 {
+        properties.push(Property::Rotation);
+    }
+    properties
+}
+
+fn base_keys(shape: &Shape, m: &Motion) -> Vec<Key> {
+    let properties = moved_properties(m);
     shape
         .keys
         .iter()
-        .filter(|k| k.t >= start - 0.001 && k.t <= end + 0.001 && motion_id(k).is_none())
-        .cloned()
+        .filter(|k| {
+            k.linked_space == m.linked_space
+                && in_move(k, m.start_time, m.start_time + m.duration)
+                && motion_id(k).is_none()
+        })
+        .filter_map(|key| {
+            let mut key = key.clone();
+            if m.property_keys {
+                let props: Vec<_> = properties
+                    .iter()
+                    .copied()
+                    .filter(|&p| key.sets(p))
+                    .collect();
+                if props.is_empty() {
+                    return None;
+                }
+                key.props = Some(props);
+            }
+            Some(key)
+        })
         .collect()
 }
 
@@ -251,7 +312,7 @@ pub fn draw(
     for old in &overlapping {
         restore_keys(shape, old);
     }
-    let m = Motion {
+    let mut m = Motion {
         id: id.clone(),
         kind: kind.into(),
         start_time: window.0,
@@ -261,9 +322,12 @@ pub fn draw(
         face: options.face,
         start_pose: start,
         source_points,
-        base_keys: base_keys(shape, window.0, window.1),
+        base_keys: Vec::new(),
+        property_keys: true,
+        linked_space: crate::model::is_linked(shape),
         extra: Map::new(),
     };
+    m.base_keys = base_keys(shape, &m);
     let mut list = kept;
     list.push(m.clone());
     set_motions(shape, &list);
@@ -308,7 +372,7 @@ pub fn edit(
     m.distance = options.distance.clamp(0.0, 500.0);
     m.spin = options.spin.clamp(-10000.0, 10000.0);
     m.face = options.face;
-    m.base_keys = base_keys(shape, start, start + length);
+    m.base_keys = base_keys(shape, m);
     let m = m.clone();
     set_motions(shape, &list);
     apply(shape, &m, scene.duration);
@@ -407,13 +471,19 @@ mod tests {
         )
         .unwrap();
         let shape = &scene.shapes[0];
-        assert_eq!(shape.keys.len(), 21);
+        assert_eq!(shape.lane_keys(Lane::Pose(Property::Position)).len(), 21);
         assert_eq!(shape.pose(1.0).y, 500.0);
         assert!(
-            (shape.keys[5].r - 90.0).abs() < 0.01,
+            (shape.pose(0.25).r - 90.0).abs() < 0.01,
             "facing down the screen"
         );
-        assert!(shape.keys.iter().all(|k| k.extra.get("motionId").is_some()));
+        assert!(
+            shape
+                .keys
+                .iter()
+                .filter(|k| k.sets(Property::Position))
+                .all(|k| k.extra.get("motionId").is_some())
+        );
     }
 
     #[test]
@@ -440,7 +510,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !scene.shapes[0].keys.iter().any(|k| k.t == 0.5),
+            scene.shapes[0]
+                .lane_key(Lane::Pose(Property::Position), 0.5)
+                .is_none(),
             "inside the move"
         );
         draw(
@@ -470,5 +542,57 @@ mod tests {
             "its own keyframe is back"
         );
         assert!(edit(&mut scene, 0, "two", 0.0, 1.0, Options::default()).is_err());
+    }
+
+    #[test]
+    fn position_motion_composes_with_keyed_rotation_and_fade() {
+        use crate::model::{Disappear, RotationClip};
+
+        let mut scene = scene();
+        let shape = &mut scene.shapes[0];
+        let start = shape.pose(0.0);
+        shape.ease = "linear".into();
+        shape.base_rotation = 5.0;
+        shape.key_property(2.0, Property::Rotation, Pose { r: 60.0, ..start });
+        shape.key_property(2.0, Property::Opacity, Pose { o: 60.0, ..start });
+        shape.rotation_clips.push(RotationClip {
+            id: "spin".into(),
+            start_time: 0.0,
+            duration: 2.0,
+            degrees: 90.0,
+            ease: "linear".into(),
+            extra: Map::new(),
+        });
+        shape.disappear = Some(Disappear {
+            start_time: 0.0,
+            duration: 2.0,
+            reappear_mode: "time".into(),
+            reappear_time: Some(3.0),
+            trigger_shape_id: None,
+            trigger_clip_id: None,
+            extra: Map::new(),
+        });
+        draw(
+            &mut scene,
+            0,
+            "arrow",
+            start,
+            &[Point {
+                x: 680.0,
+                y: start.y,
+            }],
+            0.0,
+            Options {
+                seconds: 2.0,
+                ..Default::default()
+            },
+            "move".into(),
+        )
+        .unwrap();
+        let p = scene.render_pose(&scene.shapes[0], 1.0);
+        assert_eq!((p.x, p.r, p.o), (580.0, 80.0, 40.0));
+        assert_eq!(scene.render_pose(&scene.shapes[0], 3.0).o, 60.0);
+        remove(&mut scene, 0, "move");
+        assert_eq!(scene.render_pose(&scene.shapes[0], 1.0).x, start.x);
     }
 }

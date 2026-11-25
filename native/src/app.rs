@@ -3,12 +3,15 @@
 use crate::animated_svg;
 use crate::archive;
 use crate::assets;
-use crate::model::{self, HANDLES, Pose, RotationClip, Scene, Shape, resized_pose};
+use crate::key_editor::{KeyEditor, LABEL_WIDTH, TIME_MARGIN, TimeView};
+use crate::keyframes::{Lane, Property};
+use crate::model::{self, HANDLES, Pose, RotationClip, Scene, Shape};
 use crate::motion;
 use crate::render;
 use crate::sound::Sound;
 use crate::storage;
 use crate::svg;
+use crate::transform::{self, Anchor, LayerFrame};
 use crate::video;
 use crate::videos::Videos;
 use canopy_ui::{
@@ -34,11 +37,21 @@ enum Gesture {
         handle: (i8, i8),
         start: Pos2,
         pose: Pose,
-        angle: f32,
+        inverse: tiny_skia::Transform,
+        anchor: Anchor,
+    },
+    Anchor {
+        index: usize,
+        start: Pos2,
+        initial: Anchor,
+        inverse: tiny_skia::Transform,
+        size: Vec2,
+        shape: Box<Shape>,
     },
     Rotate {
         index: usize,
         center: Pos2,
+        inverse: tiny_skia::Transform,
         last: f32,
     },
 }
@@ -82,6 +95,7 @@ enum ClipAction {
 /// A timeline row (see `Forma::rows`).
 enum Row {
     Layer { name: String, clips: Vec<usize> },
+    Property(usize, Lane),
     Fade(usize),
     Motion(usize, usize),
     Spin(usize, usize),
@@ -102,7 +116,6 @@ enum Part {
     MotionEnd(usize),
     Fade,
     FadeEnd,
-    Key(usize),
 }
 
 /// How close (px) to a bar's end a drag grabs the edge instead of the bar.
@@ -127,6 +140,7 @@ struct TimelineDrag {
     index: usize,
     part: Part,
     origin: f32,
+    seconds_per_pixel: f64,
     shape: Shape,
     duration: f64,
 }
@@ -140,38 +154,6 @@ const EASES: [(&str, &str); 6] = [
     ("Slow down", "ease-out"),
     ("Custom curve", "custom"),
 ];
-
-/// Deletes a keyframe, and the drawn move it started (Electron's `removeKeyframe` and `detachMotionKey`).
-fn remove_key(shape: &mut Shape, key: usize) {
-    if shape.keys.len() <= 1 {
-        return;
-    }
-    let removed = shape.keys.remove(key);
-    let motion = removed
-        .extra
-        .get("motionId")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .or_else(|| {
-            model::motions(shape)
-                .find(|(_, start, _)| (start - removed.t).abs() < 0.011)
-                .and_then(|(m, ..)| m.get("id")?.as_str().map(str::to_owned))
-        });
-    if let Some(motion) = motion {
-        if let Some(list) = shape
-            .extra
-            .get_mut("motions")
-            .and_then(|v| v.as_array_mut())
-        {
-            list.retain(|m| m.get("id").and_then(|v| v.as_str()) != Some(motion.as_str()));
-        }
-        for key in &mut shape.keys {
-            if key.extra.get("motionId").and_then(|v| v.as_str()) == Some(motion.as_str()) {
-                key.extra.remove("motionId");
-            }
-        }
-    }
-}
 
 /// What Electron Forma's export dialog can make.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -243,6 +225,7 @@ pub struct Forma {
     /// The canvas's zoom (1 fits the space, 0.2-5) and how far it's panned from the middle, in points.
     zoom: f32,
     pan: Vec2,
+    lock_ratio: bool,
     /// The canvas bar's scene button asked for Scene settings.
     open_scene: bool,
     videos: Videos,
@@ -254,6 +237,7 @@ pub struct Forma {
     gesture: Option<Gesture>,
     /// A drag on the timeline.
     timeline_drag: Option<TimelineDrag>,
+    key_editor: KeyEditor,
     /// Drawing a move: the tool ("arrow" or "path"), its options, and what's drawn so far (from the layer's pose).
     motion_mode: Option<&'static str>,
     motion_options: motion::Options,
@@ -340,6 +324,7 @@ impl Forma {
             preview: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
+            lock_ratio: true,
             open_scene: false,
             videos: Videos::default(),
             sound: Sound::default(),
@@ -348,6 +333,7 @@ impl Forma {
             recording_drag: false,
             gesture: None,
             timeline_drag: None,
+            key_editor: KeyEditor::default(),
             motion_mode: None,
             motion_options: motion::Options::default(),
             motion_draft: None,
@@ -386,6 +372,7 @@ impl Forma {
     }
 
     fn select_layer(&mut self, id: Option<String>, extend: bool) {
+        self.key_editor.clear_selection();
         if !extend {
             self.multi_selected = id.clone().into_iter().collect();
             self.selected = id;
@@ -410,6 +397,7 @@ impl Forma {
         self.sound.pause();
         let _ = self.save();
         self.scene = scene;
+        self.key_editor = KeyEditor::default();
         self.selected = None;
         self.multi_selected.clear();
         self.layer_drag = None;
@@ -568,6 +556,9 @@ impl Forma {
         if let Some(scene) = self.undo.pop() {
             self.pending_auto_preview = None;
             self.redo.push(std::mem::replace(&mut self.scene, scene));
+            self.key_editor.clear_selection();
+            self.timeline_drag = None;
+            self.gesture = None;
             self.suppress_history = true;
             self.playing = false;
             self.edited();
@@ -578,6 +569,9 @@ impl Forma {
         if let Some(scene) = self.redo.pop() {
             self.pending_auto_preview = None;
             self.undo.push(std::mem::replace(&mut self.scene, scene));
+            self.key_editor.clear_selection();
+            self.timeline_drag = None;
+            self.gesture = None;
             self.suppress_history = true;
             self.playing = false;
             self.edited();
@@ -1051,17 +1045,28 @@ impl Forma {
     /// Keys each layer at the playhead with its center moved to `centers` (Electron's arrange `place`). Text that
     /// follows a layer goes after the layers, so it keeps up with where they went.
     fn place_centers(&mut self, mut layers: Vec<(usize, (f32, f32))>) {
-        layers.sort_by_key(|(i, _)| {
-            let shape = &self.scene.shapes[*i];
-            shape.kind == "text" && shape.extra.contains_key("linkId")
-        });
+        layers.sort_by_key(|(i, _)| self.scene.ancestor_depth(*i));
         self.playing = false;
         let count = layers.len();
-        for (index, (x, y)) in layers {
-            let pose = self
-                .scene
-                .editable_pose(&self.scene.shapes[index], self.time);
-            self.scene.set_pose(index, self.time, Pose { x, y, ..pose });
+        let poses: Vec<_> = layers
+            .into_iter()
+            .map(|(index, (x, y))| {
+                let shape = &self.scene.shapes[index];
+                let pose = self.scene.editable_pose(shape, self.time);
+                let center = self.scene.render_pose(shape, self.time);
+                (
+                    index,
+                    Pose {
+                        x: pose.x + x - center.x,
+                        y: pose.y + y - center.y,
+                        ..pose
+                    },
+                )
+            })
+            .collect();
+        for (index, pose) in poses {
+            self.scene
+                .set_property_pose(index, self.time, pose, Property::Position);
         }
         self.edited();
         self.notice = Some(format!("Arranged {count} layers at {:.2} s", self.time));
@@ -1306,6 +1311,7 @@ impl Forma {
             self.animate_tab(ui, index);
             return;
         }
+        self.follows_picker(ui, index, false);
         self.arrange_panel(ui);
         self.clip_fields(ui, index);
         let mut pose = self
@@ -1352,7 +1358,9 @@ impl Forma {
                 .shapes
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.kind != "text" && s.id != text_id)
+                .filter(|(i, s)| {
+                    s.kind != "text" && s.id != text_id && self.scene.can_follow(index, *i)
+                })
                 .map(|(i, s)| (i, s.id.clone(), s.name.clone()))
                 .collect();
             let follows = others
@@ -1360,7 +1368,7 @@ impl Forma {
                 .find(|(_, id, _)| *id == linked)
                 .map_or("Nothing".to_owned(), |(.., name)| name.clone());
             let mut relink = None;
-            egui::ComboBox::from_label("Follows")
+            egui::ComboBox::from_label("Text linked to")
                 .selected_text(follows)
                 .show_ui(ui, |ui| {
                     for (i, id, name) in &others {
@@ -1394,7 +1402,7 @@ impl Forma {
             });
         }
         let shape = &mut self.scene.shapes[index];
-        // The fill: with "Animate color" on, picking a color sets a color keyframe at the playhead (as in Electron).
+        // Color edits use the same lane as the timeline.
         let current = shape.color_at(self.time);
         let channel =
             |i: usize| u8::from_str_radix(current.get(i..i + 2).unwrap_or("00"), 16).unwrap_or(0);
@@ -1403,26 +1411,7 @@ impl Forma {
             ui.label("Fill");
             if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
                 let picked = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
-                if shape.color_keys.is_empty() {
-                    shape.color = picked;
-                } else {
-                    let t = model::hundredths(self.time);
-                    match shape
-                        .color_keys
-                        .iter_mut()
-                        .find(|k| (k.t - t).abs() < 0.011)
-                    {
-                        Some(key) => key.color = picked,
-                        None => {
-                            shape.color_keys.push(model::ColorKey {
-                                t,
-                                color: picked,
-                                extra: Default::default(),
-                            });
-                            shape.color_keys.sort_by(|a, b| a.t.total_cmp(&b.t));
-                        }
-                    }
-                }
+                shape.key_color(self.time, picked);
                 changed = true;
             }
             ui.label(egui::RichText::new(current.to_uppercase()).color(color::INK_MUTED));
@@ -1437,6 +1426,8 @@ impl Forma {
                 shape.color_keys = vec![model::ColorKey {
                     t: model::hundredths(self.time),
                     color: current.clone(),
+                    ease: None,
+                    curve: None,
                     extra: Default::default(),
                 }];
             } else {
@@ -1468,10 +1459,14 @@ impl Forma {
         }
         let mut posed = false;
         let before = pose;
+        let lock_ratio = &mut self.lock_ratio;
+        let old_anchor = self.scene.shapes[index].anchor.unwrap_or_default();
+        let mut anchor = old_anchor;
         // Exact numbers, folded away as in Electron: dragging on the canvas does the same.
         egui::CollapsingHeader::new("Position & size")
             .id_salt("forma-position")
             .show(ui, |ui| {
+                ui.checkbox(lock_ratio, "Lock size ratio");
                 for (label, value, range) in [
                     ("X", &mut pose.x, -4000.0..=4000.0),
                     ("Y", &mut pose.y, -4000.0..=4000.0),
@@ -1484,49 +1479,32 @@ impl Forma {
                         .add(egui::Slider::new(value, range).text(label))
                         .changed();
                 }
+                Self::anchor_controls(ui, &mut anchor);
             });
+        if *lock_ratio && posed {
+            if pose.w != before.w {
+                pose.h = (before.h * pose.w / before.w).max(1.0);
+            } else if pose.h != before.h {
+                pose.w = (before.w * pose.h / before.h).max(1.0);
+            }
+        }
         let added = ui
             .button("Add keyframe here")
             .on_hover_text("Remember the layer as it is now at the playhead")
             .clicked();
-        if posed || added {
-            self.scene.set_pose(index, self.time, pose);
+        if posed {
+            self.apply_inspector_pose(index, before, pose);
             changed = true;
         }
-        if posed {
-            // With several layers selected, X and Y move them all by the same amount; other values apply to each.
-            let mut others: Vec<usize> = self
-                .selection()
-                .into_iter()
-                .filter(|&i| i != index)
-                .collect();
-            others.sort_by_key(|&i| {
-                let shape = &self.scene.shapes[i];
-                shape.kind == "text" && shape.extra.contains_key("linkId")
-            });
-            for other in others {
-                let mut p = self
-                    .scene
-                    .editable_pose(&self.scene.shapes[other], self.time);
-                p.x += pose.x - before.x;
-                p.y += pose.y - before.y;
-                for (value, (now, was)) in [
-                    (&mut p.w, (pose.w, before.w)),
-                    (&mut p.h, (pose.h, before.h)),
-                    (&mut p.r, (pose.r, before.r)),
-                    (&mut p.o, (pose.o, before.o)),
-                ] {
-                    if now != was {
-                        *value = now;
-                    }
-                }
-                self.scene.set_pose(other, self.time, p);
+        if anchor != old_anchor {
+            self.scene.set_anchor(index, anchor, self.time);
+            changed = true;
+        }
+        if added {
+            for property in Property::ALL {
+                self.scene.shapes[index].add_lane_key(Lane::Pose(property), self.time);
             }
         }
-        ui.label(
-            egui::RichText::new(format!("{} keyframes", self.scene.shapes[index].keys.len()))
-                .color(color::INK_MUTED),
-        );
         if changed || added {
             self.edited();
         }
@@ -1544,19 +1522,135 @@ impl Forma {
         }
     }
 
+    fn apply_inspector_pose(&mut self, index: usize, old: Pose, pose: Pose) {
+        let properties: Vec<_> = Property::ALL
+            .into_iter()
+            .filter(|p| p.values(old) != p.values(pose))
+            .collect();
+        let mut layers: Vec<_> = self
+            .selection()
+            .into_iter()
+            .filter(|&i| i != index)
+            .map(|i| {
+                let mut other = self.scene.editable_pose(&self.scene.shapes[i], self.time);
+                for &property in &properties {
+                    let values = if property == Property::Position {
+                        [other.x + pose.x - old.x, other.y + pose.y - old.y]
+                    } else {
+                        property.values(pose)
+                    };
+                    property.set(&mut other, values);
+                }
+                (i, other)
+            })
+            .collect();
+        layers.push((index, pose));
+        layers.sort_by_key(|(i, _)| self.scene.ancestor_depth(*i));
+        for (i, pose) in layers {
+            for &property in &properties {
+                self.scene.set_property_pose(i, self.time, pose, property);
+            }
+        }
+    }
+
+    fn follows_picker(&mut self, ui: &mut Ui, index: usize, menu: bool) {
+        let shape = &self.scene.shapes[index];
+        let parent = shape.parent.as_deref();
+        let current = self
+            .scene
+            .shapes
+            .iter()
+            .find(|s| Some(s.id.as_str()) == parent)
+            .map_or("None", |s| s.name.as_str());
+        let mut pick = None;
+        let choices = |ui: &mut Ui| {
+            if ui.selectable_label(parent.is_none(), "None").clicked() {
+                pick = Some(None);
+                ui.close();
+            }
+            for (i, other) in self.scene.shapes.iter().enumerate() {
+                if self.scene.can_follow(index, i)
+                    && ui
+                        .selectable_label(parent == Some(&other.id), &other.name)
+                        .clicked()
+                {
+                    pick = Some(Some(i));
+                    ui.close();
+                }
+            }
+        };
+        if menu {
+            ui.menu_button("Follows", choices);
+        } else {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().interact_size.y = 32.0;
+                ui.label("Follows");
+                egui::ComboBox::from_id_salt(("parent", &shape.id))
+                    .selected_text(current)
+                    .show_ui(ui, choices);
+            });
+        }
+        if let Some(parent) = pick {
+            match self.scene.set_parent(index, parent, self.time) {
+                Ok(()) => self.edited(),
+                Err(error) => self.notice = Some(error.into()),
+            }
+        }
+    }
+
+    fn anchor_controls(ui: &mut Ui, anchor: &mut Anchor) {
+        ui.label("Anchor");
+        ui.horizontal(|ui| {
+            for (label, value) in [("X", &mut anchor.x), ("Y", &mut anchor.y)] {
+                ui.label(label);
+                ui.add_sized(
+                    [64.0, 32.0],
+                    egui::DragValue::new(value)
+                        .speed(0.01)
+                        .fixed_decimals(2)
+                        .range(-10.0..=10.0),
+                );
+            }
+        });
+        egui::Grid::new("anchor-grid")
+            .spacing(vec2(4.0, 4.0))
+            .show(ui, |ui| {
+                for (y, row) in ["Top", "Middle", "Bottom"].into_iter().enumerate() {
+                    for (x, column) in ["left", "center", "right"].into_iter().enumerate() {
+                        let target = Anchor {
+                            x: x as f32 / 2.0,
+                            y: y as f32 / 2.0,
+                        };
+                        let glyph = [["?", "?", "?"], ["?", "?", "?"], ["?", "?", "?"]][y][x];
+                        if ui
+                            .add_sized(
+                                [32.0, 32.0],
+                                egui::Button::selectable(*anchor == target, glyph),
+                            )
+                            .on_hover_text(format!("{row} {column} anchor"))
+                            .clicked()
+                        {
+                            *anchor = target;
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        ui.label(egui::RichText::new("Alt-drag the anchor on the canvas").color(color::INK_MUTED));
+    }
+
     /// The Animate tab: one-click animations, easing, and the moves, spins and fades on the layer.
     fn animate_tab(&mut self, ui: &mut Ui, index: usize) {
-        let pose = self
-            .scene
-            .editable_pose(&self.scene.shapes[index], self.time);
         let mut changed = false;
         let shape = &mut self.scene.shapes[index];
+        let pose = shape.lane_pose(self.time);
         let mut animated = false;
         ui.horizontal_wrapped(|ui| {
             if ui.button("Move →").clicked() {
-                shape.edit_pose(self.time, pose);
-                shape.edit_pose(
+                shape.key_property(self.time, Property::Position, pose);
+                shape.key_property(
                     self.time + 1.0,
+                    Property::Position,
                     Pose {
                         x: pose.x + 180.0,
                         ..pose
@@ -1565,8 +1659,8 @@ impl Forma {
                 animated = true;
             }
             if ui.button("Fade out").clicked() {
-                shape.edit_pose(self.time, pose);
-                shape.edit_pose(self.time + 1.0, Pose { o: 0.0, ..pose });
+                shape.key_property(self.time, Property::Opacity, pose);
+                shape.key_property(self.time + 1.0, Property::Opacity, Pose { o: 0.0, ..pose });
                 animated = true;
             }
             if ui.button("Spin").clicked() {
@@ -1634,24 +1728,29 @@ impl Forma {
                 .keys
                 .iter()
                 .any(|k| k.t > start + 0.005 && k.t <= end + 0.005);
-        let landing = self.scene.editable_pose(shape, start);
+        let landing = shape.pose(start);
+        let seen = self.scene.render_pose(shape, start);
         if linked {
             self.notice = Some("Text that follows a shape drops with its shape".into());
         } else if occupied {
             self.notice = Some("Move the playhead to a clear section of this layer first".into());
-        } else if landing.x + landing.w / 2.0 < 0.0
-            || landing.x - landing.w / 2.0 > self.scene.width
-            || landing.y + landing.h / 2.0 < 0.0
-            || landing.y - landing.h / 2.0 > self.scene.height
+        } else if seen.x + seen.w / 2.0 < 0.0
+            || seen.x - seen.w / 2.0 > self.scene.width
+            || seen.y + seen.h / 2.0 < 0.0
+            || seen.y - seen.h / 2.0 > self.scene.height
         {
             self.notice = Some("Place the item on the canvas where it should land first".into());
         } else {
-            let above = -landing.h / 2.0 - (self.scene.height * 0.08).max(40.0);
+            let space = self.scene.layer_frame(shape, start).space;
+            let inverse = space.invert().unwrap_or_default();
+            let above = -seen.y - seen.h / 2.0 - (self.scene.height * 0.08).max(40.0);
+            let (dx, dy) = transform::vector(inverse, 0.0, above);
             let poses = [
                 (
                     0.0,
                     Pose {
-                        y: above,
+                        x: landing.x + dx,
+                        y: landing.y + dy,
                         ..landing
                     },
                 ),
@@ -1699,14 +1798,13 @@ impl Forma {
                 (1.0, landing),
             ];
             let shape = &mut self.scene.shapes[index];
-            shape
-                .keys
-                .retain(|k| k.t < start - 0.005 || k.t > end + 0.005);
+            for property in [Property::Position, Property::Size] {
+                shape.exclude_keys(property, |k| k.t >= start - 0.005 && k.t <= end + 0.005);
+            }
             for (fraction, pose) in poses {
-                shape.edit_pose(
-                    ((start + duration * fraction) * 100.0).round() / 100.0,
-                    pose,
-                );
+                let t = model::hundredths(start + duration * fraction);
+                shape.key_property(t, Property::Position, pose);
+                shape.key_property(t, Property::Size, pose);
             }
             self.scene.duration = self.scene.duration.max(end);
             self.motion_mode = None;
@@ -2650,89 +2748,79 @@ impl Forma {
             ),
             None => painter.rect_filled(canvas, 3.0, hex(&self.scene.bg, 255)),
         };
-        // Layers as drawn on screen: center, size in points and angle, for hit testing (topmost last).
-        let on_screen = |pose: Pose| {
-            (
-                pos2(
-                    canvas.left() + pose.x * scale,
-                    canvas.top() + pose.y * scale,
-                ),
-                vec2(pose.w, pose.h) * scale,
-                pose.r,
-            )
+        let to_screen = |x: f32, y: f32| canvas.min + vec2(x, y) * scale;
+        let to_scene = |p: Pos2| (p - canvas.min) / scale;
+        let from_layer = |frame: LayerFrame, x, y| {
+            let (x, y) = transform::point(frame.transform, x, y);
+            to_screen(x, y)
         };
-        let local = |p: Pos2, (center, _, angle): (Pos2, Vec2, f32)| {
-            let (d, a) = (p - center, (-angle).to_radians());
-            vec2(d.x * a.cos() - d.y * a.sin(), d.x * a.sin() + d.y * a.cos())
-        };
-        let turn = |v: Vec2, angle: f32| {
-            let a = angle.to_radians();
-            vec2(v.x * a.cos() - v.y * a.sin(), v.x * a.sin() + v.y * a.cos())
+        let corners = |frame: LayerFrame| {
+            [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+                .map(|(x, y)| from_layer(frame, x * frame.pose.w, y * frame.pose.h))
         };
         let mut hits = Vec::new();
-        for shape in &self.scene.shapes {
+        for (index, shape) in self.scene.shapes.iter().enumerate() {
             if !shape.visible(self.time, self.scene.duration) {
                 continue;
             }
-            let pose = self.scene.render_pose(shape, self.time);
-            let (center, size, angle) = on_screen(pose);
+            let frame = self.scene.layer_frame(shape, self.time);
             if renderer.leaves_out(shape) {
-                let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-                    .map(|(x, y)| center + turn(vec2(x, y) * size / 2.0, angle));
                 painter.add(egui::Shape::convex_polygon(
-                    corners.to_vec(),
-                    hex(&shape.color_at(self.time), (pose.o * 2.55).round() as u8),
+                    corners(frame).to_vec(),
+                    hex(
+                        &shape.color_at(self.time),
+                        (frame.pose.o * 2.55).round() as u8,
+                    ),
                     Stroke::NONE,
                 ));
                 painter.text(
-                    center,
+                    from_layer(frame, 0.0, 0.0),
                     Align2::CENTER_CENTER,
                     format!("{} layer", shape.kind),
                     font::ui(12.0),
                     Color32::BLACK,
                 );
             }
-            hits.push((shape.id.clone(), (center, size, angle)));
-        }
-        // The selected layer's box, resize handles and rotation handle (Electron's selection control).
-        if !self.playing {
-            for (id, (center, size, angle)) in &hits {
-                if self.multi_selected.contains(id) && self.selected.as_deref() != Some(id) {
-                    let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-                        .map(|(x, y)| *center + turn(vec2(x, y) * *size / 2.0, *angle));
-                    painter.add(egui::Shape::closed_line(
-                        corners.to_vec(),
-                        Stroke::new(1.5, color::SUN),
-                    ));
-                }
+            hits.push((index, frame));
+            if !self.playing
+                && self.multi_selected.contains(&shape.id)
+                && self.selected.as_deref() != Some(&shape.id)
+            {
+                painter.add(egui::Shape::closed_line(
+                    corners(frame).to_vec(),
+                    Stroke::new(1.5, color::SUN),
+                ));
             }
         }
-        let selected = self
-            .selected
-            .as_deref()
-            .and_then(|id| hits.iter().find(|(hit, _)| hit == id))
-            .map(|(_, place)| *place);
+        let selected = hits
+            .iter()
+            .copied()
+            .find(|(index, _)| self.selected.as_deref() == Some(&self.scene.shapes[*index].id));
         let mut handles = Vec::new();
-        let mut rotate_at = None;
-        if let (Some((center, size, angle)), false) = (selected, self.playing) {
-            let smallest = size.x.min(size.y);
-            let (knob, reach) = (
-                (smallest * 0.28).clamp(8.0, 12.0),
-                (smallest * 0.5).clamp(12.0, 28.0),
+        let (mut rotate_at, mut anchor_at) = (None, None);
+        if let (Some((_, frame)), false) = (selected, self.playing) {
+            let w = frame.pose.w;
+            let h = frame.pose.h;
+            let center = from_layer(frame, 0.0, 0.0);
+            let x_axis = (from_layer(frame, w, 0.0) - center).normalized();
+            let y_axis = (from_layer(frame, 0.0, h) - center).normalized();
+            let size = vec2(
+                center.distance(from_layer(frame, w, 0.0)),
+                center.distance(from_layer(frame, 0.0, h)),
             );
-            let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-                .map(|(x, y)| center + turn(vec2(x, y) * size / 2.0, angle));
+            let knob = (size.x.min(size.y) * 0.28).clamp(8.0, 12.0);
+            let reach = (size.x.min(size.y) * 0.5).clamp(12.0, 28.0);
             painter.add(egui::Shape::closed_line(
-                corners.to_vec(),
+                corners(frame).to_vec(),
                 Stroke::new(1.5, color::SUN),
             ));
             for (sx, sy) in HANDLES {
                 if (sx == 0 && size.x < 48.0) || (sy == 0 && size.y < 48.0) {
                     continue;
                 }
-                let at = center + turn(vec2(sx as f32 * size.x, sy as f32 * size.y) / 2.0, angle);
+                let at = from_layer(frame, f32::from(sx) * w / 2.0, f32::from(sy) * h / 2.0);
                 let square = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-                    .map(|(x, y)| at + turn(vec2(x, y) * knob / 2.0, angle));
+                    .map(|(x, y)| at + (x_axis * x + y_axis * y) * knob / 2.0);
                 painter.add(egui::Shape::convex_polygon(
                     square.to_vec(),
                     Color32::WHITE,
@@ -2740,12 +2828,20 @@ impl Forma {
                 ));
                 handles.push(((sx, sy), at, reach));
             }
-            let top = center + turn(vec2(0.0, -size.y / 2.0), angle);
-            let knob_at = center + turn(vec2(0.0, -size.y / 2.0 - 34.0), angle);
+            let top = from_layer(frame, 0.0, -h / 2.0);
+            let knob_at = top - y_axis * 34.0;
             painter.line_segment([top, knob_at], Stroke::new(1.5, color::SUN));
             painter.circle(knob_at, 10.0, Color32::WHITE, Stroke::new(1.5, color::SUN));
             painter.circle_stroke(knob_at, 4.5, Stroke::new(1.5, color::SUN));
             rotate_at = Some(knob_at);
+            let (x, y) = frame.anchor();
+            let at = to_screen(x, y);
+            let outline = Stroke::new(1.5, color::SUN);
+            painter.circle(at, 5.0, Mood::Ember.ground(), outline);
+            for axis in [vec2(1.0, 0.0), vec2(0.0, 1.0)] {
+                painter.line_segment([at - axis * 9.0, at + axis * 9.0], outline);
+            }
+            anchor_at = Some(at);
         }
         // All of the view takes clicks and drags: layers can be picked up outside the frame.
         let response = ui.interact(
@@ -2761,8 +2857,14 @@ impl Forma {
             }
             return;
         }
-        let to_screen =
-            |p: motion::Point| pos2(canvas.left() + p.x * scale, canvas.top() + p.y * scale);
+        let motion_space = selected.map_or(tiny_skia::Transform::identity(), |(index, _)| {
+            self.scene
+                .motion_space(&self.scene.shapes[index], self.time)
+        });
+        let motion_to_screen = |p: motion::Point| {
+            let (x, y) = transform::point(motion_space, p.x, p.y);
+            to_screen(x, y)
+        };
         // The selected move's path, and one being drawn.
         if let Some(m) = self
             .selected
@@ -2776,7 +2878,7 @@ impl Forma {
         {
             let points: Vec<Pos2> = motion::scaled_points(&m)
                 .into_iter()
-                .map(to_screen)
+                .map(motion_to_screen)
                 .collect();
             painter.add(egui::Shape::line(
                 points,
@@ -2784,11 +2886,11 @@ impl Forma {
             ));
         }
         if let Some((start, points)) = &self.motion_draft {
-            let mut line = vec![to_screen(motion::Point {
+            let mut line = vec![motion_to_screen(motion::Point {
                 x: start.x,
                 y: start.y,
             })];
-            line.extend(points.iter().map(|p| to_screen(*p)));
+            line.extend(points.iter().copied().map(motion_to_screen));
             if self.motion_mode == Some("arrow") {
                 line = vec![line[0], *line.last().unwrap()];
             }
@@ -2808,9 +2910,13 @@ impl Forma {
         }
         if let Some(kind) = self.motion_mode {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-            let to_scene = |p: Pos2| motion::Point {
-                x: (p.x - canvas.left()) / scale,
-                y: (p.y - canvas.top()) / scale,
+            let Some(inverse) = motion_space.invert() else {
+                return;
+            };
+            let motion_point = |p: Pos2| {
+                let p = to_scene(p);
+                let (x, y) = transform::point(inverse, p.x, p.y);
+                motion::Point { x, y }
             };
             let index = self
                 .selected
@@ -2822,9 +2928,8 @@ impl Forma {
                 ui.input(|i| i.pointer.press_origin()),
             ) {
                 self.motion_draft = Some((
-                    self.scene
-                        .editable_pose(&self.scene.shapes[index], self.time),
-                    vec![to_scene(p)],
+                    self.scene.shapes[index].lane_pose(self.time),
+                    vec![motion_point(p)],
                 ));
             }
             if let (true, Some((_, points)), Some(p)) = (
@@ -2832,7 +2937,7 @@ impl Forma {
                 self.motion_draft.as_mut(),
                 response.interact_pointer_pos(),
             ) {
-                let p = to_scene(p);
+                let p = motion_point(p);
                 let last = *points.last().unwrap();
                 if kind == "arrow" {
                     *points.last_mut().unwrap() = p;
@@ -2889,80 +2994,101 @@ impl Forma {
         let near_handle = |p: Pos2| {
             handles
                 .iter()
-                .find(|(_, at, reach)| {
-                    let d = local(p, (*at, Vec2::ZERO, selected.map_or(0.0, |s| s.2)));
-                    d.x.abs() <= reach / 2.0 && d.y.abs() <= reach / 2.0
-                })
+                .find(|(_, at, reach)| at.distance(p) <= reach / 2.0)
                 .map(|(handle, ..)| *handle)
         };
         let on_rotate = |p: Pos2| rotate_at.is_some_and(|at| at.distance(p) <= 12.0);
+        let on_anchor = |p: Pos2| anchor_at.is_some_and(|at| at.distance(p) <= 11.0);
         let topmost = |p: Pos2| {
+            let p = to_scene(p);
             hits.iter()
                 .rev()
-                .find(|(_, place)| {
-                    let d = local(p, *place);
-                    d.x.abs() <= place.1.x / 2.0 && d.y.abs() <= place.1.y / 2.0
+                .find(|(_, frame)| {
+                    frame.transform.invert().is_some_and(|inverse| {
+                        let (x, y) = transform::point(inverse, p.x, p.y);
+                        x.abs() <= frame.pose.w / 2.0 && y.abs() <= frame.pose.h / 2.0
+                    })
                 })
-                .map(|(id, _)| id.clone())
+                .map(|(index, _)| *index)
         };
+        let menu_target = response.interact_pointer_pos().and_then(topmost);
+        if response.secondary_clicked() {
+            let id = menu_target.map(|i| self.scene.shapes[i].id.clone());
+            self.select_layer(id, false);
+        }
+        if let Some(index) = self
+            .selected
+            .as_deref()
+            .and_then(|id| self.scene.shapes.iter().position(|s| s.id == id))
+        {
+            response.context_menu(|ui| self.follows_picker(ui, index, true));
+        }
+        let alt = ui.input(|i| i.modifiers.alt);
         if let Some(p) = response.hover_pos() {
-            if on_rotate(p) {
+            if alt && on_anchor(p) {
+                response.clone().on_hover_text("Drag the anchor");
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            } else if on_rotate(p) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-            } else if let Some((sx, sy)) = near_handle(p) {
-                // Electron's resizeCursor: the handle's direction on screen, to the nearest 45 degrees.
-                let degrees = ((sy as f32).atan2(sx as f32).to_degrees()
-                    + selected.map_or(0.0, |s| s.2))
-                .rem_euclid(180.0);
+            } else if let (Some((sx, sy)), Some((_, frame))) = (near_handle(p), selected) {
+                let (dx, dy) = transform::vector(frame.transform, f32::from(sx), f32::from(sy));
+                let angle = dy.atan2(dx).to_degrees().rem_euclid(180.0);
                 ui.ctx().set_cursor_icon(
                     [
                         egui::CursorIcon::ResizeHorizontal,
                         egui::CursorIcon::ResizeNwSe,
                         egui::CursorIcon::ResizeVertical,
                         egui::CursorIcon::ResizeNeSw,
-                    ][(degrees / 45.0).round() as usize % 4],
+                    ][(angle / 45.0).round() as usize % 4],
                 );
             } else if topmost(p).is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
             }
         }
-        if response.drag_started() || response.clicked() {
-            // Where the button went down: by the time a drag starts, the pointer has moved off a small handle.
+        if response.drag_started_by(egui::PointerButton::Primary) || response.clicked() {
             if let Some(p) = ui
                 .input(|i| i.pointer.press_origin())
                 .or(response.interact_pointer_pos())
             {
-                let to_scene =
-                    |p: Pos2| pos2((p.x - canvas.left()) / scale, (p.y - canvas.top()) / scale);
+                let point = to_scene(p).to_pos2();
                 self.gesture = None;
-                if let (true, Some(i)) = (
-                    on_rotate(p),
-                    self.selected
-                        .as_deref()
-                        .and_then(|id| self.scene.shapes.iter().position(|s| s.id == id)),
-                ) {
-                    let center = self.scene.render_pose(&self.scene.shapes[i], self.time);
-                    let point = to_scene(p);
-                    self.gesture = Some(Gesture::Rotate {
-                        index: i,
-                        center: pos2(center.x, center.y),
-                        last: (point.y - center.y).atan2(point.x - center.x).to_degrees(),
-                    });
-                } else if let (Some(handle), Some(i)) = (
-                    near_handle(p),
-                    self.selected
-                        .as_deref()
-                        .and_then(|id| self.scene.shapes.iter().position(|s| s.id == id)),
-                ) {
-                    let shape = &self.scene.shapes[i];
-                    self.gesture = Some(Gesture::Resize {
-                        index: i,
-                        handle,
-                        start: to_scene(p),
-                        pose: self.scene.editable_pose(shape, self.time),
-                        angle: self.scene.render_pose(shape, self.time).r,
-                    });
+                if let Some((index, frame)) = selected.filter(|_| alt && on_anchor(p)) {
+                    if let Some(inverse) = frame.transform.invert() {
+                        let shape = self.scene.shapes[index].clone();
+                        self.gesture = Some(Gesture::Anchor {
+                            index,
+                            start: point,
+                            initial: shape.anchor.unwrap_or_default(),
+                            inverse,
+                            size: vec2(frame.pose.w, frame.pose.h),
+                            shape: Box::new(shape),
+                        });
+                    }
+                } else if let Some((index, frame)) = selected.filter(|_| on_rotate(p)) {
+                    if let Some(inverse) = frame.space.invert() {
+                        let center = pos2(frame.pose.x, frame.pose.y);
+                        let (x, y) = transform::point(inverse, point.x, point.y);
+                        self.gesture = Some(Gesture::Rotate {
+                            index,
+                            center,
+                            inverse,
+                            last: (y - center.y).atan2(x - center.x).to_degrees(),
+                        });
+                    }
+                } else if let (Some(handle), Some((index, frame))) = (near_handle(p), selected) {
+                    if let Some(inverse) = frame.transform.invert() {
+                        let shape = &self.scene.shapes[index];
+                        self.gesture = Some(Gesture::Resize {
+                            index,
+                            handle,
+                            start: point,
+                            pose: self.scene.editable_pose(shape, self.time),
+                            inverse,
+                            anchor: shape.anchor.unwrap_or_default(),
+                        });
+                    }
                 } else {
-                    let hit = topmost(p);
+                    let hit = topmost(p).map(|i| self.scene.shapes[i].id.clone());
                     let extend = ui.input(|i| i.modifiers.shift);
                     if extend && response.clicked() {
                         self.select_layer(hit, true);
@@ -2992,12 +3118,9 @@ impl Forma {
                             })
                             .map(|(j, shape)| (j, self.scene.editable_pose(shape, self.time)))
                             .collect();
-                        poses.sort_by_key(|(j, _)| {
-                            self.scene.shapes[*j].kind == "text"
-                                && self.scene.shapes[*j].extra.contains_key("linkId")
-                        });
+                        poses.sort_by_key(|(j, _)| self.scene.ancestor_depth(*j));
                         self.gesture = Some(Gesture::Move {
-                            start: to_scene(p),
+                            start: point,
                             poses,
                         });
                     }
@@ -3007,12 +3130,12 @@ impl Forma {
                 }
             }
         }
-        if response.dragged() {
+        if response.dragged_by(egui::PointerButton::Primary) {
             if let (Some(gesture), Some(p)) =
                 (self.gesture.clone(), response.interact_pointer_pos())
             {
-                let point = pos2((p.x - canvas.left()) / scale, (p.y - canvas.top()) / scale);
-                let freeform = ui.input(|i| i.modifiers.shift);
+                let point = to_scene(p).to_pos2();
+                let lock_ratio = self.lock_ratio && !ui.input(|i| i.modifiers.shift);
                 match gesture {
                     Gesture::Move { start, poses } => {
                         for (index, pose) in poses {
@@ -3021,7 +3144,12 @@ impl Forma {
                                 y: pose.y + point.y - start.y,
                                 ..pose
                             };
-                            self.scene.set_pose(index, self.time, moved);
+                            self.scene.set_property_pose(
+                                index,
+                                self.time,
+                                moved,
+                                Property::Position,
+                            );
                         }
                     }
                     Gesture::Resize {
@@ -3029,31 +3157,60 @@ impl Forma {
                         handle,
                         start,
                         pose,
-                        angle,
+                        inverse,
+                        anchor,
                     } => {
-                        let resized = resized_pose(
-                            pose,
-                            angle,
-                            handle,
-                            (point.x - start.x, point.y - start.y),
-                            freeform,
+                        let delta = point - start;
+                        let delta = transform::vector(inverse, delta.x, delta.y);
+                        let (w, h) =
+                            transform::resize_about_anchor(pose, anchor, handle, delta, lock_ratio);
+                        self.scene.set_property_pose(
+                            index,
+                            self.time,
+                            Pose { w, h, ..pose },
+                            Property::Size,
                         );
-                        self.scene.set_pose(index, self.time, resized);
                     }
-                    // Turning a layer by hand changes its base rotation, as in Electron, not its keyframes.
+                    Gesture::Anchor {
+                        index,
+                        start,
+                        initial,
+                        inverse,
+                        size,
+                        shape,
+                    } => {
+                        let delta = point - start;
+                        let (dx, dy) = transform::vector(inverse, delta.x, delta.y);
+                        let anchor = Anchor {
+                            x: (initial.x + dx / size.x).clamp(-10.0, 10.0),
+                            y: (initial.y + dy / size.y).clamp(-10.0, 10.0),
+                        };
+                        self.scene.shapes[index] = *shape;
+                        self.scene.set_anchor(index, anchor, self.time);
+                    }
                     Gesture::Rotate {
                         index,
                         center,
+                        inverse,
                         last,
                     } => {
-                        let angle = (point.y - center.y).atan2(point.x - center.x).to_degrees();
+                        let (x, y) = transform::point(inverse, point.x, point.y);
+                        let angle = (y - center.y).atan2(x - center.x).to_degrees();
                         let delta = (angle - last + 540.0).rem_euclid(360.0) - 180.0;
-                        let shape = &mut self.scene.shapes[index];
-                        shape.base_rotation =
-                            (shape.base_rotation + delta).clamp(-10000.0, 10000.0);
+                        let pose = self
+                            .scene
+                            .editable_pose(&self.scene.shapes[index], self.time);
+                        let r = (pose.r + delta).clamp(-10000.0, 10000.0);
+                        self.scene.set_property_pose(
+                            index,
+                            self.time,
+                            Pose { r, ..pose },
+                            Property::Rotation,
+                        );
                         self.gesture = Some(Gesture::Rotate {
                             index,
                             center,
+                            inverse,
                             last: angle,
                         });
                     }
@@ -3107,6 +3264,9 @@ impl Forma {
             if track.is_some() && self.selected.as_deref() != Some(&shape.id) {
                 continue;
             }
+            if self.key_editor.expanded.contains(&shape.id) {
+                rows.extend(Lane::ALL.map(|lane| Row::Property(index, lane)));
+            }
             if shape.disappear.is_some() {
                 rows.push(Row::Fade(index));
             }
@@ -3146,6 +3306,8 @@ impl Forma {
                     .font(font::ui(13.0))
                     .color(color::INK_SOFT),
             );
+            self.key_editor
+                .toolbar(ui, &mut self.scene, self.selected.as_deref());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if pill(ui, "Onion skin", None, self.onion_skin)
                     .on_hover_text("While editing a clip, faintly show the clip before it on the same track")
@@ -3165,16 +3327,28 @@ impl Forma {
             self.transport(ui)
         });
         let rect = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
-        let left = rect.left() + 130.0;
-        let width = (rect.width() - 150.0).max(1.0);
+        self.key_editor.begin_frame(&self.scene);
+        let plot = Rect::from_min_max(
+            pos2(rect.left() + LABEL_WIDTH, rect.top()),
+            pos2(
+                (rect.right() - TIME_MARGIN).max(rect.left() + LABEL_WIDTH + 1.0),
+                rect.bottom(),
+            ),
+        );
         let duration = self.scene.duration;
-        let x = |t: f64| left + width * (t / duration).clamp(0.0, 1.0) as f32;
-        // A mark every second on short scenes; on long ones the shortest step that keeps marks 60 px apart.
-        let step = [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0]
-            .into_iter()
-            .find(|s| width as f64 * s / duration >= 60.0)
-            .unwrap_or(3600.0);
-        for n in 0..=(duration / step).floor() as usize {
+        let view = self.key_editor.time_view(ui, plot, duration);
+        let x = |t: f64| view.x(plot, t).clamp(plot.left(), plot.right());
+        let width = plot.width() * (duration / view.span) as f32;
+        let step = [
+            0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
+            1800.0, 3600.0,
+        ]
+        .into_iter()
+        .find(|s| plot.width() as f64 * s / view.span >= 60.0)
+        .unwrap_or(3600.0);
+        let first = (view.start / step).ceil() as usize;
+        let last = ((view.start + view.span) / step).floor() as usize;
+        for n in first..=last {
             let tick = n as f64 * step;
             let pos = x(tick);
             ui.painter().line_segment(
@@ -3184,7 +3358,7 @@ impl Forma {
             let label = if tick >= 60.0 {
                 format!("{}:{:02}", tick as u64 / 60, tick as u64 % 60)
             } else {
-                format!("{tick}s")
+                format!("{:.2}s", model::hundredths(tick)).replace(".00s", "s")
             };
             ui.painter().text(
                 pos2(pos + 3.0, rect.top() + 4.0),
@@ -3194,13 +3368,13 @@ impl Forma {
                 color::INK_MUTED,
             );
         }
-        let ruler = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 25.0));
+        let ruler = Rect::from_min_max(plot.min, pos2(plot.right(), rect.top() + 25.0));
         let response = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag());
         if let (true, Some(p)) = (
             response.clicked() || response.dragged(),
             response.interact_pointer_pos(),
         ) {
-            self.time = (((p.x - left) / width) as f64 * duration).clamp(0.0, duration);
+            self.time = view.time(plot, p.x).clamp(0.0, duration);
             self.playing = false;
         }
         let rows = self.rows();
@@ -3211,12 +3385,44 @@ impl Forma {
                 .auto_shrink(false)
                 .show(ui, |ui| {
                     for row in &rows {
-                        let (line, _) = ui
-                            .allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
-                        self.timeline_row(ui, row, line, &x, width);
+                        if let Row::Property(index, lane) = *row {
+                            let id = self.scene.shapes[index].id.clone();
+                            let height = self.key_editor.row_height(&id, lane);
+                            let (mut line, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), height),
+                                Sense::hover(),
+                            );
+                            line.max.x = rect.right();
+                            if ui.is_rect_visible(line)
+                                && self.key_editor.row(
+                                    ui,
+                                    &mut self.scene,
+                                    index,
+                                    lane,
+                                    line,
+                                    view,
+                                    &mut self.time,
+                                    &mut self.playing,
+                                )
+                            {
+                                self.selected = Some(id.clone());
+                                self.multi_selected = vec![id];
+                                self.tab = Tab::Animate;
+                            }
+                        } else {
+                            let (line, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 32.0),
+                                Sense::hover(),
+                            );
+                            if ui.is_rect_visible(line) {
+                                self.timeline_row(ui, row, line, &x, width, view);
+                            }
+                        }
                     }
                 });
         });
+        self.key_editor
+            .finish_frame(ui, &mut self.scene, area, self.time, self.lock_ratio);
         if let Some((id, action)) = self.pending_clip.take() {
             if self.scene.shapes.iter().any(|s| s.id == id) {
                 // Right-clicking one of several selected layers acts on all of them, as Delete or Ctrl+C do.
@@ -3228,11 +3434,13 @@ impl Forma {
                 self.clip_action(action);
             }
         }
-        let play_x = x(self.time);
-        ui.painter().line_segment(
-            [pos2(play_x, rect.top()), pos2(play_x, rect.bottom())],
-            Stroke::new(2.0, color::SUN),
-        );
+        if view.contains(self.time) {
+            let play_x = x(self.time);
+            ui.painter().line_segment(
+                [pos2(play_x, rect.top()), pos2(play_x, rect.bottom())],
+                Stroke::new(2.0, color::SUN),
+            );
+        }
         if ui.input(|i| !i.pointer.any_down()) && self.timeline_drag.take().is_some() {
             // A clip that moved away from the playhead brings the playhead along, as in Electron.
             if let Some(shape) = self
@@ -3254,6 +3462,7 @@ impl Forma {
         line: Rect,
         x: &dyn Fn(f64) -> f32,
         width: f32,
+        view: TimeView,
     ) {
         let bar = |from: f64, to: f64| {
             Rect::from_min_max(
@@ -3262,7 +3471,7 @@ impl Forma {
             )
         };
         let label = |ui: &Ui, text: &str, swatch: Option<Color32>, sub: bool| {
-            let mut at = line.left() + if sub { 18.0 } else { 6.0 };
+            let mut at = line.left() + if sub { 18.0 } else { 38.0 };
             if let Some(fill) = swatch {
                 ui.painter().rect_filled(
                     Rect::from_center_size(pos2(at + 5.0, line.center().y), vec2(10.0, 10.0)),
@@ -3289,38 +3498,69 @@ impl Forma {
         );
         match row {
             Row::Layer { name, clips } => {
-                let first = &self.scene.shapes[clips[0]];
-                label(ui, name, Some(hex(&first.color, 255)), false);
+                let pick = *clips
+                    .iter()
+                    .find(|&&i| self.selected.as_deref() == Some(&self.scene.shapes[i].id))
+                    .or_else(|| {
+                        clips.iter().find(|&&i| {
+                            self.scene.shapes[i].visible(self.time, self.scene.duration)
+                        })
+                    })
+                    .unwrap_or(&clips[0]);
+                let id = self.scene.shapes[pick].id.clone();
+                let open = self.key_editor.expanded.contains(&id);
+                let disclosure = Rect::from_min_size(line.min + vec2(3.0, 0.0), Vec2::splat(32.0));
+                if ui
+                    .put(
+                        disclosure,
+                        egui::Button::selectable(open, if open { "?" } else { "?" }),
+                    )
+                    .on_hover_text(if open {
+                        "Hide property lanes"
+                    } else {
+                        "Show property lanes"
+                    })
+                    .clicked()
+                {
+                    self.key_editor.toggle_layer(&id);
+                    self.select_clip(pick);
+                }
+                let label_rect = Rect::from_min_max(
+                    line.min + vec2(36.0, 0.0),
+                    pos2(line.left() + LABEL_WIDTH - 8.0, line.bottom()),
+                );
+                ui.scope_builder(UiBuilder::new().max_rect(label_rect), |ui| {
+                    ui.set_clip_rect(ui.clip_rect().intersect(label_rect));
+                    label(
+                        ui,
+                        name,
+                        Some(hex(&self.scene.shapes[clips[0]].color, 255)),
+                        false,
+                    );
+                });
                 let head = ui.interact(
-                    Rect::from_min_max(line.min, pos2(x(0.0) - 4.0, line.max.y)),
-                    ui.scope_id().with(("track", &first.id)),
+                    label_rect,
+                    ui.scope_id().with(("track", &id)),
                     Sense::click(),
                 );
                 if head.clicked() {
-                    let pick = clips
-                        .iter()
-                        .find(|&&i| self.selected.as_deref() == Some(&self.scene.shapes[i].id))
-                        .or_else(|| {
-                            clips.iter().find(|&&i| {
-                                self.scene.shapes[i].visible(self.time, self.scene.duration)
-                            })
-                        })
-                        .unwrap_or(&clips[0]);
-                    self.select_clip(*pick);
+                    self.select_clip(pick);
                 }
                 for &index in clips {
-                    self.clip_bar(ui, index, line, x, width);
+                    self.clip_bar(ui, index, line, x, width, view);
                 }
             }
+            Row::Property(..) => {}
             Row::Fade(index) => {
                 let shape = &self.scene.shapes[*index];
                 label(ui, "Fade out", None, true);
                 let d = shape.disappear.as_ref().unwrap();
                 let end = self.scene.reappear_at(shape).min(self.scene.duration);
-                let span = bar(
-                    d.start_time,
-                    end.max(d.start_time + self.scene.duration * 0.015),
-                );
+                let bar_end = end.max(d.start_time + self.scene.duration * 0.015);
+                if !view.includes_span(d.start_time, bar_end) {
+                    return;
+                }
+                let span = bar(d.start_time, bar_end);
                 ui.painter().rect_filled(span, 4.0, Accent::Berry.color());
                 ui.painter().text(
                     span.left_center() + vec2(5.0, 0.0),
@@ -3354,7 +3594,15 @@ impl Forma {
                     )
                     .on_hover_text(tip);
                 edge_cursor(ui, &response, span, false, timed);
-                self.timeline_gesture(ui, &response, *index, span, Part::Fade, width);
+                self.timeline_gesture(
+                    ui,
+                    &response,
+                    *index,
+                    span,
+                    Part::Fade,
+                    width,
+                    (false, view.contains(bar_end)),
+                );
                 if response.clicked() {
                     (self.selected, self.time, self.playing) = (Some(id), start, false);
                 }
@@ -3371,6 +3619,9 @@ impl Forma {
                     None,
                     true,
                 );
+                if !view.includes_span(start, start + length) {
+                    return;
+                }
                 let span = bar(start, start + length);
                 ui.painter().rect_filled(span, 4.0, Accent::Sky.color());
                 ui.painter().text(
@@ -3407,7 +3658,15 @@ impl Forma {
                         start + length
                     ));
                 edge_cursor(ui, &response, span, true, true);
-                self.timeline_gesture(ui, &response, *index, span, Part::Motion(*m), width);
+                self.timeline_gesture(
+                    ui,
+                    &response,
+                    *index,
+                    span,
+                    Part::Motion(*m),
+                    width,
+                    (view.contains(start), view.contains(start + length)),
+                );
                 if response.clicked() || response.drag_started() {
                     self.selected_motion = motion_id;
                 }
@@ -3419,6 +3678,9 @@ impl Forma {
                 let clip = &self.scene.shapes[*index].rotation_clips[*r];
                 let id = self.scene.shapes[*index].id.clone();
                 label(ui, &format!("Spin {}", r + 1), None, true);
+                if !view.includes_span(clip.start_time, clip.start_time + clip.duration) {
+                    return;
+                }
                 let span = bar(clip.start_time, clip.start_time + clip.duration);
                 ui.painter().rect_filled(span, 4.0, Accent::Clay.color());
                 ui.painter().text(
@@ -3443,7 +3705,15 @@ impl Forma {
                     )
                     .on_hover_text(tip);
                 edge_cursor(ui, &response, span, true, true);
-                self.timeline_gesture(ui, &response, *index, span, Part::Spin(*r), width);
+                self.timeline_gesture(
+                    ui,
+                    &response,
+                    *index,
+                    span,
+                    Part::Spin(*r),
+                    width,
+                    (view.contains(start), view.contains(start + clip.duration)),
+                );
                 if response.clicked() {
                     (self.selected, self.time, self.playing) = (Some(id), start, false);
                 }
@@ -3459,6 +3729,7 @@ impl Forma {
         line: Rect,
         x: &dyn Fn(f64) -> f32,
         width: f32,
+        view: TimeView,
     ) {
         let shape = &self.scene.shapes[index];
         let (start, end) = (
@@ -3468,6 +3739,9 @@ impl Forma {
                 .unwrap_or(self.scene.duration)
                 .min(self.scene.duration),
         );
+        if !view.includes_span(start, end) {
+            return;
+        }
         let span = Rect::from_min_max(
             pos2(x(start), line.top() + 3.0),
             pos2(x(end).max(x(start) + 3.0), line.bottom() - 3.0),
@@ -3529,11 +3803,21 @@ impl Forma {
                 egui::CursorIcon::Grab
             });
         }
-        self.timeline_gesture(ui, &response, index, span, Part::Clip, width);
+        self.timeline_gesture(
+            ui,
+            &response,
+            index,
+            span,
+            Part::Clip,
+            width,
+            (view.contains(start), view.contains(end)),
+        );
         if response.clicked() || response.secondary_clicked() {
             self.select_clip(index);
         }
         response.context_menu(|ui| {
+            self.follows_picker(ui, index, true);
+            ui.separator();
             for (label, action, keys) in [
                 ("Next pose after this", ClipAction::Next, ""),
                 (
@@ -3557,100 +3841,23 @@ impl Forma {
                 }
             }
         });
-        // Keyframes inside the clip: click to go to one, right-click to move, ease or delete it.
-        let shape = &self.scene.shapes[index];
-        let keys: Vec<(usize, f64, bool)> = shape
+        let mut times: Vec<_> = self.scene.shapes[index]
             .keys
             .iter()
-            .enumerate()
-            .map(|(i, k)| (i, k.t, k.extra.get("motionId").is_some()))
-            .filter(|(_, t, _)| *t >= start - 1e-6 && *t <= end + 1e-6)
+            .map(|k| k.t)
+            .chain(self.scene.shapes[index].color_keys.iter().map(|k| k.t))
             .collect();
-        for (key, t, of_move) in keys {
-            let at = pos2(x(t), line.center().y);
-            let dot = [
-                vec2(0.0, -5.0),
-                vec2(5.0, 0.0),
-                vec2(0.0, 5.0),
-                vec2(-5.0, 0.0),
-            ]
-            .map(|v| at + v);
-            ui.painter().add(egui::Shape::convex_polygon(
-                dot.to_vec(),
-                Color32::WHITE,
-                Stroke::new(1.0, Mood::Ember.ground()),
-            ));
-            let spot = Rect::from_center_size(at, vec2(11.0, 13.0));
-            let response = ui
-                .interact(
-                    spot,
-                    ui.scope_id().with(("key", &id, key)),
-                    if of_move { Sense::click() } else { Sense::click_and_drag() },
-                )
-                .on_hover_text(if of_move {
-                    format!("{} at {t:.2} seconds, part of a drawn move: drag the move's bar to retime it", self.scene.shapes[index].name)
-                } else {
-                    format!("{} at {t:.2} seconds. Drag to move it in time; right-click to ease or delete it", self.scene.shapes[index].name)
-                });
-            if !of_move {
-                if response.hovered() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
-                if self
-                    .timeline_drag
-                    .as_ref()
-                    .is_some_and(|d| d.index == index && d.part == Part::Key(key))
-                {
-                    ui.painter().text(
-                        at - vec2(0.0, 9.0),
-                        Align2::CENTER_BOTTOM,
-                        format!("{t:.2} s"),
-                        font::ui(10.0),
-                        color::INK,
-                    );
-                }
-                self.timeline_gesture(ui, &response, index, spot, Part::Key(key), width);
+        times.sort_by(f64::total_cmp);
+        times.dedup_by(|a, b| crate::keyframes::same_time(*a, *b));
+        for t in times.into_iter().filter(|t| (start..=end).contains(t)) {
+            let at = pos2(x(t), span.center().y);
+            if at.x <= x(0.0) || at.x >= x(self.scene.duration) {
+                continue;
             }
-            if response.clicked() {
-                (self.selected, self.time, self.playing) = (Some(id.clone()), t, false);
-            }
-            response.context_menu(|ui| self.key_menu(ui, index, key));
-        }
-        let colors: Vec<(usize, f64, String)> = self.scene.shapes[index]
-            .color_keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| (i, k.t, k.color.clone()))
-            .filter(|(_, t, _)| *t >= start - 1e-6 && *t <= end + 1e-6)
-            .collect();
-        for (key, t, fill) in colors {
-            let at = pos2(x(t), line.bottom() - 4.0);
-            ui.painter()
-                .circle(at, 4.0, hex(&fill, 255), Stroke::new(1.0, Color32::WHITE));
-            let response = ui
-                .interact(
-                    Rect::from_center_size(at, vec2(10.0, 10.0)),
-                    ui.scope_id().with(("color", &id, key)),
-                    Sense::click(),
-                )
-                .on_hover_text(format!(
-                    "Color {} at {t:.2} s — right-click to delete",
-                    fill.to_uppercase()
-                ));
-            if response.clicked() {
-                (self.selected, self.time, self.playing) = (Some(id.clone()), t, false);
-            }
-            response.context_menu(|ui| {
-                if ui.button("Delete color keyframe").clicked() {
-                    let shape = &mut self.scene.shapes[index];
-                    let removed = shape.color_keys.remove(key);
-                    // The last color keyframe gone: the layer keeps that color (Electron does the same).
-                    if shape.color_keys.is_empty() {
-                        shape.color = removed.color;
-                    }
-                    ui.close();
-                }
-            });
+            ui.painter().line_segment(
+                [at - vec2(0.0, 3.0), at + vec2(0.0, 3.0)],
+                Stroke::new(1.0, color::INK_SOFT),
+            );
         }
     }
 
@@ -3684,15 +3891,12 @@ impl Forma {
                 if self.clipboard.is_empty() {
                     return;
                 }
-                let ids: Vec<String> = self
+                let ids: Vec<_> = self
                     .clipboard
-                    .clone()
                     .iter()
-                    .map(|copied| {
-                        let index = self.scene.paste_layer(copied, new_id());
-                        self.scene.shapes[index].id.clone()
-                    })
+                    .map(|layer| (layer.id.clone(), new_id()))
                     .collect();
+                let ids = self.scene.paste_layers(&self.clipboard, &ids);
                 self.select_all_of(ids);
                 self.edited();
                 return;
@@ -3720,15 +3924,14 @@ impl Forma {
                         self.notice = Some(format!("{} copied", plural(ids.len(), &first)));
                     }
                     ClipAction::Duplicate => {
-                        let copies: Vec<String> = ids
+                        let ids: Vec<_> = ids.into_iter().map(|id| (id, new_id())).collect();
+                        let copies = self.scene.duplicate_layers(&ids);
+                        if let Some(shape) = self
+                            .scene
+                            .shapes
                             .iter()
-                            .filter_map(|id| {
-                                let index = self.scene.shapes.iter().position(|s| &s.id == id)?;
-                                let copy = self.scene.duplicate_layer(index, new_id());
-                                Some(self.scene.shapes[copy].id.clone())
-                            })
-                            .collect();
-                        if let Some(shape) = self.scene.shapes.iter().find(|s| Some(&s.id) == copies.first()) {
+                            .find(|s| Some(&s.id) == copies.first())
+                        {
                             if !shape.visible(self.time, self.scene.duration) {
                                 self.time = shape.clip_start();
                             }
@@ -3799,6 +4002,7 @@ impl Forma {
 
     /// Selects a clip and brings the playhead into it (Electron's `selectClip`).
     fn select_clip(&mut self, index: usize) {
+        self.key_editor.clear_selection();
         let shape = &self.scene.shapes[index];
         self.selected = Some(shape.id.clone());
         self.playing = false;
@@ -3816,14 +4020,15 @@ impl Forma {
         span: Rect,
         part: Part,
         width: f32,
+        trim: (bool, bool),
     ) {
         if response.drag_started() {
             let origin = ui
                 .input(|i| i.pointer.press_origin())
                 .unwrap_or(span.center());
             let (at_start, at_end) = (
-                (origin.x - span.left()).abs() <= EDGE,
-                (origin.x - span.right()).abs() <= EDGE,
+                trim.0 && (origin.x - span.left()).abs() <= EDGE,
+                trim.1 && (origin.x - span.right()).abs() <= EDGE,
             );
             let part = match part {
                 Part::Clip if at_start => Part::Start,
@@ -3839,6 +4044,7 @@ impl Forma {
                 index,
                 part,
                 origin: origin.x,
+                seconds_per_pixel: self.scene.duration / f64::from(width),
                 shape: self.scene.shapes[index].clone(),
                 duration: self.scene.duration,
             });
@@ -3856,7 +4062,7 @@ impl Forma {
             return;
         };
         let duration = drag.duration;
-        let delta = ((pointer.x - drag.origin) / width) as f64 * duration;
+        let delta = f64::from(pointer.x - drag.origin) * drag.seconds_per_pixel;
         // Snap to the playhead, the scene's ends and other clips' edges within 8 px, else to tenths; Alt is free.
         let mut targets = vec![0.0, self.time, duration];
         for (_, other) in self
@@ -3869,7 +4075,7 @@ impl Forma {
             targets.push(other.clip_start());
             targets.extend(other.out_time);
         }
-        let tolerance = 8.0 / width as f64 * duration;
+        let tolerance = 8.0 * drag.seconds_per_pixel;
         let free = ui.input(|i| i.modifiers.alt);
         let snap = |t: f64| -> (f64, bool) {
             if free {
@@ -3999,111 +4205,8 @@ impl Forma {
                     self.scene.duration = self.scene.duration.max(start + d.duration);
                 }
             }
-            Part::Key(k) => {
-                let Some(key) = drag.shape.keys.get(k) else {
-                    return;
-                };
-                // A keyframe moves between its neighbours: passing one would swap their order (two poses at once).
-                let lo = if k > 0 {
-                    drag.shape.keys[k - 1].t + 0.01
-                } else {
-                    0.0
-                };
-                let hi = drag
-                    .shape
-                    .keys
-                    .get(k + 1)
-                    .map_or(f64::INFINITY, |next| next.t - 0.01);
-                let t = model::hundredths(snap(key.t + delta).0.clamp(lo, hi.max(lo)));
-                self.scene.shapes[index].keys[k].t = t;
-                self.scene.duration = self.scene.duration.max(t);
-            }
         }
         self.edited();
-    }
-
-    /// A keyframe's menu: when it is, how the stretch after it eases, and deleting it (Electron's keyframe menu).
-    fn key_menu(&mut self, ui: &mut Ui, index: usize, key: usize) {
-        let Some(k) = self.scene.shapes[index].keys.get(key) else {
-            return;
-        };
-        let mut t = k.t;
-        ui.horizontal(|ui| {
-            ui.label("At");
-            if ui
-                .add(
-                    egui::DragValue::new(&mut t)
-                        .range(0.0..=3600.0)
-                        .speed(0.01)
-                        .fixed_decimals(2)
-                        .suffix(" s"),
-                )
-                .changed()
-            {
-                let t = model::hundredths(t);
-                let shape = &mut self.scene.shapes[index];
-                // Moving onto another keyframe would make two at one moment: keep this one's place instead.
-                if !shape
-                    .keys
-                    .iter()
-                    .enumerate()
-                    .any(|(i, other)| i != key && (other.t - t).abs() < 0.011)
-                {
-                    shape.keys[key].t = t;
-                    shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
-                    self.scene.duration = self.scene.duration.max(t);
-                    ui.close();
-                }
-            }
-        });
-        let shape = &mut self.scene.shapes[index];
-        let k = &mut shape.keys[key];
-        let mut ease = k.ease.clone().unwrap_or_default();
-        egui::ComboBox::from_label("Easing after it")
-            .selected_text(match ease.as_str() {
-                "" => "Layer's easing",
-                e => EASES
-                    .iter()
-                    .find(|(_, v)| *v == e)
-                    .map_or(e, |(name, _)| name),
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut ease, String::new(), "Layer's easing");
-                for (name, value) in EASES {
-                    ui.selectable_value(&mut ease, value.to_owned(), name);
-                }
-            });
-        if ease != k.ease.clone().unwrap_or_default() {
-            k.ease = (!ease.is_empty()).then_some(ease.clone());
-            if ease == "custom" && k.curve.is_none() {
-                k.curve = Some([0.42, 0.0, 0.58, 1.0]);
-            }
-        }
-        if k.ease.as_deref() == Some("custom") {
-            let curve = k.curve.get_or_insert([0.42, 0.0, 0.58, 1.0]);
-            ui.horizontal(|ui| {
-                ui.label("Curve");
-                for (i, value) in curve.iter_mut().enumerate() {
-                    // Electron's validCurve: the x handles stay between 0 and 1, the y handles within ±5.
-                    let range = if i % 2 == 0 { 0.0..=1.0 } else { -5.0..=5.0 };
-                    ui.add(
-                        egui::DragValue::new(value)
-                            .range(range)
-                            .speed(0.01)
-                            .fixed_decimals(2),
-                    );
-                }
-            });
-        }
-        let only = shape.keys.len() <= 1;
-        if ui
-            .add_enabled(!only, egui::Button::new("Delete keyframe"))
-            .on_disabled_hover_text("A layer keeps at least one keyframe")
-            .clicked()
-        {
-            remove_key(shape, key);
-            ui.close();
-        }
     }
 
     /// Electron Forma's export dialog: what to make, the video's options, and what it will contain.
@@ -4696,15 +4799,28 @@ impl Forma {
                 self.time = (self.time + arrow.x as f64 * step).clamp(0.0, self.scene.duration);
             } else {
                 // Text that follows a layer goes after the layers, so it keeps up with where they went.
-                layers.sort_by_key(|i| {
-                    let shape = &self.scene.shapes[*i];
-                    shape.kind == "text" && shape.extra.contains_key("linkId")
-                });
+                layers.sort_by_key(|i| self.scene.ancestor_depth(*i));
                 let by = arrow * if big { 10.0 } else { 1.0 };
                 self.playing = false;
-                for index in layers {
-                    let pose = self.scene.editable_pose(&self.scene.shapes[index], self.time);
-                    self.scene.set_pose(index, self.time, Pose { x: pose.x + by.x, y: pose.y + by.y, ..pose });
+                let poses: Vec<_> = layers
+                    .into_iter()
+                    .map(|index| {
+                        let pose = self
+                            .scene
+                            .editable_pose(&self.scene.shapes[index], self.time);
+                        (
+                            index,
+                            Pose {
+                                x: pose.x + by.x,
+                                y: pose.y + by.y,
+                                ..pose
+                            },
+                        )
+                    })
+                    .collect();
+                for (index, pose) in poses {
+                    self.scene
+                        .set_property_pose(index, self.time, pose, Property::Position);
                 }
                 self.edited();
             }
@@ -4835,8 +4951,22 @@ impl CanopyApp for Forma {
             } else if redo {
                 self.redo();
             }
-            // Electron's clip shortcuts (ui/clips.js), and Delete.
-            if !ui.ctx().egui_wants_keyboard_input() {
+            let key_shortcut = !ui.ctx().text_edit_focused() && {
+                let (copy, paste, delete) = ui.input(|i| {
+                    let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                        || (i.modifiers.command && i.key_pressed(egui::Key::C));
+                    let paste = !i.modifiers.shift
+                        && (i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+                            || (i.modifiers.command && i.key_pressed(egui::Key::V)));
+                    let delete =
+                        i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace);
+                    (copy, paste, delete)
+                });
+                self.key_editor.begin_frame(&self.scene);
+                self.key_editor
+                    .shortcut(&mut self.scene, self.time, copy, paste, delete)
+            };
+            if !key_shortcut && !ui.ctx().egui_wants_keyboard_input() {
                 if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
                     self.multi_selected = self
                         .scene
@@ -5003,7 +5133,7 @@ impl CanopyApp for Forma {
         self.svg_window(ui);
         if !self.suppress_history && self.scene != before {
             let dragging = ui.input(|i| i.pointer.any_down());
-            if !self.recording_drag || !dragging {
+            if !self.recording_drag {
                 self.undo.push(before);
                 if self.undo.len() > 100 {
                     self.undo.remove(0);

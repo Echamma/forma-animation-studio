@@ -23,62 +23,47 @@ struct Sample {
 pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     let mut defs = String::new();
     let mut layers = String::new();
-    let timing = |samples: &[Sample]| {
-        let times: Vec<String> = samples
-            .iter()
-            .map(|s| fixed(s.t / scene.duration, 6))
-            .collect();
-        format!(
-            r#"dur="{}s" repeatCount="indefinite" calcMode="linear" keyTimes="{}""#,
-            scene.duration,
-            times.join(";")
-        )
-    };
     for shape in &scene.shapes {
-        let p = scene.render_pose(shape, 0.0);
-        let mut group = format!(r#"<g fill="{}""#, attr(&shape.color_at(0.0)));
-        group.push_str(&blur_filter(shape, p, &mut defs));
-        let samples = sample_layer(scene, shape);
-        let timing = timing(&samples);
-        let values = |value: &dyn Fn(&Sample) -> String| {
-            samples.iter().map(value).collect::<Vec<_>>().join(";")
-        };
-        let number = |v: f32| fixed(v as f64, 3);
-        write!(group, r#" transform="translate({} {})">"#, p.x, p.y).unwrap();
-        write!(
-            group,
-            r#"<g transform="rotate({})"><g transform="scale({} {})" opacity="{}">"#,
-            p.r,
-            p.w,
-            p.h,
-            p.o / 100.0
-        )
-        .unwrap();
-        group.push_str(&geometry(shape, place)?);
-        write!(
-            group,
-            r#"<animateTransform attributeName="transform" type="scale" {timing} values="{}"/>"#,
-            values(&|s| format!("{} {}", number(s.pose.w), number(s.pose.h)))
-        )
-        .unwrap();
-        write!(
-            group,
-            r#"<animate attributeName="opacity" {timing} values="{}"/></g>"#,
-            values(&|s| number(s.pose.o / 100.0))
-        )
-        .unwrap();
-        write!(group, r#"<animateTransform attributeName="transform" type="rotate" {timing} values="{}"/></g>"#, values(&|s| number(s.pose.r))).unwrap();
-        write!(group, r#"<animateTransform attributeName="transform" type="translate" {timing} values="{}"/>"#, values(&|s| format!("{} {}", number(s.pose.x), number(s.pose.y)))).unwrap();
-        if !shape.color_keys.is_empty() {
-            write!(
-                group,
-                r#"<animate attributeName="fill" {timing} values="{}"/>"#,
-                attr(&values(&|s| s.color.clone()))
-            )
-            .unwrap();
+        let p = scene.local_pose(shape, 0.0);
+        let mut styling = format!(r#"<g fill="{}""#, attr(&shape.color_at(0.0)));
+        styling.push_str(&blur_filter(shape, p, &mut defs));
+        let mut chain = vec![shape];
+        while let Some(parent) = chain.last().and_then(|s| {
+            s.parent
+                .as_deref()
+                .and_then(|id| scene.shapes.iter().find(|p| p.id == id))
+        }) {
+            if chain.iter().any(|visited| visited.id == parent.id) {
+                return Err(format!("{}: the Follows layers form a loop.", shape.name));
+            }
+            chain.push(parent);
         }
-        group.push_str("</g>");
-        layers.push_str(&group);
+        for layer in &chain {
+            if let Some(target) = link(scene, layer).filter(|target| {
+                target.parent.is_some() || target.parent_space.is_some() || target.anchor.is_some()
+            }) {
+                return Err(format!(
+                    "{}: animated SVG can't export text linked to a transformed layer ({}).",
+                    layer.name, target.name
+                ));
+            }
+        }
+        let geometry = geometry(shape, place)?;
+        let nested = chain.len() > 1 || shape.parent_space.is_some();
+        if !nested {
+            layers.push_str(&animate_group(scene, shape, styling, &geometry, true));
+            continue;
+        }
+        let mut content = animate_group(scene, shape, "<g".into(), &geometry, true);
+        for (i, layer) in chain.iter().enumerate() {
+            if i != 0 {
+                content = animate_group(scene, layer, "<g".into(), &content, false);
+            }
+            if let Some(basis) = layer.parent_space {
+                content = format!(r#"<g transform="{}">{content}</g>"#, svg_matrix(basis));
+            }
+        }
+        write!(layers, "{styling}>{content}</g>").unwrap();
     }
     let (w, h) = (scene.width, scene.height);
     let defs = if defs.is_empty() {
@@ -92,17 +77,116 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     ))
 }
 
+fn animate_group(
+    scene: &Scene,
+    shape: &Shape,
+    mut group: String,
+    content: &str,
+    artwork: bool,
+) -> String {
+    let p = scene.local_pose(shape, 0.0);
+    let samples = sample_layer(scene, shape);
+    let times: Vec<_> = samples
+        .iter()
+        .map(|s| fixed(s.t / scene.duration, 6))
+        .collect();
+    let timing = format!(
+        r#"dur="{}s" repeatCount="indefinite" calcMode="linear" keyTimes="{}""#,
+        scene.duration,
+        times.join(";")
+    );
+    let values =
+        |value: &dyn Fn(&Sample) -> String| samples.iter().map(value).collect::<Vec<_>>().join(";");
+    let number = |v: f32| fixed(v as f64, 3);
+    write!(
+        group,
+        r#" transform="translate({} {})"><g transform="rotate({})"><g transform="scale({} {})""#,
+        p.x, p.y, p.r, p.w, p.h
+    )
+    .unwrap();
+    if artwork {
+        write!(group, r#" opacity="{}""#, p.o / 100.0).unwrap();
+    }
+    group.push('>');
+    if let Some(anchor) = shape.anchor {
+        write!(
+            group,
+            r#"<g transform="translate({} {})">{content}</g>"#,
+            0.5 - anchor.x,
+            0.5 - anchor.y
+        )
+        .unwrap();
+    } else {
+        group.push_str(content);
+    }
+    write!(
+        group,
+        r#"<animateTransform attributeName="transform" type="scale" {timing} values="{}"/>"#,
+        values(&|s| format!("{} {}", number(s.pose.w), number(s.pose.h)))
+    )
+    .unwrap();
+    if artwork {
+        write!(
+            group,
+            r#"<animate attributeName="opacity" {timing} values="{}"/>"#,
+            values(&|s| number(s.pose.o / 100.0))
+        )
+        .unwrap();
+    }
+    group.push_str("</g>");
+    write!(
+        group,
+        r#"<animateTransform attributeName="transform" type="rotate" {timing} values="{}"/></g>"#,
+        values(&|s| number(s.pose.r))
+    )
+    .unwrap();
+    write!(
+        group,
+        r#"<animateTransform attributeName="transform" type="translate" {timing} values="{}"/>"#,
+        values(&|s| format!("{} {}", number(s.pose.x), number(s.pose.y)))
+    )
+    .unwrap();
+    if artwork && !shape.color_keys.is_empty() {
+        write!(
+            group,
+            r#"<animate attributeName="fill" {timing} values="{}"/>"#,
+            attr(&values(&|s| s.color.clone()))
+        )
+        .unwrap();
+    }
+    group.push_str("</g>");
+    group
+}
+
+fn svg_matrix([a, b, c, d, e, f]: [f32; 6]) -> String {
+    format!("matrix({a} {b} {c} {d} {e} {f})")
+}
+
 /// The scene at `t` as a still SVG (Electron's `svgText(false)`): each layer shown then, posed as it is then.
 pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
     let mut defs = String::new();
     let mut layers = String::new();
     for shape in scene.shapes.iter().filter(|s| s.visible(t, scene.duration)) {
-        let p = scene.render_pose(shape, t);
+        let frame = scene.layer_frame(shape, t);
+        let p = frame.pose;
         let mut group = format!(r#"<g fill="{}""#, attr(&shape.color_at(t)));
         group.push_str(&blur_filter(shape, p, &mut defs));
-        write!(group, r#" transform="translate({} {})"><g transform="rotate({})"><g transform="scale({} {})" opacity="{}">"#, p.x, p.y, p.r, p.w, p.h, p.o / 100.0).unwrap();
-        group.push_str(&geometry(shape, place)?);
-        group.push_str("</g></g></g>");
+        if frame.space.is_identity() && shape.anchor.is_none() {
+            write!(group, r#" transform="translate({} {})"><g transform="rotate({})"><g transform="scale({} {})" opacity="{}">"#,
+                p.x, p.y, p.r, p.w, p.h, p.o / 100.0).unwrap();
+            group.push_str(&geometry(shape, place)?);
+            group.push_str("</g></g></g>");
+        } else {
+            let ts = frame.box_transform();
+            let matrix = svg_matrix([ts.sx, ts.ky, ts.kx, ts.sy, ts.tx, ts.ty]);
+            write!(
+                group,
+                r#"><g transform="{matrix}" opacity="{}">{}</g></g>"#,
+                p.o / 100.0,
+                geometry(shape, place)?
+            )
+            .unwrap();
+        }
         layers.push_str(&group);
     }
     let (w, h) = (scene.width, scene.height);
@@ -201,7 +285,7 @@ fn sample_layer(scene: &Scene, shape: &Shape) -> Vec<Sample> {
     let fps = (12000.0 / duration).min(60.0);
     let at = |t: f64| Sample {
         t,
-        pose: scene.render_pose(shape, t),
+        pose: scene.local_pose(shape, t),
         color: shape.color_at(t),
     };
     let mut events = vec![0.0, duration];
@@ -283,24 +367,30 @@ fn curved(shape: &Shape, a: f64, b: f64) -> bool {
     {
         return true;
     }
+    use crate::keyframes::Property;
+
     let mid = (a + b) / 2.0;
-    let before = shape.keys.iter().rposition(|k| k.t <= mid).unwrap_or(0);
-    let after = shape
-        .keys
-        .iter()
-        .position(|k| k.t >= mid)
-        .unwrap_or(shape.keys.len() - 1);
-    let (ka, kb) = (&shape.keys[before], &shape.keys[after]);
-    let moving = before != after
-        && (ka.x != kb.x
-            || ka.y != kb.y
-            || ka.w != kb.w
-            || ka.h != kb.h
-            || ka.r != kb.r
-            || ka.o != kb.o);
-    let kind = ka.ease.as_deref().unwrap_or(&shape.ease);
-    if moving && kind != "linear" && kind != "hold" {
-        return true;
+    let mut opacity_changes = false;
+    for property in Property::ALL {
+        let Some(ka) = shape
+            .keys
+            .iter()
+            .rev()
+            .find(|k| k.sets(property) && k.t <= mid)
+        else {
+            continue;
+        };
+        let Some(kb) = shape.keys.iter().find(|k| k.sets(property) && k.t >= mid) else {
+            continue;
+        };
+        let changing = property.values(Pose::from(ka)) != property.values(Pose::from(kb));
+        let kind = ka.ease.as_deref().unwrap_or(&shape.ease);
+        if changing && kind != "linear" && kind != "hold" {
+            return true;
+        }
+        if property == Property::Opacity {
+            opacity_changes = changing;
+        }
     }
     if shape.rotation_clips.iter().any(|c| {
         c.degrees != 0.0 && c.ease != "linear" && c.start_time < b && c.start_time + c.duration > a
@@ -308,18 +398,21 @@ fn curved(shape: &Shape, a: f64, b: f64) -> bool {
         return true;
     }
     if let Some(d) = &shape.disappear {
-        if d.duration > 0.0
-            && d.start_time < b
-            && d.start_time + d.duration > a
-            && moving
-            && ka.o != kb.o
+        if d.duration > 0.0 && d.start_time < b && d.start_time + d.duration > a && opacity_changes
         {
             return true;
         }
     }
+    let color_ease = shape
+        .color_keys
+        .iter()
+        .rev()
+        .find(|key| key.t <= mid)
+        .and_then(|key| key.ease.as_deref())
+        .unwrap_or(&shape.ease);
     shape.color_at(a + EPSILON) != shape.color_at(b - EPSILON)
-        && shape.ease != "linear"
-        && shape.ease != "hold"
+        && color_ease != "linear"
+        && color_ease != "hold"
 }
 
 fn same(p: &Sample, q: &Sample) -> bool {
@@ -438,6 +531,68 @@ mod tests {
         assert!(svg.contains("Fish &amp; &lt;chips&gt;"));
         assert!(svg.contains(r#"<feGaussianBlur stdDeviation="4"/>"#));
         assert!(crate::svg::parse(&svg).is_ok());
+    }
+
+    #[test]
+    fn exported_hierarchy_keeps_the_anchor_and_uses_the_property_curves() {
+        use crate::keyframes::{Lane, Property};
+        use crate::transform::Anchor;
+
+        let mut scene = Scene::empty("svg-hierarchy".into());
+        scene.add_shape("parent".into(), "rect");
+        scene.add_shape("child".into(), "circle");
+        scene.shapes[0].keys[0].o = 0.0;
+        scene.shapes[1].keys[0].x += 70.0;
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        scene.set_anchor(1, Anchor { x: 0.0, y: 0.0 }, 0.0);
+        scene.shapes[0].keys[0].r = 90.0;
+
+        let child = &mut scene.shapes[1];
+        let lane = Lane::Pose(Property::Rotation);
+        let mut key = child.lane_key(lane, 0.0).unwrap();
+        key.set_easing("hold", None);
+        child.put_lane_key(0.0, key);
+        child.key_property(
+            2.0,
+            Property::Rotation,
+            Pose {
+                r: 90.0,
+                ..child.pose(0.0)
+            },
+        );
+        let jump: Vec<_> = sample_layer(&scene, &scene.shapes[1])
+            .into_iter()
+            .filter_map(|s| (s.t == 2.0).then_some(s.pose.r))
+            .collect();
+        assert_eq!(jump, [0.0, 90.0]);
+
+        let svg = animated(&scene, &place()).unwrap();
+        assert!(svg.contains(r#"transform="translate(0.5 0.5)""#));
+        assert!(svg.contains(r#"transform="matrix("#));
+        let svg = roxmltree::Document::parse(&svg).unwrap();
+        assert_eq!(
+            svg.descendants()
+                .filter(|n| n.attribute("type") == Some("rotate"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            svg.descendants()
+                .filter(|n| n.attribute("attributeName") == Some("opacity"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn animated_svg_names_a_linked_text_layer_it_cannot_export() {
+        let mut scene = Scene::example("linked-svg".into());
+        scene.add_linked_text("title".into(), 0);
+        scene.set_parent(0, Some(1), 0.0).unwrap();
+        let error = animated(&scene, &place()).unwrap_err();
+        assert!(error.contains(&scene.shapes[3].name));
+        assert!(error.contains("text linked to a transformed layer"));
+        assert!(crate::svg::parse(&still(&scene, &place(), 2.0).unwrap()).is_ok());
     }
 
     #[test]

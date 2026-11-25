@@ -1,0 +1,556 @@
+use crate::model::{Pose, Scene, Shape, is_linked};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tiny_skia::{Point, Transform};
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Anchor {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Default for Anchor {
+    fn default() -> Self {
+        Self { x: 0.5, y: 0.5 }
+    }
+}
+
+impl Anchor {
+    fn offset(self, pose: Pose) -> (f32, f32) {
+        ((self.x - 0.5) * pose.w, (self.y - 0.5) * pose.h)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct LayerFrame {
+    pub pose: Pose,
+    /// Maps centered layer pixels to scene pixels, including the anchor and all ancestors.
+    pub transform: Transform,
+    /// Maps the layer's position-key coordinates to scene pixels.
+    pub space: Transform,
+}
+
+impl LayerFrame {
+    pub fn anchor(self) -> (f32, f32) {
+        point(self.space, self.pose.x, self.pose.y)
+    }
+
+    pub fn box_transform(self) -> Transform {
+        Transform::from_scale(self.pose.w, self.pose.h).post_concat(self.transform)
+    }
+}
+
+pub fn point(transform: Transform, x: f32, y: f32) -> (f32, f32) {
+    let mut p = Point::from_xy(x, y);
+    transform.map_point(&mut p);
+    (p.x, p.y)
+}
+
+pub fn vector(transform: Transform, x: f32, y: f32) -> (f32, f32) {
+    (
+        x * transform.sx + y * transform.kx,
+        x * transform.ky + y * transform.sy,
+    )
+}
+
+pub(crate) fn matrix(transform: Transform) -> Option<[f32; 6]> {
+    (!transform.is_identity()).then_some([
+        transform.sx,
+        transform.ky,
+        transform.kx,
+        transform.sy,
+        transform.tx,
+        transform.ty,
+    ])
+}
+
+fn from_matrix([sx, ky, kx, sy, tx, ty]: [f32; 6]) -> Transform {
+    Transform::from_row(sx, ky, kx, sy, tx, ty)
+}
+
+fn centered(pose: Pose) -> Transform {
+    Transform::from_rotate(pose.r).post_translate(pose.x, pose.y)
+}
+
+fn placement(shape: &Shape, pose: Pose) -> Transform {
+    let transform = centered(pose);
+    let (x, y) = shape.anchor.unwrap_or_default().offset(pose);
+    if (x, y) == (0.0, 0.0) {
+        transform
+    } else {
+        Transform::from_translate(-x, -y).post_concat(transform)
+    }
+}
+
+fn link_target(shape: &Shape) -> Option<&str> {
+    is_linked(shape)
+        .then(|| shape.extra.get("linkId")?.as_str())
+        .flatten()
+}
+
+impl Scene {
+    pub fn layer_frame(&self, shape: &Shape, t: f64) -> LayerFrame {
+        self.frame_in_chain(shape, t, &mut Vec::new())
+    }
+
+    fn frame_in_chain<'a>(
+        &'a self,
+        shape: &'a Shape,
+        t: f64,
+        chain: &mut Vec<&'a str>,
+    ) -> LayerFrame {
+        let pose = self.local_pose(shape, t);
+        let own = placement(shape, pose);
+        // Files can be edited outside Forma. Ignore a cyclic edge even if it bypassed the picker.
+        if chain.contains(&shape.id.as_str()) {
+            return LayerFrame {
+                pose,
+                transform: own,
+                space: Transform::identity(),
+            };
+        }
+        chain.push(&shape.id);
+        let mut space = self.parent_in_chain(shape, t, chain);
+        if let Some(target) = link_target(shape).and_then(|id| self.layer(id)) {
+            let frame = self.frame_in_chain(target, t, chain);
+            space = link_effect(target, t, frame).post_concat(space);
+        }
+        chain.pop();
+        let transform = if space.is_identity() {
+            own
+        } else {
+            own.post_concat(space)
+        };
+        LayerFrame {
+            pose,
+            transform,
+            space,
+        }
+    }
+
+    /// A screen-space pose for callers that need an approximate box. Drawing uses the full affine frame.
+    pub fn render_pose(&self, shape: &Shape, t: f64) -> Pose {
+        let frame = self.layer_frame(shape, t);
+        let mut pose = frame.pose;
+        if !frame.space.is_identity() || shape.anchor.is_some() {
+            (pose.x, pose.y) = point(frame.transform, 0.0, 0.0);
+        }
+        if !frame.space.is_identity() {
+            pose.w *= frame.transform.sx.hypot(frame.transform.ky);
+            pose.h *= frame.transform.kx.hypot(frame.transform.sy);
+            let angle = frame.transform.ky.atan2(frame.transform.sx).to_degrees();
+            pose.r += (angle - pose.r + 180.0).rem_euclid(360.0) - 180.0;
+        }
+        pose
+    }
+
+    fn layer(&self, id: &str) -> Option<&Shape> {
+        self.shapes.iter().find(|shape| shape.id == id)
+    }
+
+    fn following_frame<'a>(
+        &'a self,
+        parent: Option<&str>,
+        t: f64,
+        chain: &mut Vec<&'a str>,
+    ) -> Transform {
+        parent
+            .and_then(|id| self.layer(id))
+            .filter(|p| !chain.contains(&p.id.as_str()))
+            .map_or_else(Transform::identity, |p| {
+                self.frame_in_chain(p, t, chain).box_transform()
+            })
+    }
+
+    fn parent_in_chain<'a>(
+        &'a self,
+        shape: &'a Shape,
+        t: f64,
+        chain: &mut Vec<&'a str>,
+    ) -> Transform {
+        let following = self.following_frame(shape.parent.as_deref(), t, chain);
+        shape
+            .parent_space
+            .map_or(following, |basis| from_matrix(basis).post_concat(following))
+    }
+
+    pub(crate) fn parent_space_at(&self, shape: &Shape, t: f64) -> Transform {
+        self.parent_in_chain(shape, t, &mut vec![&shape.id])
+    }
+
+    pub fn can_follow(&self, child: usize, candidate: usize) -> bool {
+        let child = &self.shapes[child].id;
+        let mut pending = vec![self.shapes[candidate].id.as_str()];
+        let mut visited = Vec::new();
+        while let Some(id) = pending.pop() {
+            if id == child {
+                return false;
+            }
+            if visited.contains(&id) {
+                continue;
+            }
+            visited.push(id);
+            if let Some(shape) = self.layer(id) {
+                pending.extend(shape.parent.as_deref());
+                pending.extend(link_target(shape));
+            }
+        }
+        true
+    }
+
+    pub fn ancestor_depth(&self, index: usize) -> usize {
+        let mut seen = vec![self.shapes[index].id.as_str()];
+        let mut shape = &self.shapes[index];
+        loop {
+            let Some(parent) = shape
+                .parent
+                .as_deref()
+                .or_else(|| link_target(shape))
+                .and_then(|id| self.layer(id))
+                .filter(|p| !seen.contains(&p.id.as_str()))
+            else {
+                return seen.len() - 1;
+            };
+            seen.push(&parent.id);
+            shape = parent;
+        }
+    }
+
+    pub(crate) fn unlink_text_space(
+        &self,
+        shape: &Shape,
+        t: f64,
+        space: Transform,
+    ) -> Option<[f32; 6]> {
+        let parent = self.following_frame(shape.parent.as_deref(), t, &mut vec![&shape.id]);
+        parent
+            .invert()
+            .and_then(|inverse| matrix(space.post_concat(inverse)))
+    }
+
+    pub(crate) fn relink_text_space(
+        &self,
+        shape: &Shape,
+        target: &Shape,
+        t: f64,
+        before: Transform,
+    ) -> Option<[f32; 6]> {
+        let effect = link_effect(target, t, self.layer_frame(target, t));
+        let parent = self.following_frame(shape.parent.as_deref(), t, &mut vec![&shape.id]);
+        let basis = effect
+            .invert()?
+            .post_concat(before)
+            .post_concat(parent.invert()?);
+        matrix(basis)
+    }
+
+    pub fn set_parent(
+        &mut self,
+        child: usize,
+        parent: Option<usize>,
+        t: f64,
+    ) -> Result<(), &'static str> {
+        if parent.is_some_and(|i| !self.can_follow(child, i)) {
+            return Err("Following that layer would create a loop.");
+        }
+        let shape = &self.shapes[child];
+        let id = parent.map(|i| self.shapes[i].id.clone());
+        if shape.parent == id {
+            return Ok(());
+        }
+        let old = self.parent_space_at(shape, t);
+        let new = self.following_frame(id.as_deref(), t, &mut vec![&shape.id]);
+        let inverse = new
+            .invert()
+            .filter(Transform::is_finite)
+            .ok_or("The parent is too small at the playhead.")?;
+        // Convert the coordinate space of every key and motion at once. Baking into x/y/angle/size
+        // would lose shear, and rewriting key times would change independently eased channels.
+        let basis = old.post_concat(inverse);
+        self.shapes[child].parent_space = matrix(basis);
+        self.shapes[child].parent = id;
+        Ok(())
+    }
+
+    pub fn set_anchor(&mut self, index: usize, anchor: Anchor, t: f64) {
+        let shape = &self.shapes[index];
+        let old = shape.anchor.unwrap_or_default();
+        if old == anchor || !anchor.x.is_finite() || !anchor.y.is_finite() {
+            return;
+        }
+        let frame = self.layer_frame(shape, t);
+        let (dx, dy) = vector(
+            Transform::from_rotate(frame.pose.r),
+            (anchor.x - old.x) * frame.pose.w,
+            (anchor.y - old.y) * frame.pose.h,
+        );
+        if is_linked(shape) {
+            self.shift_linked_position(index, t, (dx, dy));
+        } else {
+            self.shapes[index].translate_keys(dx, dy);
+        }
+        self.shapes[index].anchor = (anchor != Anchor::default()).then_some(anchor);
+    }
+}
+
+fn link_effect(target: &Shape, t: f64, frame: LayerFrame) -> Transform {
+    if target.anchor.is_none() && frame.space.is_identity() {
+        return Transform::identity();
+    }
+    let mut old = target.pose(t);
+    old.r += target.rotation_at(t) + target.base_rotation;
+    centered(old)
+        .invert()
+        .map_or_else(Transform::identity, |inverse| {
+            inverse.post_concat(frame.transform)
+        })
+}
+
+impl Shape {
+    pub(crate) fn resize_world_space(&mut self, sx: f32, sy: f32) {
+        if let Some(space) = self.parent_space {
+            self.parent_space = matrix(from_matrix(space).post_scale(sx, sy));
+        }
+    }
+
+    pub(crate) fn translate_keys(&mut self, dx: f32, dy: f32) {
+        if let Some(pose) = &mut self.rest_pose {
+            (pose.x, pose.y) = (pose.x + dx, pose.y + dy);
+        }
+        for key in &mut self.keys {
+            (key.x, key.y) = (key.x + dx, key.y + dy);
+        }
+        let nudge = |point: &mut Value| {
+            for (axis, delta) in [("x", dx), ("y", dy)] {
+                if let Some(value) = point.get(axis).and_then(Value::as_f64) {
+                    point[axis] = serde_json::json!(value + f64::from(delta));
+                }
+            }
+        };
+        for motion in self
+            .extra
+            .get_mut("motions")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(start) = motion.get_mut("startPose") {
+                nudge(start);
+            }
+            for key in ["sourcePoints", "baseKeys"] {
+                for p in motion
+                    .get_mut(key)
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    nudge(p);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn resize_about_anchor(
+    pose: Pose,
+    anchor: Anchor,
+    handle: (i8, i8),
+    (dx, dy): (f32, f32),
+    lock_ratio: bool,
+) -> (f32, f32) {
+    let x = if handle.0 == 0 {
+        0.0
+    } else {
+        f32::from(handle.0) / 2.0 + 0.5 - anchor.x
+    };
+    let y = if handle.1 == 0 {
+        0.0
+    } else {
+        f32::from(handle.1) / 2.0 + 0.5 - anchor.y
+    };
+    let (w, h) = (pose.w, pose.h);
+    if lock_ratio {
+        let (a, b) = (x * w, y * h);
+        let length_sq = a * a + b * b;
+        if length_sq <= f32::EPSILON {
+            return (w, h);
+        }
+        let scale = (1.0 + (a * dx + b * dy) / length_sq).clamp(
+            (1.0 / w).max(1.0 / h),
+            (4000.0 / w).min(4000.0 / h).max(1.0),
+        );
+        return (w * scale, h * scale);
+    }
+    let resized = |size: f32, delta: f32, factor: f32| {
+        if factor.abs() < 0.0001 {
+            size
+        } else {
+            (size + delta / factor).clamp(1.0, size.max(4000.0))
+        }
+    };
+    (resized(w, dx, x), resized(h, dy, y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyframes::Property;
+
+    fn assert_near(a: (f32, f32), b: (f32, f32)) {
+        assert!(
+            (a.0 - b.0).abs() < 0.002 && (a.1 - b.1).abs() < 0.002,
+            "{a:?} != {b:?}"
+        );
+    }
+
+    fn scene() -> Scene {
+        let mut scene = Scene::empty("hierarchy".into());
+        for id in ["parent", "child", "grandchild"] {
+            scene.add_shape(id.into(), "rect");
+        }
+        for (i, shape) in scene.shapes.iter_mut().enumerate() {
+            let key = &mut shape.keys[0];
+            (key.x, key.y, key.w, key.h) = (200.0 + 40.0 * i as f32, 200.0, 80.0, 40.0);
+        }
+        scene
+    }
+
+    #[test]
+    fn nested_layers_follow_position_rotation_and_non_uniform_scale_without_inheriting_opacity() {
+        let mut scene = scene();
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        scene.set_parent(2, Some(1), 0.0).unwrap();
+        assert!(scene.set_parent(0, Some(2), 0.0).is_err());
+        let parent = &mut scene.shapes[0];
+        let mut pose = parent.pose(0.0);
+        (pose.x, pose.y, pose.w, pose.h, pose.r, pose.o) = (300.0, 250.0, 160.0, 40.0, 90.0, 0.0);
+        parent.out_time = Some(0.5);
+        parent.edit_pose(2.0, pose);
+        let child = scene.layer_frame(&scene.shapes[1], 2.0);
+        let grandchild = scene.layer_frame(&scene.shapes[2], 2.0);
+        assert_near(child.anchor(), (300.0, 330.0));
+        assert_near(grandchild.anchor(), (300.0, 410.0));
+        assert_near(point(grandchild.transform, 40.0, 20.0), (280.0, 490.0));
+        assert_eq!((child.pose.o, grandchild.pose.o), (100.0, 100.0));
+    }
+
+    #[test]
+    fn reparenting_clearing_and_deletion_preserve_all_corners_at_the_playhead() {
+        let mut scene = scene();
+        scene.shapes[1].keys[0].r = 35.0;
+        scene.shapes[0].keys[0].w = 160.0;
+        scene.shapes[0].keys[0].r = 76.0;
+        let corner = |scene: &Scene, index| {
+            point(
+                scene.layer_frame(&scene.shapes[index], 1.0).transform,
+                40.0,
+                -20.0,
+            )
+        };
+        let original = corner(&scene, 1);
+        scene.set_parent(1, Some(0), 1.0).unwrap();
+        assert_near(corner(&scene, 1), original);
+        scene.set_parent(1, None, 1.0).unwrap();
+        assert_near(corner(&scene, 1), original);
+        scene.set_parent(1, Some(0), 1.0).unwrap();
+        let parent = &mut scene.shapes[0];
+        parent.keys[0].w = 322.0;
+        parent.keys[0].r = -22.0;
+        let seen = corner(&scene, 1);
+        assert_eq!(scene.delete_layers(&["parent".into()], 1.0), 1);
+        assert!(scene.shapes[0].parent.is_none());
+        assert_near(corner(&scene, 0), seen);
+    }
+
+    #[test]
+    fn rotating_and_resizing_around_a_corner_keeps_that_corner_fixed() {
+        let mut scene = scene();
+        let corner = |scene: &Scene, t| {
+            let f = scene.layer_frame(&scene.shapes[0], t);
+            point(f.transform, -f.pose.w / 2.0, -f.pose.h / 2.0)
+        };
+        let first = corner(&scene, 0.0);
+        scene.set_anchor(0, Anchor { x: 0.0, y: 0.0 }, 0.0);
+        assert_near(corner(&scene, 0.0), first);
+        let shape = &mut scene.shapes[0];
+        let pose = shape.pose(0.0);
+        shape.key_property(2.0, Property::Rotation, Pose { r: 90.0, ..pose });
+        shape.key_property(
+            2.0,
+            Property::Size,
+            Pose {
+                w: 100.0,
+                h: 50.0,
+                ..pose
+            },
+        );
+        assert_near(corner(&scene, 2.0), first);
+        let at = scene.layer_frame(&scene.shapes[0], 2.0);
+        assert_near(point(at.transform, 50.0, -25.0), (first.0, first.1 + 100.0));
+        scene.set_anchor(0, Anchor::default(), 2.0);
+        assert_near(corner(&scene, 2.0), first);
+    }
+
+    #[test]
+    fn duplicates_follow_the_duplicated_parent_when_it_is_in_the_group() {
+        let mut scene = scene();
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        scene.duplicate_layer(1, "lone-copy".into());
+        assert_eq!(
+            scene.layer("lone-copy").unwrap().parent.as_deref(),
+            Some("parent")
+        );
+        scene.duplicate_layers(&[
+            ("parent".into(), "new-parent".into()),
+            ("child".into(), "new-child".into()),
+        ]);
+        let child = scene.layer("new-child").unwrap();
+        assert_eq!(child.parent.as_deref(), Some("new-parent"));
+        assert_near(scene.layer_frame(child, 0.0).anchor(), (260.0, 220.0));
+    }
+
+    #[test]
+    fn legacy_linked_text_tracks_its_layers_keyed_and_parented_movement() {
+        let mut scene = scene();
+        scene.add_linked_text("caption".into(), 1);
+        let text = scene.shapes[3].clone();
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        assert!(scene.set_parent(0, Some(3), 0.0).is_err());
+        scene.shapes[0].keys[0].x += 100.0;
+        let p = scene.shapes[1].pose(0.0);
+        scene.shapes[1].key_property(2.0, Property::Position, Pose { x: p.x + 40.0, ..p });
+        assert_near(scene.layer_frame(&text, 2.0).anchor(), (380.0, 138.0));
+        assert_eq!(scene.shapes[3], text);
+    }
+
+    #[test]
+    fn linked_text_can_key_an_offset_without_changing_its_link() {
+        let mut scene = scene();
+        scene.add_linked_text("caption".into(), 1);
+        let initial = scene.render_pose(&scene.shapes[3], 0.0);
+        let pose = scene.editable_pose(&scene.shapes[3], 2.0);
+        scene.set_property_pose(
+            3,
+            2.0,
+            Pose {
+                x: pose.x + 30.0,
+                ..pose
+            },
+            Property::Position,
+        );
+        assert_eq!(scene.render_pose(&scene.shapes[3], 0.0), initial);
+        assert_eq!(scene.render_pose(&scene.shapes[3], 1.0).x, initial.x + 15.0);
+        assert_eq!(scene.render_pose(&scene.shapes[3], 2.0).x, initial.x + 30.0);
+        assert_eq!(scene.shapes[3].extra["linkId"], "child");
+        assert_eq!(
+            scene.shapes[3]
+                .keys
+                .iter()
+                .filter(|k| !k.linked_space)
+                .count(),
+            1
+        );
+        scene.shapes[1].keys[0].x += 20.0;
+        assert_eq!(scene.render_pose(&scene.shapes[3], 2.0).x, initial.x + 50.0);
+    }
+}
