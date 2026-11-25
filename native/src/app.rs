@@ -131,6 +131,36 @@ enum Part {
 /// How close (px) to a bar's end a drag grabs the edge instead of the bar.
 const EDGE: f32 = 6.0;
 
+const ANCHOR_GLYPHS: [[&str; 3]; 3] = [
+    ["\u{2196}", "\u{2191}", "\u{2197}"],
+    ["\u{2190}", "\u{2022}", "\u{2192}"],
+    ["\u{2199}", "\u{2193}", "\u{2198}"],
+];
+const DISCLOSURE_OPEN: &str = "\u{25be}";
+const DISCLOSURE_CLOSED: &str = "\u{25b8}";
+
+fn control_symbol(glyph: &str) -> egui::RichText {
+    // egui ships these symbols in Hack, its monospace face.
+    egui::RichText::new(glyph).monospace().size(14.0)
+}
+
+fn disclosure_symbol(open: bool) -> egui::RichText {
+    control_symbol(if open { DISCLOSURE_OPEN } else { DISCLOSURE_CLOSED })
+}
+
+fn rail_button(ui: &mut Ui, label: &str, active: bool, enabled: bool) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding.x = 4.0;
+        ui.add_enabled(
+            enabled,
+            egui::Button::selectable(active, egui::RichText::new(label).font(font::ui(12.0)))
+                .min_size(vec2(38.0, 40.0))
+                .wrap_mode(egui::TextWrapMode::Extend),
+        )
+    })
+    .inner
+}
+
 /// The pointer over a timeline bar: a resize arrow on an end that can be dragged, else a hand.
 fn edge_cursor(ui: &Ui, response: &egui::Response, span: Rect, start: bool, end: bool) {
     if let Some(p) = response.hover_pos() {
@@ -782,9 +812,14 @@ impl Forma {
             if icon_button(ui, Icon::Image, "Add pictures, SVG artwork, or video", false).clicked() {
                 self.pick_media();
             }
-            if ui.add(egui::Button::selectable(self.vector_tools.tool == Some(VectorTool::Pen), "Pen").min_size(vec2(38.0, 40.0)))
-                .on_hover_text("Draw an editable path")
-                .clicked()
+            if rail_button(
+                ui,
+                "Pen",
+                self.vector_tools.tool == Some(VectorTool::Pen),
+                true,
+            )
+            .on_hover_text("Draw an editable path")
+            .clicked()
             {
                 self.camera_tool = false;
                 self.vector_tools.toggle(VectorTool::Pen, None);
@@ -796,11 +831,7 @@ impl Forma {
             }
             self.mask_editor.sync(self.selected.as_deref());
             let masking = self.mask_editor.active();
-            if ui
-                .add_enabled(
-                    self.selected.is_some(),
-                    egui::Button::selectable(masking, "Mask").min_size(vec2(38.0, 40.0)),
-                )
+            if rail_button(ui, "Mask", masking, self.selected.is_some())
                 .on_hover_text("Draw and edit masks on the selected layer")
                 .clicked()
             {
@@ -1194,7 +1225,7 @@ impl Forma {
                 ui.add(
                     egui::DragValue::new(&mut settings.shutter_angle)
                         .range(0.0..=720.0)
-                        .suffix("?"),
+                        .suffix("\u{00b0}"),
                 );
                 ui.label("Samples");
                 ui.add(egui::DragValue::new(&mut settings.samples).range(2..=32));
@@ -1958,7 +1989,7 @@ impl Forma {
                             x: x as f32 / 2.0,
                             y: y as f32 / 2.0,
                         };
-                        let glyph = [["?", "?", "?"], ["?", "?", "?"], ["?", "?", "?"]][y][x];
+                        let glyph = control_symbol(ANCHOR_GLYPHS[y][x]);
                         if ui
                             .add_sized(
                                 [32.0, 32.0],
@@ -3071,12 +3102,12 @@ impl Forma {
                 let playing = if self.playing { " · Playing" } else { "" };
                 // A narrow canvas (a split pane) keeps just the size, so the zoom buttons still fit beside it.
                 let label = if bar.width() < 330.0 {
-                    format!("{w} × {h}")
+                    format!("{w} \u{00d7} {h}")
                 } else {
-                    format!("{shape} · {w} × {h}{playing}")
+                    format!("{shape} \u{00b7} {w} \u{00d7} {h}{playing}")
                 };
                 let size = ui
-                    .button(label)
+                    .add(egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend))
                     .on_hover_text("Canvas size, length, and background");
                 let mut background = size.rect;
                 if self.scene.shapes.iter().any(Shape::is_3d) || self.camera_tool {
@@ -3113,7 +3144,11 @@ impl Forma {
                         self.zoom_by(1.25, viewport.center(), viewport);
                     }
                     if ui
-                        .small_button(format!("{:.0}%", self.zoom * 100.0))
+                        .add(
+                            egui::Button::new(format!("{:.0}%", self.zoom * 100.0))
+                                .small()
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        )
                         .on_hover_text("Reset zoom and position (Ctrl+0)")
                         .clicked()
                     {
@@ -4299,6 +4334,7 @@ impl Forma {
                 .id_salt("forma-timeline")
                 .auto_shrink(false)
                 .show(ui, |ui| {
+                    // Each row advances the cursor once. Its controls use absolute positions.
                     for row in &rows {
                         if let Row::Property(index, lane) = *row {
                             let id = self.scene.shapes[index].id.clone();
@@ -4411,17 +4447,17 @@ impl Forma {
                 pos2(x(to).max(x(from) + 3.0), line.bottom() - 3.0),
             )
         };
-        let label = |ui: &Ui, text: &str, swatch: Option<Color32>, sub: bool| {
+        let label = |painter: &egui::Painter, text: &str, swatch: Option<Color32>, sub: bool| {
             let mut at = line.left() + if sub { 18.0 } else { 38.0 };
             if let Some(fill) = swatch {
-                ui.painter().rect_filled(
+                painter.rect_filled(
                     Rect::from_center_size(pos2(at + 5.0, line.center().y), vec2(10.0, 10.0)),
                     2.0,
                     fill,
                 );
                 at += 15.0;
             }
-            ui.painter().text(
+            painter.text(
                 pos2(at, line.center().y),
                 Align2::LEFT_CENTER,
                 text,
@@ -4439,6 +4475,9 @@ impl Forma {
         );
         match row {
             Row::Layer { name, clips } => {
+                let Some(&first) = clips.first() else {
+                    return;
+                };
                 let pick = *clips
                     .iter()
                     .find(|&&i| self.selected.as_deref() == Some(&self.scene.shapes[i].id))
@@ -4447,14 +4486,14 @@ impl Forma {
                             self.scene.shapes[i].visible(self.time, self.scene.duration)
                         })
                     })
-                    .unwrap_or(&clips[0]);
+                    .unwrap_or(&first);
                 let id = self.scene.shapes[pick].id.clone();
                 let open = self.key_editor.expanded.contains(&id);
                 let disclosure = Rect::from_min_size(line.min + vec2(3.0, 0.0), Vec2::splat(32.0));
                 if ui
-                    .put(
+                    .place(
                         disclosure,
-                        egui::Button::selectable(open, if open { "?" } else { "?" }),
+                        egui::Button::selectable(open, disclosure_symbol(open)),
                     )
                     .on_hover_text(if open {
                         "Hide property lanes"
@@ -4470,15 +4509,12 @@ impl Forma {
                     line.min + vec2(36.0, 0.0),
                     pos2(line.left() + LABEL_WIDTH - 8.0, line.bottom()),
                 );
-                ui.scope_builder(UiBuilder::new().max_rect(label_rect), |ui| {
-                    ui.set_clip_rect(ui.clip_rect().intersect(label_rect));
-                    label(
-                        ui,
-                        name,
-                        Some(hex(&self.scene.shapes[clips[0]].color, 255)),
-                        false,
-                    );
-                });
+                label(
+                    &ui.painter().with_clip_rect(label_rect),
+                    name,
+                    Some(hex(&self.scene.shapes[first].color, 255)),
+                    false,
+                );
                 let head = ui.interact(
                     label_rect,
                     ui.scope_id().with(("track", &id)),
@@ -4507,12 +4543,14 @@ impl Forma {
                 let id = shape.id.clone();
                 let open = self.key_editor.animator_expanded(&id, *animator);
                 let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(140.0, 32.0));
-                let arrow = if open { "\u{25be}" } else { "\u{25b8}" };
                 if ui
-                    .put(
+                    .place(
                         label,
-                        egui::Button::selectable(open, format!("{arrow}  {}", animation.name))
-                            .truncate(),
+                        egui::Button::selectable(
+                            open,
+                            (disclosure_symbol(open), animation.name.as_str()),
+                        )
+                        .truncate(),
                     )
                     .on_hover_text(format!("Show or hide lanes for {}", animation.name))
                     .clicked()
@@ -4529,11 +4567,10 @@ impl Forma {
                 let id = shape.id.clone();
                 let open = self.key_editor.effects_expanded(&id);
                 let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(140.0, 32.0));
-                let arrow = if open { "?" } else { "?" };
                 if ui
-                    .put(
+                    .place(
                         label,
-                        egui::Button::selectable(open, format!("{arrow}  Effects")),
+                        egui::Button::selectable(open, (disclosure_symbol(open), "Effects")),
                     )
                     .on_hover_text("Show or hide effect parameter lanes")
                     .clicked()
@@ -4547,11 +4584,13 @@ impl Forma {
                 let id = self.scene.shapes[*index].id.clone();
                 let open = self.key_editor.mask_expanded(&id, *mask);
                 let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(140.0, 32.0));
-                let arrow = if open { "▾" } else { "▸" };
                 if ui
-                    .put(
+                    .place(
                         label,
-                        egui::Button::selectable(open, format!("{arrow}  Mask {number}")),
+                        egui::Button::selectable(
+                            open,
+                            (disclosure_symbol(open), format!("Mask {number}")),
+                        ),
                     )
                     .on_hover_text("Show or hide this mask's animation lanes")
                     .clicked()
@@ -4563,8 +4602,10 @@ impl Forma {
             }
             Row::Fade(index) => {
                 let shape = &self.scene.shapes[*index];
-                label(ui, "Fade out", None, true);
-                let d = shape.disappear.as_ref().unwrap();
+                let Some(d) = &shape.disappear else {
+                    return;
+                };
+                label(ui.painter(), "Fade out", None, true);
                 let end = self.scene.reappear_at(shape).min(self.scene.duration);
                 let bar_end = end.max(d.start_time + self.scene.duration * 0.015);
                 if !view.includes_span(d.start_time, bar_end) {
@@ -4624,7 +4665,7 @@ impl Forma {
                 };
                 let path = motion.get("type").and_then(|t| t.as_str()) == Some("path");
                 label(
-                    ui,
+                    ui.painter(),
                     &format!("{} {}", if path { "Path" } else { "Move" }, m + 1),
                     None,
                     true,
@@ -4687,7 +4728,7 @@ impl Forma {
             Row::Spin(index, r) => {
                 let clip = &self.scene.shapes[*index].rotation_clips[*r];
                 let id = self.scene.shapes[*index].id.clone();
-                label(ui, &format!("Spin {}", r + 1), None, true);
+                label(ui.painter(), &format!("Spin {}", r + 1), None, true);
                 if !view.includes_span(clip.start_time, clip.start_time + clip.duration) {
                     return;
                 }
@@ -6464,15 +6505,137 @@ fn hex(value: &str, alpha: u8) -> Color32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn project_edit_invalidates_cached_playback_frames() {
+    fn test_forma() -> Forma {
         let root = std::env::temp_dir().join(format!("forma-preview-{}", new_id()));
-        let mut forma = Forma::new(Place {
+        Forma::new(Place {
             space: None,
             projects_dir: root.clone(),
             data_dir: root.clone(),
             exports_dir: root,
+        })
+    }
+
+    fn layout_at_default_width(height: f32, layout: impl FnMut(&mut Ui)) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        canopy_ui::install(&ctx);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1456.0, height))),
+                ..Default::default()
+            },
+            layout,
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    #[test]
+    fn timeline_rows_stay_separate_with_one_expanded_layer() {
+        let mut forma = test_forma();
+        forma.scene.add_layer("rect".into(), "rect");
+        forma.scene.add_text("text".into());
+        forma.scene.add_layer("circle".into(), "circle");
+        forma.key_editor.toggle_layer("text");
+        let text = &mut forma.scene.shapes[1];
+        text.text_layout
+            .as_mut()
+            .unwrap()
+            .add(crate::text_animator::Animator::default());
+        text.effects.push(crate::effects::Effect::new(
+            1,
+            crate::effects::Kind::GaussianBlur,
+        ));
+        text.masks.push(crate::compositing::LayerMask {
+            id: 1,
+            shape: crate::compositing::MaskShape::Rectangle,
+            mode: crate::compositing::MaskMode::Add,
+            inverted: false,
+            reference_size: [100.0, 100.0],
+            rest: crate::compositing::MaskPose::new([0.0, 0.0], [100.0, 100.0]),
+            keys: Vec::new(),
         });
+
+        let output = layout_at_default_width(900.0, |ui| forma.timeline(ui, None));
+        // Each row paints a wide veil behind the clip, keys or subgroup. Its vertical inset is 3 px.
+        let rows: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|painted| match &painted.shape {
+                egui::Shape::Rect(rect) if rect.fill == color::VEIL && rect.rect.width() > 1000.0 => {
+                    Some(rect.rect.expand2(vec2(0.0, 3.0)))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), forma.rows().len());
+        assert!(rows.iter().all(|row| row.height() >= 32.0));
+        for pair in rows.windows(2) {
+            assert!(
+                pair[1].top() >= pair[0].bottom(),
+                "Overlapping rows: {pair:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tool_rail_and_canvas_numbers_fit_on_one_line() {
+        let mut forma = test_forma();
+        forma.selected = Some(forma.scene.add_layer("rect".into(), "rect"));
+        forma.zoom = 0.9;
+        let rail = Rect::from_min_size(Pos2::ZERO, vec2(46.0, 600.0));
+        let canvas = Rect::from_min_size(pos2(270.0, 0.0), vec2(922.0, 600.0));
+        let output = layout_at_default_width(920.0, |ui| {
+            let mut tools = ui.new_child(UiBuilder::new().max_rect(rail.shrink2(vec2(4.0, 8.0))));
+            forma.rail(&mut tools);
+            forma.canvas_bar(ui, canvas);
+        });
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|painted| match &painted.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        let size = format!(
+            "Landscape \u{00b7} {} \u{00d7} {}",
+            forma.scene.width, forma.scene.height
+        );
+        for (label, bounds) in [
+            ("Pen", rail),
+            ("Mask", rail),
+            (size.as_str(), canvas),
+            ("90%", canvas),
+        ] {
+            let found = text
+                .iter()
+                .find(|shape| shape.galley.text() == label)
+                .unwrap_or_else(|| panic!("Missing {label:?}"));
+            assert_eq!(found.galley.rows.len(), 1, "{label:?} wrapped");
+            assert!(bounds.contains_rect(found.galley.rect.translate(found.pos.to_vec2())));
+        }
+    }
+
+    #[test]
+    fn bundled_ui_fonts_cover_anchor_disclosure_and_shutter_symbols() {
+        layout_at_default_width(900.0, |ui| {
+            ui.fonts_mut(|fonts| {
+                let symbols = egui::FontId::monospace(14.0);
+                for glyph in ANCHOR_GLYPHS
+                    .into_iter()
+                    .flatten()
+                    .chain([DISCLOSURE_OPEN, DISCLOSURE_CLOSED])
+                {
+                    assert!(fonts.has_glyphs(&symbols, glyph), "Missing {glyph:?}");
+                }
+                assert!(fonts.has_glyph(&font::ui(14.0), '\u{00b0}'));
+            });
+        });
+    }
+
+    #[test]
+    fn project_edit_invalidates_cached_playback_frames() {
+        let mut forma = test_forma();
         let key = (0.0, ((0.0, 0.0), 1.0, (2, 2)), true);
         let pixels = std::sync::Arc::new(tiny_skia::Pixmap::new(2, 2).unwrap());
         forma

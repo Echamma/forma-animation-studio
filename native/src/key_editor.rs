@@ -396,7 +396,7 @@ impl KeyEditor {
         let toggle = Rect::from_min_size(add.right_top() + vec2(2.0, 0.0), vec2(32.0, 32.0));
         let has_expression = scene.shapes[index].expression(lane).is_some();
         if ui
-            .put(
+            .place(
                 toggle,
                 egui::Button::selectable(has_expression || expression_line.is_some(), "="),
             )
@@ -419,7 +419,7 @@ impl KeyEditor {
             _ => lane.label().to_owned(),
         };
         let label_response = ui
-            .put(label, egui::Button::selectable(active, &title).truncate())
+            .place(label, egui::Button::selectable(active, &title).truncate())
             .on_hover_text(format!(
                 "{title}. Select for the graph. Shift or Ctrl selects several lanes."
             ));
@@ -431,11 +431,16 @@ impl KeyEditor {
         let on_key = scene.shapes[index]
             .lane_key(lane, hundredths(*playhead))
             .is_some();
+        let key_button = egui::Button::selectable(
+            on_key,
+            egui::RichText::new(if on_key { "On key" } else { "Add" }).font(font::ui(12.0)),
+        )
+        .wrap_mode(egui::TextWrapMode::Extend);
         if ui
-            .put(
-                add,
-                egui::Button::selectable(on_key, if on_key { "On key" } else { "Add" }),
-            )
+            .place(add, |ui: &mut Ui| {
+                ui.spacing_mut().button_padding.x = 4.0;
+                ui.add(key_button)
+            })
             .on_hover_text(if on_key {
                 "Select the key at the playhead"
             } else {
@@ -552,67 +557,64 @@ impl KeyEditor {
         let mut changed = false;
         let mut link = None;
         let pane = Rect::from_min_max(line.min + vec2(14.0, 2.0), line.max - vec2(10.0, 0.0));
-        ui.scope_builder(
+        let mut editor = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(pane)
                 .id_salt(("expression", track)),
-            |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().interact_size.y = 32.0;
-                    let width = (ui.available_width() - 152.0).max(64.0);
-                    let field = egui::TextEdit::singleline(&mut source)
-                        .hint_text("Expression")
-                        .desired_width(width)
-                        .char_limit(1024)
-                        .show(ui);
-                    changed = field.response.changed();
-                    egui::Response::clone(&field.response).on_hover_text(
-                    "Use time, value or index. Try value + sin(time), or link to another property.",
-                );
-                    ui.menu_button("Link to…", |ui| {
-                        link = expression_links(ui, scene, track);
-                    });
-                    if ui.button("Clear").clicked() {
-                        source.clear();
-                        changed = true;
-                    }
-                    if let Some(link) = link {
-                        let (start, end) =
-                            field
-                                .cursor_range
-                                .map_or((source.len(), source.len()), |range| {
-                                    let [start, end] = range.sorted_cursors();
-                                    let byte = |i| {
-                                        source
-                                            .char_indices()
-                                            .nth(i)
-                                            .map_or(source.len(), |(byte, _)| byte)
-                                    };
-                                    (byte(start.index.into()), byte(end.index.into()))
-                                });
-                        if source.len() - (end - start) + link.len() <= 1024 {
-                            source.replace_range(start..end, &link);
-                            changed = true;
-                        }
-                    }
-                });
-                if changed {
-                    let source = (!source.trim().is_empty()).then_some(source);
-                    if let Some(shape) = track_shape_mut(scene, track) {
-                        shape.set_expression(track.lane, source);
-                    }
-                }
-                if scene.shapes[index].expression(track.lane).is_some()
-                    && let Err(error) = crate::expressions::evaluate(scene, index, track.lane, time)
-                {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(error.clone()).color(color::SUN))
-                            .truncate(),
-                    )
-                    .on_hover_text(error);
-                }
-            },
         );
+        editor.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 32.0;
+            let width = (ui.available_width() - 152.0).max(64.0);
+            let field = egui::TextEdit::singleline(&mut source)
+                .hint_text("Expression")
+                .desired_width(width)
+                .char_limit(1024)
+                .show(ui);
+            changed = field.response.changed();
+            egui::Response::clone(&field.response).on_hover_text(
+                "Use time, value or index. Try value + sin(time), or link to another property.",
+            );
+            ui.menu_button("Link to\u{2026}", |ui| {
+                link = expression_links(ui, scene, track);
+            });
+            if ui.button("Clear").clicked() {
+                source.clear();
+                changed = true;
+            }
+            if let Some(link) = link {
+                let (start, end) = field
+                    .cursor_range
+                    .map_or((source.len(), source.len()), |range| {
+                        let [start, end] = range.sorted_cursors();
+                        let byte = |i| {
+                            source
+                                .char_indices()
+                                .nth(i)
+                                .map_or(source.len(), |(byte, _)| byte)
+                        };
+                        (byte(start.index.into()), byte(end.index.into()))
+                    });
+                if source.len() - (end - start) + link.len() <= 1024 {
+                    source.replace_range(start..end, &link);
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            let source = (!source.trim().is_empty()).then_some(source);
+            if let Some(shape) = track_shape_mut(scene, track) {
+                shape.set_expression(track.lane, source);
+            }
+        }
+        if scene.shapes[index].expression(track.lane).is_some()
+            && let Err(error) = crate::expressions::evaluate(scene, index, track.lane, time)
+        {
+            editor
+                .add(
+                    egui::Label::new(egui::RichText::new(error.clone()).color(color::SUN)).truncate(),
+                )
+                .on_hover_text(error);
+        }
     }
 
     fn graph_channels(&mut self, ui: &mut Ui, track: &Track, line: Rect) -> usize {
@@ -622,7 +624,7 @@ impl KeyEditor {
             let text = egui::RichText::new(label).color(channel_color(i));
             let button = egui::Button::selectable(*channel == i, text);
             if ui
-                .put(Rect::from_min_size(at, vec2(100.0, 32.0)), button)
+                .place(Rect::from_min_size(at, vec2(100.0, 32.0)), button.truncate())
                 .on_hover_text("Choose this value where graph points overlap")
                 .clicked()
             {
@@ -1470,6 +1472,45 @@ fn easing_label(kind: &str) -> &'static str {
 mod tests {
     use super::*;
     use egui::{Context, Event, Modifiers, PointerButton, RawInput};
+
+    #[test]
+    fn graph_and_expression_controls_leave_the_next_row_below_the_lane() {
+        let ctx = Context::default();
+        canopy_ui::install(&ctx);
+        let mut scene = Scene::empty("graph-and-expression".into());
+        let layer = scene.add_shape("rect".into(), "rect");
+        let lane = Lane::Pose(Property::Position);
+        let track = Track { layer, lane };
+        let mut editor = KeyEditor {
+            graph: true,
+            graph_tracks: HashSet::from([track.clone()]),
+            expression_open: HashSet::from([track.clone()]),
+            ..Default::default()
+        };
+        scene.shapes[0].set_expression(lane, Some("sin(".into()));
+        let view = TimeView {
+            start: 0.0,
+            span: scene.duration,
+        };
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 500.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let height = editor.row_height(&track.layer, lane);
+                let (line, _) = ui.allocate_exact_size(vec2(800.0, height), Sense::hover());
+                let next_top = ui.next_widget_position().y;
+                let (mut time, mut playing) = (0.0, false);
+                editor.row(ui, &mut scene, 0, lane, line, view, &mut time, &mut playing);
+                let (next, _) = ui.allocate_exact_size(vec2(800.0, 32.0), Sense::hover());
+                assert_eq!(next.top(), next_top);
+                assert!(next.top() >= line.bottom());
+            },
+        )
+        .textures_delta
+        .clear();
+    }
 
     #[test]
     fn key_drag_survives_layer_list_changes_and_stops_when_its_source_is_deleted() {
