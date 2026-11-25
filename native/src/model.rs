@@ -29,6 +29,10 @@ pub struct Scene {
     pub motion_blur: Option<crate::motion_blur::Settings>,
     #[serde(default)]
     pub motion_blur_preview: bool,
+    #[serde(default)]
+    pub compositions: Vec<Scene>,
+    #[serde(default)]
+    pub transparent_background: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -80,6 +84,10 @@ pub struct Shape {
     pub effects: Vec<crate::effects::Effect>,
     #[serde(default, skip_serializing_if = "crate::effects::is_false")]
     pub motion_blur: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<crate::composition::Playback>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub template_fields: Vec<crate::template::Field>,
     #[serde(flatten, serialize_with = "serialize_shape_extra")]
     pub extra: Map<String, Value>,
 }
@@ -111,6 +119,12 @@ impl Serialize for Scene {
         if self.motion_blur_preview {
             map.serialize_entry("motionBlurPreview", &true)?;
         }
+        if !self.compositions.is_empty() {
+            map.serialize_entry("compositions", &self.compositions)?;
+        }
+        if self.transparent_background {
+            map.serialize_entry("transparentBackground", &true)?;
+        }
         for (name, value) in &self.extra {
             map.serialize_entry(name, value)?;
         }
@@ -130,7 +144,7 @@ impl Serialize for ShapeForSave<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let Self(shape, duration) = *self;
         let path_fallback;
-        let layer = if matches!(shape.kind.as_str(), "path" | "adjustment") {
+        let layer = if matches!(shape.kind.as_str(), "path" | "adjustment" | "composition") {
             let mut fallback = shape.clone();
             fallback.kind = "svg".into();
             fallback.extra.insert("svgSource".into(), PATH_FALLBACK.into());
@@ -170,6 +184,11 @@ impl<'de> Deserialize<'de> for Shape {
             && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
         {
             shape.kind = "path".into();
+            shape.extra.remove("svgSource");
+        } else if shape.kind == "svg" && shape.composition.is_some()
+            && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
+        {
+            shape.kind = "composition".into();
             shape.extra.remove("svgSource");
         } else if shape.kind == "svg"
             && shape.extra.get("nativeAdjustment").and_then(Value::as_bool) == Some(true)
@@ -316,6 +335,8 @@ impl Scene {
             shapes: Vec::new(),
             motion_blur: None,
             motion_blur_preview: false,
+            compositions: Vec::new(),
+            transparent_background: false,
             extra: Map::new(),
         }
     }
@@ -389,6 +410,17 @@ impl Scene {
         let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
         let mut scene: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("Invalid Forma project: {e}"))?;
+        scene.validate_compositions()?;
+        scene.prepare()?;
+        for composition in &mut scene.compositions {
+            composition.prepare()?;
+        }
+        scene.compositions.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        Ok(scene)
+    }
+
+    fn prepare(&mut self) -> Result<(), String> {
+        let scene = self;
         for shape in &mut scene.shapes {
             shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
             if shape.vector.as_mut().is_some_and(|vector| !vector.prepare(scene.duration)) {
@@ -462,7 +494,7 @@ impl Scene {
                 ));
             }
         }
-        Ok(scene)
+        Ok(())
     }
 
     pub fn add_shape(&mut self, id: String, kind: &str) -> String {
@@ -520,6 +552,8 @@ impl Scene {
             text_layout: None,
             effects: Vec::new(),
             motion_blur: false,
+            composition: None,
+            template_fields: Vec::new(),
             extra: Map::new(),
         });
         id
@@ -1223,6 +1257,10 @@ impl Scene {
             return Err("A clip must last at least 0.05 seconds".into());
         }
         let shape = &mut self.shapes[index];
+        let old_start = shape.clip_start();
+        if let Some(playback) = &mut shape.composition {
+            playback.offset = (playback.offset + (start - old_start) * playback.speed).max(0.0);
+        }
         if start > 0.0 || shape.in_time.is_some() {
             shape.in_time = Some(start);
         }
@@ -1306,6 +1344,10 @@ impl Scene {
                 serde_json::json!(hundredths(media_start + t - start)),
             );
         }
+        if let Some(playback) = &mut second.composition {
+            playback.offset += (t - start) * playback.speed;
+        }
+        second.rekey_template_fields();
         self.shapes.insert(index + 1, second);
         Ok(index + 1)
     }
@@ -1363,6 +1405,7 @@ impl Scene {
             }
         };
         copy.id = id;
+        copy.rekey_template_fields();
         copy.name = self.numbered_name(&template.name);
         copy.extra.insert("trackId".into(), track.into());
         (copy.in_time, copy.out_time) = (Some(end), Some(hundredths(end + length)));
@@ -1419,6 +1462,9 @@ impl Scene {
                 copy.extra
                     .insert("mediaStart".into(), serde_json::json!(next));
             }
+        }
+        if same && let Some(playback) = &mut copy.composition {
+            playback.offset += length * playback.speed;
         }
         self.duration = self.duration.max(copy.out_time.unwrap());
         self.shapes.insert(index + 1, copy);
@@ -1561,6 +1607,7 @@ impl Scene {
     fn nudged_copy(&self, layer: &Shape, id: String, nudge: f32) -> Shape {
         let mut copy = layer.clone();
         (copy.id, copy.name) = (id, self.numbered_name(&copy.name));
+        copy.rekey_template_fields();
         copy.extra.remove("trackId");
         if nudge == 0.0 {
             return copy;

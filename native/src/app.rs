@@ -30,6 +30,9 @@ use egui::{
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "composition_panel.rs"]
+mod composition_panel;
+
 /// A drag on the canvas, with what it started from (scene pixels, editable poses).
 #[derive(Clone)]
 enum Gesture {
@@ -168,6 +171,8 @@ enum ExportKind {
     Svg,
     Picture,
     Project,
+    Lottie,
+    StreamCuts,
 }
 
 #[derive(Clone, PartialEq)]
@@ -249,8 +254,12 @@ pub struct Forma {
     clip_in_edit: String,
     clip_out_edit: String,
     show_projects: bool,
+    show_compositions: bool,
+    composition_path: Vec<(String, f64)>,
+    pending_composition: Option<(String, f64)>,
     show_help: bool,
     show_export: bool,
+    export_error: Option<String>,
     export_kind: ExportKind,
     video_settings: video::Settings,
     /// Draws the preview the way exports draw frames. Made again when the scene's pictures change.
@@ -354,8 +363,12 @@ impl Forma {
             clip_in_edit: String::new(),
             clip_out_edit: String::new(),
             show_projects: first_launch,
+            show_compositions: false,
+            composition_path: Vec::new(),
+            pending_composition: None,
             show_help: false,
             show_export: false,
+            export_error: None,
             export_kind: ExportKind::Video,
             video_settings: video::Settings::default(),
             renderer: None,
@@ -438,6 +451,9 @@ impl Forma {
         self.sound.pause();
         let _ = self.save();
         self.scene = scene;
+        self.composition_path.clear();
+        self.pending_composition = None;
+        self.show_compositions = false;
         self.key_editor = KeyEditor::default();
         self.mask_editor = MaskEditor::default();
         self.vector_tools = VectorTools::default();
@@ -598,7 +614,9 @@ impl Forma {
     fn undo(&mut self) {
         if let Some(scene) = self.undo.pop() {
             self.pending_auto_preview = None;
-            self.redo.push(std::mem::replace(&mut self.scene, scene));
+            let current = self.project_snapshot();
+            self.redo.push(current);
+            self.restore_snapshot(scene);
             self.key_editor.clear_selection();
             self.timeline_drag = None;
             self.gesture = None;
@@ -613,7 +631,9 @@ impl Forma {
     fn redo(&mut self) {
         if let Some(scene) = self.redo.pop() {
             self.pending_auto_preview = None;
-            self.undo.push(std::mem::replace(&mut self.scene, scene));
+            let current = self.project_snapshot();
+            self.undo.push(current);
+            self.restore_snapshot(scene);
             self.key_editor.clear_selection();
             self.timeline_drag = None;
             self.gesture = None;
@@ -659,6 +679,7 @@ impl Forma {
             if projects.clicked() {
                 self.show_projects = true;
             }
+            self.composition_toolbar(ui);
             let new = if compact {
                 icon_button(ui, Icon::Plus, "New: an empty canvas", false)
             } else {
@@ -679,6 +700,7 @@ impl Forma {
                         .on_hover_text("A video, a picture or the project file, into Files")
                         .clicked()
                     {
+                        self.export_error = None;
                         self.show_export = true;
                     }
                 });
@@ -957,6 +979,9 @@ impl Forma {
         } else {
             "Shift-click picks several; drag one to reorder."
         };
+        if self.selected.is_some() && quiet_button(ui, "Precompose", None).clicked() {
+            self.precompose_selection();
+        }
         ui.label(egui::RichText::new(hint).color(color::INK_MUTED));
         egui::ScrollArea::vertical()
             .id_salt("forma-layers")
@@ -965,6 +990,7 @@ impl Forma {
             .show(ui, |ui| {
                 let mut destination = None;
                 let mut clicked = None;
+                let mut open = None;
                 for (index, shape) in self.scene.shapes.iter().enumerate() {
                     let response = ui.add(
                         egui::Button::selectable(
@@ -974,6 +1000,9 @@ impl Forma {
                         )
                         .sense(Sense::click_and_drag()),
                     );
+                    if response.double_clicked() {
+                        open = Some(shape.id.clone());
+                    }
                     if response.clicked() {
                         clicked = Some(shape.id.clone());
                     }
@@ -1000,6 +1029,9 @@ impl Forma {
                 if let Some(id) = clicked {
                     self.select_layer(Some(id), ui.input(|i| i.modifiers.shift));
                 }
+                if let Some(id) = open {
+                    self.queue_composition(&id);
+                }
                 if ui.input(|i| i.pointer.any_released()) {
                     if let (Some(id), Some(target)) = (self.layer_drag.take(), destination) {
                         if let Some(from) =
@@ -1019,6 +1051,10 @@ impl Forma {
     /// The Scene tab: canvas size, background and length (Electron's Scene panel).
     fn scene_settings(&mut self, ui: &mut Ui) {
         section_label(ui, "Canvas");
+        ui.checkbox(&mut self.scene.transparent_background, "Transparent canvas");
+        if quiet_button(ui, "Compositions", None).clicked() {
+            self.show_compositions = true;
+        }
         ui.scope(|ui| {
                 let (mut width, mut height) = (self.scene.width as u32, self.scene.height as u32);
                 // Wrapped: the inspector is narrower than the three sizes side by side.
@@ -1427,7 +1463,7 @@ impl Forma {
         let shape = &mut self.scene.shapes[index];
         let tool_before = self.vector_tools.tool;
         let has_paint = shape.is_vector() || shape.kind == "text";
-        let show_solid = shape.kind != "adjustment"
+        let show_solid = !matches!(shape.kind.as_str(), "adjustment" | "composition")
             && (!has_paint
                 || shape_panel::fill_panel(
                     ui,
@@ -1463,6 +1499,7 @@ impl Forma {
             .inspector_pose(&self.scene.shapes[index], self.time);
         let shape = &mut self.scene.shapes[index];
         changed |= ui.text_edit_singleline(&mut shape.name).changed();
+        composition_panel::layer_settings(ui, shape);
         if shape.kind == "text" {
             changed |= text_panel::content(ui, shape);
             let linked = shape
@@ -2702,6 +2739,13 @@ impl Forma {
         self.vector_tools.sync(self.selected.as_deref(), self.time);
         self.canvas_view(ui);
         self.canvas_bar(ui, viewport);
+        if !self.composition_path.is_empty() {
+            let rect = Rect::from_min_size(viewport.min + vec2(8.0, 41.0), vec2(viewport.width() - 16.0, 32.0));
+            ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+                egui::Frame::new().fill(Mood::Ember.pane_solid()).corner_radius(8)
+                    .inner_margin(4).show(ui, |ui| self.composition_breadcrumbs(ui));
+            });
+        }
         if let Some(tool) = self.vector_tools.tool.filter(|_| !self.playing) {
             shape_panel::draw_hint(ui, viewport, tool);
         }
@@ -2970,7 +3014,7 @@ impl Forma {
             }
             None => std::borrow::Cow::Borrowed(&self.scene),
         };
-        let stale = self
+        let stale = renderer.preview_is_waiting() || self
             .preview
             .as_ref()
             .is_none_or(|(_, scene, time, drawn, shown)| {
@@ -3016,6 +3060,9 @@ impl Forma {
                     }
                 }
             }
+        }
+        if renderer.preview_is_waiting() {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
         // Selection handles can reach past the canvas, but not over the toolbar or the panels.
         let painter = ui.painter().with_clip_rect(viewport);
@@ -3405,6 +3452,10 @@ impl Forma {
         let menu_target = response
             .interact_pointer_pos()
             .and_then(|p| topmost(&self.scene, self.time, p, self.renderer.as_ref()));
+        if response.double_clicked() && let Some(index) = menu_target {
+            let id = self.scene.shapes[index].id.clone();
+            self.queue_composition(&id);
+        }
         if response.secondary_clicked() {
             let id = menu_target.map(|i| self.scene.shapes[i].id.clone());
             self.select_layer(id, false);
@@ -4038,6 +4089,9 @@ impl Forma {
                     ui.scope_id().with(("track", &id)),
                     Sense::click(),
                 );
+                if head.double_clicked() {
+                    self.queue_composition(&id);
+                }
                 if head.clicked() {
                     self.select_clip(pick);
                 }
@@ -4349,6 +4403,7 @@ impl Forma {
             shape.name
         );
         let id = shape.id.clone();
+        let opens_composition = shape.composition.is_some();
         let response = ui
             .interact(
                 span,
@@ -4356,6 +4411,9 @@ impl Forma {
                 Sense::click_and_drag(),
             )
             .on_hover_text(tip);
+        if opens_composition && response.double_clicked() {
+            self.queue_composition(&id);
+        }
         if let Some(p) = response.hover_pos() {
             let edge = (p.x - span.left()).abs() <= 6.0 || (p.x - span.right()).abs() <= 6.0;
             ui.ctx().set_cursor_icon(if edge {
@@ -4453,6 +4511,10 @@ impl Forma {
                 if self.clipboard.is_empty() {
                     return;
                 }
+                if self.clipboard.iter().any(|layer| !self.can_paste_composition(layer)) {
+                    self.notice = Some("Can't paste a composition whose source is missing here or would form a loop.".into());
+                    return;
+                }
                 let ids: Vec<_> = self
                     .clipboard
                     .iter()
@@ -4533,10 +4595,11 @@ impl Forma {
                 .continue_after(index, None, self.time, new_id(), new_id())
                 .map(|i| (i, "added — drag it to its next position")),
             ClipAction::PasteAfter => match self.clipboard.first().cloned() {
-                Some(template) => self
+                Some(template) if self.can_paste_composition(&template) => self
                     .scene
                     .continue_after(index, Some(&template), self.time, new_id(), new_id())
                     .map(|i| (i, "added — drag it to its next position")),
+                Some(_) => Err("Can't paste a composition whose source is missing here or would form a loop.".into()),
                 None => Err("Copy a layer first (Ctrl+C)".into()),
             },
             ClipAction::Split => self
@@ -4784,11 +4847,12 @@ impl Forma {
                     .color(color::INK),
             );
             ui.add_space(6.0);
+            let old_kind = self.export_kind;
             for (kind, title, detail) in [
                 (
                     ExportKind::Video,
                     "Video",
-                    "MP4 or WebM, with sound. Plays anywhere.",
+                    "MP4, WebM, MOV, GIF or PNG frames.",
                 ),
                 (
                     ExportKind::Svg,
@@ -4805,12 +4869,17 @@ impl Forma {
                     "Project file",
                     "Everything, to open in Forma elsewhere.",
                 ),
+                (ExportKind::Lottie, "Lottie", "An animation in Bodymovin JSON."),
+                (ExportKind::StreamCuts, "StreamCuts template", "An animated title with editable fields."),
             ] {
                 ui.radio_value(
                     &mut self.export_kind,
                     kind,
                     egui::RichText::new(format!("{title}  ·  {detail}")).font(font::ui(13.0)),
                 );
+            }
+            if self.export_kind != old_kind {
+                self.export_error = None;
             }
             ui.separator();
             let scene = &self.scene;
@@ -4821,10 +4890,27 @@ impl Forma {
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("Format");
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut settings.format, video::Format::Mp4, "MP4");
-                            ui.selectable_value(&mut settings.format, video::Format::WebM, "WebM");
+                        let formats = [
+                            (video::Format::Mp4, "MP4"),
+                            (video::Format::WebM, "WebM (VP9)"),
+                            (video::Format::Mov, "MOV (ProRes 4444)"),
+                            (video::Format::PngSequence, "PNG sequence (ZIP)"),
+                            (video::Format::Gif, "GIF"),
+                        ];
+                        egui::ComboBox::from_id_salt("video-format")
+                            .selected_text(formats.iter().find(|(format, _)| *format == settings.format).map_or("MP4", |(_, name)| *name))
+                            .show_ui(ui, |ui| {
+                                for (format, name) in formats {
+                                    ui.selectable_value(&mut settings.format, format, name);
+                                }
                         });
+                        ui.end_row();
+                        if settings.format == video::Format::Mp4 {
+                            settings.transparent = false;
+                        }
+                        ui.label("Background");
+                        ui.add_enabled(settings.format != video::Format::Mp4,
+                            egui::Checkbox::new(&mut settings.transparent, "Transparent"));
                         ui.end_row();
                         ui.label("Smoothness");
                         ui.horizontal(|ui| {
@@ -4852,7 +4938,8 @@ impl Forma {
             }
             let summary = match self.export_kind {
                 ExportKind::Video => {
-                    let sound = if scene.shapes.iter().any(|s| s.kind == "video") {
+                    let sound = if !matches!(self.video_settings.format, video::Format::Gif | video::Format::PngSequence)
+                        && scene.shapes.iter().any(|s| s.kind == "video") {
                         "  ·  Includes sound"
                     } else {
                         ""
@@ -4882,16 +4969,25 @@ impl Forma {
                         if n == 1 { "" } else { "s" }
                     )
                 }
+                ExportKind::Lottie => format!("{:.1} seconds at 30 frames per second", scene.duration),
+                ExportKind::StreamCuts => "Saves the open composition and its editable fields.".into(),
             };
             ui.label(egui::RichText::new(summary).font(font::bold(13.0)));
+            if let Some(error) = &self.export_error {
+                egui::ScrollArea::vertical().max_height(155.0).show(ui, |ui| {
+                    ui.label(error);
+                });
+            }
             ui.add_space(6.0);
             let label = match self.export_kind {
                 ExportKind::Video => "Export video",
                 ExportKind::Svg => "Export SVG",
                 ExportKind::Picture => "Save picture",
                 ExportKind::Project => "Save project file",
+                ExportKind::Lottie => "Export Lottie",
+                ExportKind::StreamCuts => "Send to StreamCuts as template",
             };
-            run = ui.button(label).clicked();
+            run = primary_button(ui, label, Mood::Ember).clicked();
         });
         if run {
             self.show_export = false;
@@ -4908,6 +5004,8 @@ impl Forma {
             ExportKind::Svg => "svg",
             ExportKind::Picture => "png",
             ExportKind::Project => "forma",
+            ExportKind::Lottie => "lottie.json",
+            ExportKind::StreamCuts => crate::template::EXTENSION,
         };
         if let Err(error) = std::fs::create_dir_all(&self.place.exports_dir) {
             return host.toast(error.to_string());
@@ -4937,11 +5035,27 @@ impl Forma {
             ExportKind::Picture => {
                 render::save_png(&self.scene, &self.place, self.time, &path).map(|_| path)
             }
-            ExportKind::Project => archive::pack(&self.scene, &self.place, &path).map(|_| path),
+            ExportKind::Project => archive::pack(&self.project_snapshot(), &self.place, &path).map(|_| path),
+            ExportKind::Lottie => crate::lottie::export(&self.scene)
+                .and_then(|data| std::fs::write(&path, data).map_err(|e| e.to_string())).map(|_| path),
+            ExportKind::StreamCuts => {
+                match crate::template::save(&self.scene, &self.place, &path) {
+                    Ok(()) => {
+                        if let Ok(request) = serde_json::to_string(&path) {
+                            host.open_in("streamcuts", &format!("{}{request}", crate::template::OPEN_PREFIX));
+                        }
+                        Ok(path)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         };
         match done {
             Ok(path) => host.exported(path),
-            Err(error) => host.toast(error),
+            Err(error) => {
+                self.export_error = Some(error);
+                self.show_export = true;
+            }
         }
     }
 
@@ -5143,7 +5257,7 @@ impl Forma {
             Back,
         }
         let mut choice = None;
-        let current = self.scene.project_id.clone();
+        let current = self.main_id().to_owned();
         let modal = pane_modal(ui.ctx(), self.pane, ui.scope_id().with("forma-projects"), |ui| {
             ui.set_width(620.0_f32.min(ui.ctx().content_rect().width() - 60.0));
             ui.horizontal(|ui| {
@@ -5493,11 +5607,11 @@ impl CanopyApp for Forma {
                 }
             }
         }
-        let before = self.scene.clone();
+        let before = self.project_snapshot();
         self.run_auto_preview(ui.ctx());
         self.automation(ui.ctx(), host);
         // With a dialog up, the editor's keys wait (Delete would otherwise remove a layer behind the Export dialog).
-        let dialog = self.show_projects || self.show_help || self.show_export || self.svg_edit.is_some();
+        let dialog = self.show_projects || self.show_compositions || self.show_help || self.show_export || self.svg_edit.is_some();
         self.vector_keyboard = host.focused() && !dialog && !ui.ctx().text_edit_focused();
         if host.focused() && !dialog {
             let undo = ui.input(|i| {
@@ -5706,10 +5820,11 @@ impl CanopyApp for Forma {
             self.timeline(ui, reveal_mask.as_ref())
         });
         self.projects_window(ui);
+        self.compositions_window(ui);
         self.help_window(ui);
         self.export_window(ui, host);
         self.svg_window(ui);
-        if !self.suppress_history && self.scene != before {
+        if !self.suppress_history && before.project_id == self.main_id() && self.project_differs(&before) {
             let dragging = ui.input(|i| i.pointer.any_down());
             if !self.recording_drag {
                 self.undo.push(before);
@@ -5823,7 +5938,7 @@ impl CanopyApp for Forma {
     }
 
     fn save(&mut self) -> Result<(), String> {
-        let result = storage::save(&self.place, &self.scene);
+        let result = storage::save(&self.place, &self.project_snapshot());
         self.edited_at = None;
         self.save_failed = result.is_err();
         result

@@ -71,7 +71,10 @@ pub fn load_default(place: &Place, id: String) -> Result<Option<Scene>, String> 
         return Ok(None);
     }
     let mut scene = load(&path)?;
-    for shape in &mut scene.shapes {
+    for shape in std::iter::once(&mut scene.shapes)
+        .chain(scene.compositions.iter_mut().map(|child| &mut child.shapes))
+        .flatten()
+    {
         for field in ["assetData", "posterData", "svgSource"] {
             let ref_field = format!("{field}Ref");
             let Some(token) = shape.extra.get(&ref_field).and_then(|v| v.as_str()) else {

@@ -24,11 +24,12 @@ struct Clip {
     end: f64,
     media_start: f64,
     media_duration: f64,
+    speed: f64,
 }
 
 impl Clip {
     fn source_at(&self, time: f64) -> f64 {
-        let offset = (time - self.start).max(0.0) + self.media_start;
+        let offset = (time - self.start).max(0.0) * self.speed + self.media_start;
         if self.media_duration > 0.0 {
             offset.rem_euclid(self.media_duration)
         } else {
@@ -37,31 +38,17 @@ impl Clip {
     }
 }
 
-fn clips(scene: &Scene, renderer: &Renderer) -> Vec<Clip> {
-    scene
-        .shapes
-        .iter()
-        .filter(|shape| shape.kind == "video")
-        .filter_map(|shape| {
-            let path = renderer.video(&shape.id)?.to_owned();
-            Some(Clip {
-                id: shape.id.clone(),
-                path,
-                start: shape.clip_start(),
-                end: shape.out_time.unwrap_or(scene.duration).min(scene.duration),
-                media_start: shape
-                    .extra
-                    .get("mediaStart")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
-                media_duration: shape
-                    .extra
-                    .get("mediaDuration")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0),
-            })
-        })
-        .collect()
+fn clips(scene: &Scene, renderer: &Renderer) -> Result<Vec<Clip>, String> {
+    Ok(crate::composition_audio::video_spans(scene, renderer)?.into_iter()
+        .map(|span| Clip {
+            id: span.id,
+            path: span.file.to_owned(),
+            start: span.start,
+            end: span.end,
+            media_start: span.offset,
+            media_duration: span.duration,
+            speed: span.speed,
+        }).collect())
 }
 
 fn signature(clips: &[Clip]) -> u64 {
@@ -69,7 +56,7 @@ fn signature(clips: &[Clip]) -> u64 {
     for clip in clips {
         clip.id.hash(&mut hash);
         clip.path.hash(&mut hash);
-        for value in [clip.start, clip.end, clip.media_start, clip.media_duration] {
+        for value in [clip.start, clip.end, clip.media_start, clip.media_duration, clip.speed] {
             value.to_bits().hash(&mut hash);
         }
     }
@@ -339,7 +326,7 @@ impl Sound {
             let source = source_clip.source_at(begin);
             let length = clip.end - begin;
             let (chunks, cancel, errors) =
-                decode(clip.path.clone(), source, length, rate, channels);
+                decode(clip.path.clone(), source, length, rate, channels, clip.speed);
             self.mix().voices.push(Voice {
                 next: frames_at(begin, self.origin, rate),
                 end: frames_at(clip.end, self.origin, rate),
@@ -382,7 +369,13 @@ impl Sound {
         let Some(renderer) = renderer else {
             return true;
         };
-        let clips = clips(scene, renderer);
+        let clips = match clips(scene, renderer) {
+            Ok(clips) => clips,
+            Err(error) => {
+                self.fail(error);
+                return true;
+            }
+        };
         for clip in &clips {
             if near(clip, time) {
                 self.probe(&clip.path);
@@ -441,13 +434,15 @@ fn decode(
     length: f64,
     rate: u32,
     channels: usize,
+    speed: f64,
 ) -> (Receiver<Vec<f32>>, Arc<AtomicBool>, Receiver<String>) {
     let (send, recv) = mpsc::sync_channel(32);
     let (error_send, error_recv) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
     std::thread::spawn(move || {
-        let child = media::command(media::ffmpeg())
+        let mut command = media::command(media::ffmpeg());
+        command
             .args([
                 "-v",
                 "error",
@@ -457,8 +452,12 @@ fn decode(
                 &format!("{source:.6}"),
                 "-i",
             ])
-            .arg(path)
-            .args([
+            .arg(path);
+        let tempo = crate::composition_audio::tempo_filter(speed);
+        if !tempo.is_empty() {
+            command.args(["-af", tempo.trim_end_matches(',')]);
+        }
+        let child = command.args([
                 "-t",
                 &format!("{length:.6}"),
                 "-vn",
@@ -637,7 +636,7 @@ mod tests {
             let output = sound.output.as_ref().unwrap();
             (output.rate, output.channels)
         };
-        let (chunks, cancel, _errors) = decode(file.clone(), 0.0, 1.5, rate, channels);
+        let (chunks, cancel, _errors) = decode(file.clone(), 0.0, 1.5, rate, channels, 1.0);
         {
             let mut mix = sound.mix();
             mix.running = true;
@@ -678,6 +677,7 @@ mod tests {
             end: 5.0,
             media_start: 1.5,
             media_duration: 2.0,
+            speed: 1.0,
         };
         assert_eq!(clip.source_at(2.0), 1.5);
         assert_eq!(clip.source_at(3.0), 0.5);

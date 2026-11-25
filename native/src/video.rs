@@ -19,6 +19,9 @@ use std::sync::{
 pub enum Format {
     Mp4,
     WebM,
+    Mov,
+    PngSequence,
+    Gif,
 }
 
 /// What Electron Forma's export dialog lets you choose for a video.
@@ -28,6 +31,7 @@ pub struct Settings {
     pub fps: u32,
     /// 1 is the scene's size, 2 twice it.
     pub scale: u32,
+    pub transparent: bool,
 }
 
 impl Default for Settings {
@@ -36,6 +40,7 @@ impl Default for Settings {
             format: Format::Mp4,
             fps: 30,
             scale: 1,
+            transparent: false,
         }
     }
 }
@@ -44,6 +49,10 @@ impl Settings {
     /// The scene's size times `scale`, in even numbers (H.264 and VP9 need them), as Electron rounds it.
     pub fn size(&self, scene: &Scene) -> (u32, u32) {
         let even = |side: f32| (((side * self.scale as f32) / 2.0).round() as u32 * 2).max(2);
+        let whole = |side: f32| (side * self.scale as f32).round().max(1.0) as u32;
+        if matches!(self.format, Format::PngSequence | Format::Gif) {
+            return (whole(scene.width), whole(scene.height));
+        }
         (even(scene.width), even(scene.height))
     }
 
@@ -55,6 +64,9 @@ impl Settings {
         match self.format {
             Format::Mp4 => "mp4",
             Format::WebM => "webm",
+            Format::Mov => "mov",
+            Format::PngSequence => "zip",
+            Format::Gif => "gif",
         }
     }
 }
@@ -72,6 +84,12 @@ pub fn start(
     settings: Settings,
     ctx: egui::Context,
 ) -> Result<Export, String> {
+    if !matches!(settings.fps, 1..=120) || !matches!(settings.scale, 1..=2) {
+        return Err("Choose an export frame rate from 1 to 120 and a size of 1× or 2×.".into());
+    }
+    if settings.transparent && settings.format == Format::Mp4 {
+        return Err("Choose WebM, MOV, PNG sequence or GIF for a transparent background.".into());
+    }
     let renderer = Renderer::new(scene, place);
     renderer.check(scene)?;
     let scene = scene.clone();
@@ -107,6 +125,7 @@ struct Sound<'a> {
     start: f64,
     end: f64,
     offset: f64,
+    speed: f64,
 }
 
 /// FFmpeg's arguments: frames come in raw on stdin; each sound is its own input, delayed to its clip and mixed.
@@ -139,16 +158,23 @@ fn arguments(scene: &Scene, sounds: &[Sound], settings: Settings, output: &Path)
                 "-ss",
                 &format!("{:.3}", sound.offset),
                 "-t",
-                &format!("{:.3}", sound.end - sound.start),
+                &format!("{:.3}", (sound.end - sound.start) * sound.speed),
                 "-i",
             ]
             .map(String::from),
         );
         args.push(sound.file.to_string_lossy().into_owned());
         let delay = (sound.start * 1000.0).round() as u64;
-        filters.push(format!("[{}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,adelay={delay}:all=1[s{index}]", index + 1));
+        let tempo = crate::composition_audio::tempo_filter(sound.speed);
+        filters.push(format!("[{}:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,{tempo}adelay={delay}:all=1[s{index}]", index + 1));
     }
-    args.extend(["-map", "0:v"].map(String::from));
+    if settings.format == Format::Gif {
+        args.extend(["-filter_complex_threads", "1", "-filter_complex",
+            "[0:v]split[a][b];[a]palettegen=reserve_transparent=1:stats_mode=single[p];[b][p]paletteuse=new=1:alpha_threshold=128[v]",
+            "-map", "[v]"].map(String::from));
+    } else {
+        args.extend(["-map", "0:v"].map(String::from));
+    }
     if !sounds.is_empty() {
         // Sounds add up, as in Electron's OfflineAudioContext; the mix lasts exactly as long as the video.
         let inputs: String = (0..sounds.len()).map(|i| format!("[s{i}]")).collect();
@@ -167,13 +193,12 @@ fn arguments(scene: &Scene, sounds: &[Sound], settings: Settings, output: &Path)
             "-map".into(),
             "[sound]".into(),
         ]);
-        args.extend(
-            match settings.format {
-                Format::Mp4 => ["-c:a", "aac", "-b:a", "192k"],
-                Format::WebM => ["-c:a", "libopus", "-b:a", "160k"],
-            }
-            .map(String::from),
-        );
+        let audio = if settings.format == Format::WebM {
+            ["-c:a", "libopus", "-b:a", "160k"]
+        } else {
+            ["-c:a", "aac", "-b:a", "192k"]
+        };
+        args.extend(audio.map(String::from));
     }
     let video: &[&str] = match settings.format {
         Format::Mp4 => &[
@@ -202,8 +227,24 @@ fn arguments(scene: &Scene, sounds: &[Sound], settings: Settings, output: &Path)
             "-row-mt",
             "1",
             "-pix_fmt",
-            "yuv420p",
+            if settings.transparent || scene.transparent_background {
+                "yuva420p"
+            } else {
+                "yuv420p"
+            },
         ],
+        Format::Mov => &[
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "4",
+            "-pix_fmt",
+            "yuva444p10le",
+            "-alpha_bits",
+            "16",
+        ],
+        Format::Gif => &["-loop", "0"],
+        Format::PngSequence => &[],
     };
     args.extend(video.iter().map(|s| s.to_string()));
     args.extend(["-t".to_string(), format!("{length:.3}")]);
@@ -244,36 +285,32 @@ fn render_video(
         }
         videos.insert(shape.id.clone(), (file, info, decode_size));
     }
-    let sounds: Vec<Sound> = scene
-        .shapes
-        .iter()
-        .filter_map(|shape| {
-            let (file, info, _) = videos.get(&shape.id).filter(|(_, info, _)| info.sound)?;
-            let (start, end) = (
-                shape.in_time.unwrap_or(0.0),
-                shape.out_time.unwrap_or(scene.duration).min(scene.duration),
-            );
-            (end > start).then(|| Sound {
-                file,
-                start,
-                end,
-                offset: shape.media_time(start, info.duration),
-            })
-        })
-        .collect();
-    let mut child = media::command(media::ffmpeg())
-        .args(arguments(scene, &sounds, settings, output))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("FFmpeg couldn't start ({e}). Install FFmpeg to export MP4."))?;
-    let mut stderr = child.stderr.take().unwrap();
-    let errors = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
+    let mut sounds = Vec::new();
+    if !matches!(settings.format, Format::PngSequence | Format::Gif) {
+        let mut known: HashMap<&Path, Info> = videos
+            .values()
+            .map(|&(file, info, _)| (file, info))
+            .collect();
+        for clip in crate::composition_audio::video_spans(scene, renderer)? {
+            let info = match known.get(clip.file) {
+                Some(info) => *info,
+                None => {
+                    let info = media::probe(clip.file)?;
+                    known.insert(clip.file, info);
+                    info
+                }
+            };
+            if info.sound {
+                sounds.push(Sound {
+                    file: clip.file,
+                    start: clip.start,
+                    end: clip.end,
+                    offset: clip.offset.rem_euclid(info.duration),
+                    speed: clip.speed,
+                });
+            }
+        }
+    }
     // Each video layer on screen reads its frames from one FFmpeg run that started where its clip comes in.
     let mut readers: HashMap<String, media::Frames> = HashMap::new();
     let mut shutter_readers: HashMap<String, Option<media::ShutterReader>> = HashMap::new();
@@ -315,28 +352,77 @@ fn render_video(
                 readers.get_mut(&shape.id).unwrap().next()?,
             );
         }
-        renderer.exposed_frame(scene, t, size, settings.fps, &current, |sample| {
+        renderer.export_frame(
+            scene,
+            t,
+            size,
+            settings.fps,
+            &current,
+            |sample| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("Export stopped".into());
+                }
+                let mut pixels = render::SampleFrames::new();
+                for shape in scene.shapes.iter().filter(|shape| {
+                    shape.kind == "video"
+                        && shape.motion_blur
+                        && shape.visible(sample, scene.duration)
+                }) {
+                    let (file, info, size) = videos[&shape.id];
+                    let reader = shutter_readers.entry(shape.id.clone()).or_default();
+                    let frame = media::ShutterReader::at(
+                        reader,
+                        (file, info.duration, size),
+                        shape,
+                        sample,
+                        settings.fps,
+                    )?;
+                    pixels.insert(shape.id.clone(), frame);
+                }
+                Ok(Some(pixels))
+            },
+            settings.transparent,
+        )
+    };
+    if settings.format == Format::PngSequence {
+        let file = std::fs::File::create(output).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipWriter::new(file);
+        for index in 0..frames {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Export stopped".into());
             }
-            let mut pixels = render::SampleFrames::new();
-            for shape in scene.shapes.iter().filter(|shape| {
-                shape.kind == "video" && shape.motion_blur && shape.visible(sample, scene.duration)
-            }) {
-                let (file, info, size) = videos[&shape.id];
-                let reader = shutter_readers.entry(shape.id.clone()).or_default();
-                let frame = media::ShutterReader::at(
-                    reader,
-                    (file, info.duration, size),
-                    shape,
-                    sample,
-                    settings.fps,
-                )?;
-                pixels.insert(shape.id.clone(), frame);
-            }
-            Ok(Some(pixels))
-        })
-    };
+            let frame = frame_at(index as f64 / f64::from(settings.fps))?;
+            zip.start_file(
+                format!("frame-{:010}.png", index + 1),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .map_err(|e| e.to_string())?;
+            zip.write_all(&frame.encode_png().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            progress.store(
+                ((u64::from(index) + 1) * 1000 / u64::from(frames)) as u32,
+                Ordering::Relaxed,
+            );
+        }
+        zip.finish().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let mut child = media::command(media::ffmpeg())
+        .args(arguments(scene, &sounds, settings, output))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("FFmpeg couldn't start ({e}). Install FFmpeg to export video."))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or("FFmpeg error output is unavailable")?;
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
     let mut failure = None;
     if let Some(mut stdin) = child.stdin.take() {
         for index in 0..frames {
@@ -345,7 +431,17 @@ fn render_video(
             }
             match frame_at(index as f64 / settings.fps as f64) {
                 Ok(frame) => {
-                    if let Err(error) = stdin.write_all(frame.data()) {
+                    let result = if settings.transparent || scene.transparent_background {
+                        let mut rgba = Vec::with_capacity(frame.data().len());
+                        for pixel in frame.pixels() {
+                            let pixel = pixel.demultiply();
+                            rgba.extend([pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]);
+                        }
+                        stdin.write_all(&rgba)
+                    } else {
+                        stdin.write_all(frame.data())
+                    };
+                    if let Err(error) = result {
                         failure = Some(error.to_string());
                         break;
                     }
@@ -396,6 +492,117 @@ mod tests {
             data_dir: root.into(),
             exports_dir: root.into(),
         }
+    }
+
+    #[test]
+    fn alpha_survives_webm_mov_png_sequence_and_gif() {
+        let root = std::env::temp_dir().join(format!("forma-alpha-export-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut scene = Scene::empty("test".into());
+        (scene.width, scene.height, scene.duration) = (64.0, 48.0, 1.0);
+        scene.add_shape("box".into(), "rect");
+        scene.shapes[0].color = "#ec5824".into();
+        scene.shapes[0].keys[0].w = 20.0;
+        scene.shapes[0].keys[0].h = 20.0;
+        for format in [Format::WebM, Format::Mov, Format::PngSequence, Format::Gif] {
+            let settings = Settings {
+                format,
+                fps: 4,
+                transparent: true,
+                ..Settings::default()
+            };
+            let path = root.join(format!("alpha.{}", settings.extension()));
+            let export = start(
+                &scene,
+                &place(&root),
+                path.clone(),
+                settings,
+                egui::Context::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                export.result.recv().unwrap(),
+                Ok(path.clone()),
+                "{format:?}"
+            );
+            let input = if format == Format::PngSequence {
+                let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+                assert_eq!(zip.len(), 4);
+                let mut entry = zip.by_name("frame-0000000001.png").unwrap();
+                let png = root.join("first.png");
+                std::io::copy(&mut entry, &mut std::fs::File::create(&png).unwrap()).unwrap();
+                png
+            } else {
+                path
+            };
+            let probe = media::command(media::ffprobe())
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=pix_fmt:stream_tags=alpha_mode",
+                    "-of",
+                    "json",
+                ])
+                .arg(&input)
+                .output()
+                .unwrap();
+            assert!(probe.status.success(), "{:?}", probe.stderr);
+            let info: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+            let stream = &info["streams"][0];
+            match format {
+                // FFprobe uses its default VP9 decoder, which only reports the color plane.
+                Format::WebM => {
+                    assert!(matches!(
+                        stream["pix_fmt"].as_str(),
+                        Some("yuv420p" | "yuva420p")
+                    ));
+                    let tags = stream["tags"].as_object().unwrap();
+                    assert!(
+                        tags.iter()
+                            .any(|(key, value)| key.eq_ignore_ascii_case("alpha_mode")
+                                && value == "1")
+                    );
+                }
+                Format::Mov => assert!(stream["pix_fmt"].as_str().unwrap().starts_with("yuva444p")),
+                Format::PngSequence => assert_eq!(stream["pix_fmt"], "rgba"),
+                Format::Gif => assert!(matches!(stream["pix_fmt"].as_str(), Some("bgra" | "rgba"))),
+                Format::Mp4 => unreachable!(),
+            }
+            let mut ffmpeg = media::command(media::ffmpeg());
+            ffmpeg.args(["-v", "error"]);
+            if format == Format::WebM {
+                ffmpeg.args(["-c:v", "libvpx-vp9"]);
+            }
+            let frame = ffmpeg
+                .arg("-i")
+                .arg(&input)
+                .args([
+                    "-frames:v",
+                    "1",
+                    "-pix_fmt",
+                    "rgba",
+                    "-f",
+                    "rawvideo",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                frame.status.success(),
+                "{}",
+                String::from_utf8_lossy(&frame.stderr)
+            );
+            assert_eq!(frame.stdout[3], 0, "{format:?} lost the transparent corner");
+            assert_eq!(
+                frame.stdout[(24 * 64 + 32) * 4 + 3],
+                255,
+                "{format:?} lost the visible box"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -591,12 +798,14 @@ mod tests {
                 start: 0.5,
                 end: 3.0,
                 offset: 1.25,
+                speed: 1.0,
             },
             Sound {
                 file: Path::new("b.mp4"),
                 start: 0.0,
                 end: 1.0,
                 offset: 0.0,
+                speed: 1.0,
             },
         ];
         let args = arguments(&scene, &sounds, Settings::default(), Path::new("out.mp4")).join(" ");
@@ -617,6 +826,76 @@ mod tests {
     }
 
     #[test]
+    fn nested_video_and_sound_follow_the_composition_clock() {
+        let root = std::env::temp_dir().join(format!("forma-nested-video-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let place = place(&root);
+        let source = media::tests::video(&root, "source.mp4", 2, true);
+        let (asset, poster, info) = crate::assets::import_video(&source, &place).unwrap();
+        let mut scene = Scene::empty("main".into());
+        (scene.width, scene.height, scene.duration) = (160.0, 120.0, 2.4);
+        let mut child = Scene::empty("child".into());
+        (child.width, child.height, child.duration) = (160.0, 120.0, 2.0);
+        child.add_shape("source".into(), "video");
+        let layer = &mut child.shapes[0];
+        (layer.keys[0].w, layer.keys[0].h) = (160.0, 120.0);
+        layer.extra.extend([
+            ("assetData".into(), asset.into()),
+            ("posterData".into(), poster.into()),
+            ("mediaDuration".into(), info.duration.into()),
+        ]);
+        scene.compositions.push(child);
+        scene
+            .add_composition_layer("instance".into(), "child")
+            .unwrap();
+        scene.shapes[0].in_time = Some(0.5);
+        let playback = scene.shapes[0].composition.as_mut().unwrap();
+        (playback.offset, playback.speed, playback.looping) = (0.25, 2.0, true);
+
+        let path = root.join("nested.mp4");
+        let job = start(
+            &scene,
+            &place,
+            path.clone(),
+            Settings::default(),
+            egui::Context::default(),
+        )
+        .unwrap();
+        assert_eq!(job.result.recv().unwrap(), Ok(path.clone()));
+        assert!(media::probe(&path).unwrap().sound);
+        let color = |at| {
+            let frame = media::Frames::start(&path, at, 30, 16, 12)
+                .unwrap()
+                .next()
+                .unwrap();
+            let pixel = frame.pixel(8, 6).unwrap();
+            [pixel.red(), pixel.green()]
+        };
+        assert!(color(0.65)[0] > 200, "{:?}", color(0.65));
+        assert!(color(1.05)[1] > 200, "{:?}", color(1.05));
+        assert!(color(1.55)[0] > 200, "{:?}", color(1.55));
+        let amplitude = |time: &str| {
+            let audio = media::command(media::ffmpeg())
+                .args(["-v", "error", "-ss", time, "-i"])
+                .arg(&path)
+                .args(["-t", "0.15", "-vn", "-ac", "1", "-f", "s16le", "pipe:1"])
+                .output()
+                .unwrap();
+            assert!(audio.status.success());
+            audio
+                .stdout
+                .chunks_exact(2)
+                .map(|v| i16::from_le_bytes([v[0], v[1]]).unsigned_abs())
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(amplitude("0.1") < 20);
+        assert!(amplitude("0.7") > 100);
+        assert!(amplitude("1.65") > 100);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn large_webm_at_sixty_frames_a_second() {
         let root = std::env::temp_dir().join(format!("forma-native-webm-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -627,6 +906,7 @@ mod tests {
             format: Format::WebM,
             fps: 60,
             scale: 2,
+            ..Settings::default()
         };
         assert_eq!(settings.size(&scene), (202, 122));
         let output = root.join("out.webm");

@@ -667,6 +667,7 @@ fn export(e: &mut Editor, args: &Value) -> Result<Outcome, ToolError> {
     if format == "mp4" || format == "webm" {
         let fps = args["fps"].as_u64().unwrap_or(30) as u32;
         let settings = video::Settings {
+            transparent: false,
             format: if format == "mp4" {
                 video::Format::Mp4
             } else {

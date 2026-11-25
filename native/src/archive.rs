@@ -28,8 +28,11 @@ fn write(scene: &Scene, place: &Place, output: &Path) -> Result<(), String> {
     let mut media = Vec::new();
     let mut names: HashMap<String, String> = HashMap::new();
     let mut packed: HashSet<String> = HashSet::new();
-    let shapes = project["shapes"].as_array_mut().ok_or("Invalid project")?;
-    for (shape, copy) in scene.shapes.iter().zip(shapes) {
+    let originals = std::iter::once(scene)
+        .chain(&scene.compositions)
+        .flat_map(|scene| &scene.shapes);
+    let copies = project_shape_groups(&mut project).into_iter().flatten();
+    for (shape, copy) in originals.zip(copies) {
         let copy = copy.as_object_mut().ok_or("Invalid project")?;
         for field in MEDIA_FIELDS {
             let Some(value) = assets::stored(shape, field, place)? else {
@@ -79,14 +82,23 @@ fn write(scene: &Scene, place: &Place, output: &Path) -> Result<(), String> {
 
 /// Reads a `.forma` file, putting its media in this place's library.
 pub fn unpack(path: &Path, place: &Place) -> Result<Scene, String> {
+    unpack_checked(path, place, |_| Ok(()))
+}
+
+pub(crate) fn unpack_checked(
+    path: &Path,
+    place: &Place,
+    check: impl FnOnce(&Value) -> Result<(), String>,
+) -> Result<Scene, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let mut zip = ZipArchive::new(file).map_err(|_| "This isn't a .forma file".to_owned())?;
     let json = entry(&mut zip, "project.json")
         .map_err(|_| "This .forma file has no project.json".to_owned())?;
     let mut project: Value =
         serde_json::from_slice(&json).map_err(|e| format!("Invalid Forma project: {e}"))?;
+    check(&project)?;
     let mut stored: HashMap<String, String> = HashMap::new();
-    for shape in project["shapes"].as_array_mut().into_iter().flatten() {
+    for shape in project_shape_groups(&mut project).into_iter().flatten() {
         for field in MEDIA_FIELDS {
             let Some(name) = shape
                 .get(field)
@@ -116,6 +128,27 @@ pub fn unpack(path: &Path, place: &Place) -> Result<Scene, String> {
     Scene::read(&serde_json::to_vec(&project).map_err(|e| e.to_string())?)
 }
 
+fn project_shape_groups(project: &mut Value) -> Vec<&mut Vec<Value>> {
+    let Some(project) = project.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut main = None;
+    let mut children = Vec::new();
+    for (key, value) in project {
+        match key.as_str() {
+            "shapes" => main = value.as_array_mut(),
+            "compositions" => children.extend(
+                value
+                    .as_array_mut()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|comp| comp.get_mut("shapes").and_then(Value::as_array_mut)),
+            ),
+            _ => {}
+        }
+    }
+    main.into_iter().chain(children).collect()
+}
 fn entry(zip: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>, String> {
     let mut file = zip.by_name(name).map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();

@@ -404,6 +404,14 @@ impl TextInk {
         self.glyphs.iter().map(|glyph| glyph.bounds).reduce(union)
     }
 
+    pub(crate) fn outlined(&self, size: [f32; 2]) -> crate::paths::PathData {
+        let contours = self.glyphs.iter().filter_map(|glyph| match &glyph.paths {
+            GlyphPaths::Solid(path, _, transform) => (**path).clone().transform(*transform),
+            GlyphPaths::Styled { .. } => None,
+        }).flat_map(|path| crate::paths::PathData::from_outline(&path, size).contours).collect();
+        crate::paths::PathData { contours }
+    }
+
     pub(crate) fn hit_boxes(&self) -> Vec<Rect> {
         self.glyphs
             .iter()

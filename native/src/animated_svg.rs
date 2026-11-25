@@ -25,6 +25,9 @@ struct Sample {
 }
 
 pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
+    if let Some(layer) = scene.shapes.iter().find(|shape| shape.kind == "composition") {
+        return Err(format!("{}: animated SVG can't export composition layers.", layer.name));
+    }
     let mut defs = String::new();
     let mut layers = String::new();
     let mut text_cache = TextCache::default();
@@ -128,9 +131,13 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     } else {
         format!("<defs>{defs}</defs>")
     };
+    let background = if scene.transparent_background {
+        String::new()
+    } else {
+        format!(r#"<rect width="{w}" height="{h}" fill="{}"/>"#, attr(&scene.bg))
+    };
     Ok(format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" overflow="hidden">{defs}<rect width="{w}" height="{h}" fill="{}"/>{layers}</svg>"#,
-        attr(&scene.bg)
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" overflow="hidden">{defs}{background}{layers}</svg>"#
     ))
 }
 
@@ -255,8 +262,8 @@ fn svg_matrix([a, b, c, d, e, f]: [f32; 6]) -> String {
 
 /// The scene at `t` as a still SVG (Electron's `svgText(false)`): each layer shown then, posed as it is then.
 pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
-    if scene.shapes.iter().any(|shape| {
-        shape.kind == "adjustment" || shape.effects.iter().any(|effect| effect.enabled)
+    if scene.transparent_background || scene.shapes.iter().any(|shape| {
+        shape.composition.is_some() || shape.kind == "adjustment" || shape.effects.iter().any(|effect| effect.enabled)
     }) || !crate::motion_blur::exposure(scene, t, crate::motion_blur::DEFAULT_FPS).is_empty()
     {
         let picture = crate::render::frame(scene, place, t)?;

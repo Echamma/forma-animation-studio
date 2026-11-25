@@ -14,9 +14,11 @@ use crate::vector_render::{GeometryCache, VectorInk};
 use crate::{assets, svg, text};
 use canopy_ui::Place;
 use std::collections::HashMap;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tiny_skia::{
     Color, FillRule, IntRect, IntSize, Paint, Path as Outline, PathBuilder, Pixmap, PixmapPaint,
     Point, Rect, Transform,
@@ -47,6 +49,38 @@ pub struct Renderer {
     geometry: Mutex<GeometryCache>,
     text: Mutex<(TextCache, TextPaths)>,
     text_hits: Mutex<TextHits>,
+    compositions: HashMap<String, Renderer>,
+    nested_video: Mutex<HashMap<String, NestedVideo>>,
+    preview_videos: Mutex<HashMap<u64, (u64, crate::videos::Videos)>>,
+    preview_pending: AtomicBool,
+    preview_epoch: AtomicU64,
+}
+
+struct NestedVideo {
+    info: crate::media::Info,
+    reader: Option<crate::media::ShutterReader>,
+    size: (u32, u32),
+}
+
+type CompositionFrames = RefCell<HashMap<(String, u64, u32, u32), Arc<Pixmap>>>;
+
+#[derive(Clone, Copy)]
+struct CompositionRender<'a> {
+    renderer: &'a Renderer,
+    project: &'a Scene,
+    pixels: &'a CompositionFrames,
+    depth: usize,
+    fps: u32,
+    instance: u64,
+}
+
+impl CompositionRender<'_> {
+    fn enter(self, layer: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (self.instance, layer).hash(&mut hash);
+        Self { depth: self.depth + 1, instance: hash.finish(), ..self }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +94,7 @@ struct RenderFrame<'a> {
     strict: bool,
     videos: &'a Frames,
     sampled_videos: Option<&'a SampleFrames>,
+    compositions: CompositionRender<'a>,
 }
 
 struct MatteFrame {
@@ -73,7 +108,21 @@ enum Ink<'a> {
     Fill(Outline, Paint<'static>),
     Vector(VectorInk),
     Text(TextInk),
-    Picture(&'a Pixmap, PixmapPaint, Transform),
+    Picture(PicturePixels<'a>, PixmapPaint, Transform),
+}
+
+enum PicturePixels<'a> {
+    Borrowed(&'a Pixmap),
+    Composition(Arc<Pixmap>),
+}
+
+impl PicturePixels<'_> {
+    fn pixmap(&self) -> &Pixmap {
+        match self {
+            Self::Borrowed(pixels) => pixels,
+            Self::Composition(pixels) => pixels,
+        }
+    }
 }
 
 impl Ink<'_> {
@@ -91,6 +140,7 @@ impl Ink<'_> {
             Ink::Vector(ink) => ink.bounds(),
             Ink::Text(ink) => ink.bounds(),
             Ink::Picture(pixmap, _, transform) => {
+                let pixmap = pixmap.pixmap();
                 let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
                 let mut corners = [
                     Point::from_xy(0.0, 0.0),
@@ -114,7 +164,7 @@ impl Ink<'_> {
             Ink::Picture(pixmap, paint, transform) => target.draw_pixmap(
                 0,
                 0,
-                pixmap.as_ref(),
+                pixmap.pixmap().as_ref(),
                 paint,
                 transform.post_concat(offset),
                 None,
@@ -163,20 +213,43 @@ impl Renderer {
             geometry: Mutex::default(),
             text: Mutex::default(),
             text_hits: Mutex::default(),
+            compositions: scene.compositions.iter().map(|comp| {
+                (comp.project_id.clone(), Self::new(comp, place))
+            }).collect(),
+            nested_video: Mutex::default(),
+            preview_videos: Mutex::default(),
+            preview_pending: AtomicBool::default(),
+            preview_epoch: AtomicU64::default(),
         }
     }
 
     /// Whether this renderer has read the pictures `scene` shows.
     pub fn matches(&self, scene: &Scene) -> bool {
         self.sources == sources(scene)
+            && self.compositions.len() == scene.compositions.len()
+            && scene.compositions.iter().all(|comp| self.compositions.get(&comp.project_id)
+                .is_some_and(|renderer| renderer.matches(comp)))
     }
 
     /// Whether every layer can be exported: none is left out of an export.
     pub fn check(&self, scene: &Scene) -> Result<(), String> {
-        scene
-            .shapes
-            .iter()
-            .try_for_each(|shape| self.exportable(shape))
+        scene.validate_compositions()?;
+        self.check_composition(scene, self, scene, &mut std::collections::HashSet::new())
+    }
+
+    fn check_composition(&self, scene: &Scene, root: &Renderer, project: &Scene, seen: &mut std::collections::HashSet<String>) -> Result<(), String> {
+        if !seen.insert(scene.project_id.clone()) {
+            return Ok(());
+        }
+        for shape in &scene.shapes {
+            self.exportable(shape)?;
+            if let Some(playback) = &shape.composition {
+                let child = project.composition(&playback.source).ok_or_else(|| format!("{}: missing source composition", shape.name))?;
+                let renderer = root.compositions.get(&playback.source).ok_or("Missing composition renderer")?;
+                renderer.check_composition(child, root, project, seen)?;
+            }
+        }
+        Ok(())
     }
 
     fn exportable(&self, shape: &Shape) -> Result<(), String> {
@@ -200,15 +273,94 @@ impl Renderer {
         self.videos.get(id).map(PathBuf::as_path)
     }
 
+    pub(crate) fn composition_renderer(&self, id: &str) -> Option<&Self> {
+        self.compositions.get(id)
+    }
+
+    fn nested_frames(&self, scene: &Scene, time: f64, output: (u32, u32), fps: u32) -> Result<Frames, String> {
+        let mut videos = self.nested_video.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut frames = Frames::new();
+        for shape in scene.shapes.iter().filter(|s| s.kind == "video" && s.visible(time, scene.duration)) {
+            let path = self.video(&shape.id).ok_or_else(|| format!("{}: missing video file", shape.name))?;
+            if !videos.contains_key(&shape.id) {
+                videos.insert(shape.id.clone(), NestedVideo { info: crate::media::probe(path)?, reader: None, size: (0, 0) });
+            }
+            let video = videos.get_mut(&shape.id).ok_or("Missing video reader")?;
+            let size = limit_decode_size(output, video.info);
+            if video.size != size {
+                video.size = size;
+                video.reader = None;
+            }
+            let pixels = crate::media::ShutterReader::at(&mut video.reader, (path, video.info.duration, size), shape, time, fps)?;
+            frames.insert(shape.id.clone(), pixels.as_ref().clone());
+        }
+        Ok(frames)
+    }
+
+    pub(crate) fn preview_is_waiting(&self) -> bool {
+        self.preview_pending.load(Ordering::Relaxed)
+    }
+
+    fn nested_preview(&self, scene: &Scene, time: f64, scale: f32, composition: CompositionRender<'_>) -> Frames {
+        if self.videos.is_empty() {
+            return Frames::default();
+        }
+        let mut instances = self.preview_videos.lock().unwrap_or_else(PoisonError::into_inner);
+        let epoch = composition.renderer.preview_epoch.load(Ordering::Relaxed);
+        instances.retain(|_, (last, _)| epoch.wrapping_sub(*last) <= 2);
+        if instances.len() >= 32 && !instances.contains_key(&composition.instance) {
+            return Frames::default();
+        }
+        let (last, videos) = instances.entry(composition.instance).or_default();
+        *last = epoch;
+        if videos.update(scene, self, time, false, scale) {
+            composition.renderer.preview_pending.store(true, Ordering::Relaxed);
+        }
+        videos.frames.clone()
+    }
+
+    fn nested_preview_sample(&self, composition: CompositionRender<'_>, time: f64) -> Option<SampleFrames> {
+        self.preview_videos.lock().unwrap_or_else(PoisonError::into_inner).get(&composition.instance)?.1.sample(time)
+    }
+
+    pub(crate) fn cached_frame(&self, scene: &Scene, time: f64, size: (u32, u32), transparent: bool) -> Result<Pixmap, String> {
+        let fps = motion_blur::DEFAULT_FPS;
+        let frames = self.nested_frames(scene, time, size, fps)?;
+        self.export_frame(scene, time, size, fps, &frames, |sample| {
+            self.nested_frames(scene, sample, size, fps).map(|frames| {
+                Some(frames.into_iter().map(|(id, pixels)| (id, Arc::new(pixels))).collect())
+            })
+        }, transparent)
+    }
+
     /// Whether the editor's preview leaves this layer out (the editor marks where it is).
     pub fn leaves_out(&self, shape: &Shape) -> bool {
         !self.draws(shape)
     }
 
+    pub(crate) fn template_preview(&self, scene: &Scene, time: f64, size: (u32, u32)) -> Result<(Pixmap, bool), String> {
+        let fps = motion_blur::DEFAULT_FPS;
+        let cache = CompositionFrames::default();
+        let composition = self.composition_render(scene, &cache, fps);
+        self.preview_pending.store(false, Ordering::Relaxed);
+        self.preview_epoch.fetch_add(1, Ordering::Relaxed);
+        let frames = self.nested_preview(scene, time, size.0 as f32 / scene.width, composition);
+        let shutter = motion_blur::exposure(scene, time, fps);
+        let pixels = if shutter.is_empty() {
+            self.draw_surface(scene, time, size, false, &frames, None, composition, true)?
+        } else {
+            average(&shutter, |time_sample| {
+                let sampled = self.nested_preview_sample(composition, time_sample);
+                self.draw_surface(scene, time, size, false, &frames, Some((time_sample, sampled.as_ref())), composition, true)
+            })?
+        };
+        Ok((pixels, self.preview_is_waiting()))
+    }
+
     fn draws(&self, shape: &Shape) -> bool {
         matches!(
             shape.kind.as_str(),
-            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text" | "path" | "adjustment"
+            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text" | "path" | "adjustment" | "composition"
         ) || (matches!(shape.kind.as_str(), "image" | "video" | "svg")
             && self.images.contains_key(&shape.id))
     }
@@ -239,21 +391,38 @@ impl Renderer {
         size: (u32, u32),
         fps: u32,
         frames: &Frames,
-        mut read_sample: impl FnMut(f64) -> Result<Option<SampleFrames>, String>,
+        read_sample: impl FnMut(f64) -> Result<Option<SampleFrames>, String>,
     ) -> Result<Pixmap, String> {
+        self.export_frame(scene, time, size, fps, frames, read_sample, false)
+    }
+
+    pub(crate) fn export_frame(
+        &self,
+        scene: &Scene,
+        time: f64,
+        size: (u32, u32),
+        fps: u32,
+        frames: &Frames,
+        mut read_sample: impl FnMut(f64) -> Result<Option<SampleFrames>, String>,
+        transparent: bool,
+    ) -> Result<Pixmap, String> {
+        let pixels = CompositionFrames::default();
+        let compositions = self.composition_render(scene, &pixels, fps);
         let times = motion_blur::exposure(scene, time, fps);
         if times.is_empty() {
-            return self.draw(scene, time, size, true, frames, None);
+            return self.draw_surface(scene, time, size, true, frames, None, compositions, transparent);
         }
         average(&times, |sample| {
             let videos = read_sample(sample)?;
-            self.draw(
+            self.draw_surface(
                 scene,
                 time,
                 size,
                 true,
                 frames,
                 Some((sample, videos.as_ref())),
+                compositions,
+                transparent,
             )
         })
     }
@@ -304,6 +473,8 @@ impl Renderer {
         frames: &Frames,
         read_sample: impl Fn(f64) -> Option<SampleFrames>,
     ) -> Option<Pixmap> {
+        self.preview_pending.store(false, Ordering::Relaxed);
+        self.preview_epoch.fetch_add(1, Ordering::Relaxed);
         let canvas = self.draw_view(scene, t, view, clip, frames, None)?;
         if !scene.motion_blur_preview {
             return Some(canvas);
@@ -342,7 +513,9 @@ impl Renderer {
         let [r, g, b] = rgb(&scene.bg);
         let mut paint = Paint::default();
         paint.set_color(Color::from_rgba8(r, g, b, 255));
-        canvas.fill_rect(frame, &paint, Transform::identity(), None);
+        if !scene.transparent_background {
+            canvas.fill_rect(frame, &paint, Transform::identity(), None);
+        }
         let view = Transform::from_row(scale, 0.0, 0.0, scale, left, top);
         let mut hits = self
             .text_hits
@@ -361,6 +534,7 @@ impl Renderer {
             frames,
             sample,
             sample.is_none().then_some(&mut hits),
+            self.composition_render(scene, &CompositionFrames::default(), motion_blur::DEFAULT_FPS),
         )
         .ok()?;
         if clip {
@@ -417,10 +591,25 @@ impl Renderer {
         frames: &Frames,
         sample: Option<ShutterSample<'_>>,
     ) -> Result<Pixmap, String> {
+        self.draw_surface(scene, t, (width, height), strict, frames, sample,
+            self.composition_render(scene, &CompositionFrames::default(), motion_blur::DEFAULT_FPS), false)
+    }
+
+    fn composition_render<'a>(&'a self, scene: &'a Scene, pixels: &'a CompositionFrames, fps: u32) -> CompositionRender<'a> {
+        CompositionRender { renderer: self, project: scene, pixels, depth: 0, fps, instance: 0 }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_surface(
+        &self, scene: &Scene, t: f64, (width, height): (u32, u32), strict: bool, frames: &Frames,
+        sample: Option<ShutterSample<'_>>, compositions: CompositionRender<'_>, transparent: bool,
+    ) -> Result<Pixmap, String> {
         let mut canvas =
             Pixmap::new(width.max(1), height.max(1)).ok_or("Scene is too large to render")?;
         let [r, g, b] = rgb(&scene.bg);
-        canvas.fill(Color::from_rgba8(r, g, b, 255));
+        if !transparent && !scene.transparent_background {
+            canvas.fill(Color::from_rgba8(r, g, b, 255));
+        }
         // Like Electron's export, which scales the canvas by width and height separately.
         let (scale_x, scale_y) = (width as f32 / scene.width, height as f32 / scene.height);
         let view = Transform::from_scale(scale_x, scale_y);
@@ -434,6 +623,7 @@ impl Renderer {
             frames,
             sample,
             None,
+            compositions,
         )?;
         Ok(canvas)
     }
@@ -451,6 +641,7 @@ impl Renderer {
         frames: &Frames,
         sample: Option<ShutterSample<'_>>,
         mut text_hits: Option<&mut TextHits>,
+        compositions: CompositionRender<'_>,
     ) -> Result<(), String> {
         let frame = RenderFrame {
             renderer: self,
@@ -462,6 +653,7 @@ impl Renderer {
             strict,
             videos: frames,
             sampled_videos: None,
+            compositions,
         };
         let mut mattes = MatteLinks::new(scene).map(|links| MatteFrame {
             links,
@@ -479,6 +671,9 @@ impl Renderer {
             let source = mattes
                 .as_ref()
                 .and_then(|mattes| mattes.links.sources[index]);
+            if source.is_none() && active.paint_precomposed_stack(canvas, shape)? {
+                continue;
+            }
             if shape.kind == "adjustment" {
                 let matte = match (&mut mattes, source) {
                     (Some(mattes), Some(source)) => mattes.source(&frame, source, sample)?,
@@ -541,6 +736,7 @@ impl Renderer {
         time: f64,
     ) -> Result<Option<LayerPixels>, String> {
         let videos = Frames::default();
+        let pixels = CompositionFrames::default();
         let frame = RenderFrame {
             renderer: self,
             scene,
@@ -551,6 +747,7 @@ impl Renderer {
             strict: false,
             videos: &videos,
             sampled_videos: None,
+            compositions: self.composition_render(scene, &pixels, motion_blur::DEFAULT_FPS),
         };
         Ok(frame.visible_ink(shape)?.and_then(|(ink, layer)| {
             frame.raster(shape, layer, &ink, frame.layer_blur(shape, layer))
@@ -571,14 +768,7 @@ impl Renderer {
         let pose = frame.pose;
         let place = frame.transform.post_concat(view);
         if let Some(pixmap) = video_pixels.or_else(|| self.images.get(&shape.id)) {
-            let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
-            let mut paint = PixmapPaint::default();
-            paint.opacity = (pose.o / 100.0).clamp(0.0, 1.0);
-            paint.quality = tiny_skia::FilterQuality::Bilinear;
-            let transform = Transform::from_scale(pose.w / w, pose.h / h)
-                .post_translate(-pose.w / 2.0, -pose.h / 2.0)
-                .post_concat(place);
-            return Some(Ink::Picture(pixmap, paint, transform));
+            return Some(picture_ink(PicturePixels::Borrowed(pixmap), frame, view));
         }
         if let Some(vector) = &shape.vector
             && shape.is_vector()
@@ -597,7 +787,55 @@ impl Renderer {
     }
 }
 
+fn picture_ink(pixels: PicturePixels<'_>, frame: LayerFrame, view: Transform) -> Ink<'_> {
+    let pixmap = pixels.pixmap();
+    let pose = frame.pose;
+    let paint = PixmapPaint {
+        opacity: (pose.o / 100.0).clamp(0.0, 1.0),
+        quality: tiny_skia::FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    };
+    let transform = Transform::from_scale(pose.w / pixmap.width() as f32, pose.h / pixmap.height() as f32)
+        .post_translate(-pose.w / 2.0, -pose.h / 2.0)
+        .post_concat(frame.transform.post_concat(view));
+    Ink::Picture(pixels, paint, transform)
+}
+
 impl<'a> RenderFrame<'a> {
+    fn paint_precomposed_stack(&self, canvas: &mut Pixmap, shape: &Shape) -> Result<bool, String> {
+        let Some(playback) = &shape.composition else { return Ok(false) };
+        if !playback.preserve_stack || playback.offset != 0.0 || playback.speed != 1.0 || playback.looping
+            || shape.clip_start() != 0.0 || !shape.visible(self.time, self.scene.duration)
+            || shape.blend() != Blend::Normal || !shape.masks.is_empty() || blur(shape) > 0.0
+            || shape.effects.iter().any(|effect| effect.enabled)
+        {
+            return Ok(false);
+        }
+        let project = self.compositions.project;
+        let Some(source) = project.composition(&playback.source) else { return Ok(false) };
+        let frame = self.scene.layer_frame(shape, self.time);
+        if frame.pose.o != 100.0 || !source.transparent_background
+            || (source.width, source.height) != (self.scene.width, self.scene.height)
+            || (frame.pose.w, frame.pose.h) != (source.width, source.height)
+            || frame.transform != Transform::from_translate(source.width / 2.0, source.height / 2.0)
+            || source.motion_blur.is_some() && source.shapes.iter().any(|layer| layer.motion_blur)
+            || self.compositions.depth + 1 >= crate::composition::MAX_DEPTH
+        {
+            return Ok(false);
+        }
+        let Some(renderer) = self.compositions.renderer.compositions.get(&playback.source) else {
+            return Ok(false);
+        };
+        // The unchanged layer shares its original backdrop, pixel grid and blend order.
+        let time = playback.time(self.time, source.duration);
+        let nested = self.compositions.enter(&shape.id);
+        let frames = if self.strict { renderer.nested_frames(source, time, self.size, nested.fps)? }
+            else { renderer.nested_preview(source, time, self.scale, nested) };
+        renderer.layers(canvas, source, time, self.view, self.scale, self.strict, &frames, None, None,
+            nested)?;
+        Ok(true)
+    }
+
     fn visible_ink(&self, shape: &Shape) -> Result<Option<(Ink<'_>, LayerFrame)>, String> {
         if !shape.visible(self.time, self.scene.duration) {
             return Ok(None);
@@ -612,7 +850,62 @@ impl<'a> RenderFrame<'a> {
                 return Err(format!("{}: no video frame", shape.name));
             }
         }
+        if let Some(playback) = &shape.composition {
+            let result = self.composition_pixels(shape, playback, frame);
+            return match result {
+                Ok(pixels) => Ok(Some((picture_ink(PicturePixels::Composition(pixels), frame, self.view), frame))),
+                Err(error) if self.strict => Err(error),
+                Err(_) => Ok(None),
+            };
+        }
         Ok(self.ink_at(shape, frame).map(|ink| (ink, frame)))
+    }
+
+    fn composition_pixels(&self, shape: &Shape, playback: &crate::composition::Playback, frame: LayerFrame) -> Result<Arc<Pixmap>, String> {
+        let composition = self.compositions;
+        let missing = || format!("{}: missing source composition", shape.name);
+        let source = composition.project.composition(&playback.source).ok_or_else(missing)?;
+        if composition.depth >= crate::composition::MAX_DEPTH {
+            return Err(format!("{}: compositions are nested too deeply", shape.name));
+        }
+        let renderer = composition.renderer.compositions.get(&playback.source).ok_or_else(missing)?;
+        let time = playback.time(self.time - shape.clip_start(), source.duration);
+        let (sx, sy) = crate::transform::axis_scales(frame.transform.post_concat(self.view));
+        let size = (
+            (frame.pose.w * sx).round().clamp(1.0, 8192.0) as u32,
+            (frame.pose.h * sy).round().clamp(1.0, 8192.0) as u32,
+        );
+        let scale = (16_777_216.0 / (size.0 as f64 * size.1 as f64)).sqrt().min(1.0);
+        let size = (((size.0 as f64 * scale) as u32).max(1), ((size.1 as f64 * scale) as u32).max(1));
+        let key = (playback.source.clone(), time.to_bits(), size.0, size.1);
+        if let Some(pixels) = composition.pixels.borrow().get(&key) {
+            return Ok(Arc::clone(pixels));
+        }
+        let nested = composition.enter(&shape.id);
+        let frames = if self.strict { renderer.nested_frames(source, time, size, composition.fps)? }
+            else { renderer.nested_preview(source, time, size.0 as f32 / source.width, nested) };
+        let shutter = if self.strict || source.motion_blur_preview {
+            motion_blur::exposure(source, time, composition.fps)
+        } else {
+            Vec::new()
+        };
+        let pixels = Arc::new(if shutter.is_empty() {
+            renderer.draw_surface(source, time, size, self.strict, &frames, None, nested, false)?
+        } else {
+            average(&shutter, |sample| {
+                let sampled = if self.strict {
+                    Some(renderer.nested_frames(source, sample, size, composition.fps)?
+                        .into_iter().map(|(id, pixels)| (id, Arc::new(pixels))).collect())
+                } else { renderer.nested_preview_sample(nested, sample) };
+                renderer.draw_surface(source, time, size, self.strict, &frames, Some((sample, sampled.as_ref())), nested, false)
+            })?
+        });
+        let mut cache = composition.pixels.borrow_mut();
+        // A draw can contain many differently sized instances of the same composition.
+        if cache.len() < 8 && u64::from(size.0) * u64::from(size.1) <= 4_194_304 {
+            cache.insert(key, Arc::clone(&pixels));
+        }
+        Ok(pixels)
     }
 
     fn ink_at(&self, shape: &Shape, frame: LayerFrame) -> Option<Ink<'_>> {
@@ -707,7 +1000,12 @@ impl<'a> RenderFrame<'a> {
                 view: local_view,
                 ..*self
             };
-            let ink = local_renderer.ink_at(shape, local_frame)?;
+            let ink = match ink {
+                Ink::Picture(PicturePixels::Composition(pixels), _, _) => picture_ink(
+                    PicturePixels::Composition(Arc::clone(pixels)), local_frame, local_view,
+                ),
+                _ => local_renderer.ink_at(shape, local_frame)?,
+            };
             let bounds = ink.bounds()?;
             let local_blur = crate::render::blur(shape) * local.scale;
             let region = local.region(bounds, &effects, local_blur * 3.0)?;
