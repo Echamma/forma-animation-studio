@@ -134,6 +134,21 @@ impl Videos {
         self.update_shutter(scene, renderer, time, scale) || waiting
     }
 
+    pub(crate) fn have_playback_frames(&self, scene: &Scene, time: f64) -> bool {
+        scene
+            .shapes
+            .iter()
+            .filter(|shape| shape.kind == "video" && shape.visible(time, scene.duration))
+            .all(|shape| {
+                self.frames.contains_key(&shape.id)
+                    && self.streams.get(&shape.id).is_some_and(|stream| {
+                        stream.read > 0
+                            && (stream.from + (stream.read - 1) as f64 / FPS - time).abs()
+                                <= 0.5 / FPS
+                    })
+            })
+    }
+
     fn update_shutter(
         &mut self,
         scene: &Scene,

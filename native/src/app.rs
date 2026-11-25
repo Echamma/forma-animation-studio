@@ -237,6 +237,9 @@ pub(crate) fn new_id() -> String {
     )
 }
 
+type FrameKey = (f64, render::View, bool);
+type CachedFrame = (std::sync::Arc<tiny_skia::Pixmap>, render::TextHits);
+
 pub struct Forma {
     place: Place,
     scene: Scene,
@@ -264,6 +267,11 @@ pub struct Forma {
     video_settings: video::Settings,
     /// Draws the preview the way exports draw frames. Made again when the scene's pictures change.
     renderer: Option<render::Renderer>,
+    camera_tool: bool,
+    quality: crate::preview_cache::Quality,
+    playing_at_half: bool,
+    frame_time_ms: f64,
+    frame_cache: crate::preview_cache::Cache<FrameKey, CachedFrame>,
     /// The preview picture, and what it shows: the scene, the time, its size in pixels, and which video frames.
     preview: Option<(TextureHandle, Scene, f64, (render::View, bool), u64)>,
     /// The canvas's zoom (1 fits the space, 0.2-5) and how far it's panned from the middle, in points.
@@ -372,6 +380,11 @@ impl Forma {
             export_kind: ExportKind::Video,
             video_settings: video::Settings::default(),
             renderer: None,
+            camera_tool: false,
+            quality: Default::default(),
+            playing_at_half: false,
+            frame_time_ms: 0.0,
+            frame_cache: crate::preview_cache::Cache::new(crate::preview_cache::FRAME_BYTES),
             preview: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
@@ -421,6 +434,10 @@ impl Forma {
     }
 
     fn edited(&mut self) {
+        self.frame_cache.invalidate();
+        if let Some(renderer) = &self.renderer {
+            renderer.invalidate_preview_pixels();
+        }
         self.edited_at = Some(Instant::now());
         self.save_failed = false;
     }
@@ -448,6 +465,9 @@ impl Forma {
     }
 
     fn open(&mut self, scene: Scene) {
+        self.frame_cache.invalidate();
+        self.camera_tool = false;
+        self.playing_at_half = false;
         self.sound.pause();
         let _ = self.save();
         self.scene = scene;
@@ -766,6 +786,7 @@ impl Forma {
                 .on_hover_text("Draw an editable path")
                 .clicked()
             {
+                self.camera_tool = false;
                 self.vector_tools.toggle(VectorTool::Pen, None);
                 self.mask_editor.stop();
                 (self.motion_mode, self.motion_draft) = (None, None);
@@ -783,6 +804,7 @@ impl Forma {
                 .on_hover_text("Draw and edit masks on the selected layer")
                 .clicked()
             {
+                self.camera_tool = false;
                 self.mask_editor.toggle(&self.scene);
                 if self.mask_editor.active() {
                     self.vector_tools.set(None, None);
@@ -798,6 +820,7 @@ impl Forma {
                 if icon_button(ui, Icon::Chevron, "Draw a move for the selected layer (Escape stops)", drawing)
                     .clicked()
                 {
+                    self.camera_tool = false;
                     if drawing {
                         (self.motion_mode, self.motion_draft) = (None, None);
                     } else {
@@ -913,6 +936,13 @@ impl Forma {
             self.select_layer(Some(id), false);
             self.tab = Tab::Layer;
             self.edited();
+        }
+        if !self.scene.shapes.iter().any(Shape::is_camera)
+            && quiet_button(ui, "Camera", Some(Icon::Plus))
+                .on_hover_text("Add a camera for 3D layers")
+                .clicked()
+        {
+            self.add_camera();
         }
         section_label(ui, "Your files");
         if quiet_button(ui, "Picture, SVG or video…", Some(Icon::Image)).clicked() {
@@ -1455,6 +1485,18 @@ impl Forma {
             );
             return;
         };
+        if self.scene.shapes[index].is_camera() {
+            if self.tab == Tab::Animate {
+                if quiet_button(ui, "Show camera lanes", None).clicked() {
+                    self.key_editor
+                        .expanded
+                        .insert(self.scene.shapes[index].id.clone());
+                }
+            } else {
+                self.camera_panel(ui, index);
+            }
+            return;
+        }
         if self.tab == Tab::Animate {
             self.animate_tab(ui, index);
             return;
@@ -1483,6 +1525,7 @@ impl Forma {
             self.playing = false;
         }
         self.follows_picker(ui, index, false);
+        self.layer_3d_panel(ui, index);
         let was_masking = self.mask_editor.active();
         self.mask_editor
             .panel(ui, &mut self.scene, index, self.time, &mut self.playing);
@@ -1672,6 +1715,141 @@ impl Forma {
             .clicked()
         {
             self.clip_action(ClipAction::Delete);
+        }
+    }
+
+    fn add_camera(&mut self) -> Option<String> {
+        match self.scene.add_camera(new_id()) {
+            Ok(id) => {
+                self.select_layer(Some(id.clone()), false);
+                self.key_editor.expanded.insert(id.clone());
+                self.tab = Tab::Layer;
+                self.drawer = None;
+                self.edited();
+                Some(id)
+            }
+            Err(error) => {
+                self.notice = Some(error);
+                None
+            }
+        }
+    }
+
+    fn layer_3d_panel(&mut self, ui: &mut Ui, index: usize) {
+        use crate::spatial::{Property, Spatial};
+        let shape = &mut self.scene.shapes[index];
+        if shape.kind == "adjustment" {
+            return;
+        }
+        let mut enabled = shape.is_3d();
+        if ui.add_sized([40.0, 40.0], egui::Checkbox::new(&mut enabled, "3D"))
+            .on_hover_text("Use camera perspective. Layers are sorted back to front by their centers. Intersecting layers are drawn whole.")
+            .changed()
+        {
+            if enabled {
+                shape.spatial.get_or_insert_with(Spatial::default).enabled = true;
+                self.key_editor.expanded.insert(shape.id.clone());
+            } else if let Some(spatial) = &mut shape.spatial {
+                spatial.enabled = false;
+                if spatial.tracks.is_empty() {
+                    shape.spatial = None;
+                }
+            }
+        }
+        if enabled {
+            egui::CollapsingHeader::new("3D transform").show(ui, |ui| {
+                for property in Property::LAYER {
+                    spatial_field(ui, shape, property, self.time);
+                }
+            });
+        }
+    }
+
+    fn camera_panel(&mut self, ui: &mut Ui, index: usize) {
+        use crate::spatial::Property;
+        ui.add(egui::TextEdit::singleline(
+            &mut self.scene.shapes[index].name,
+        ));
+        self.follows_picker(ui, index, false);
+        self.clip_fields(ui, index);
+        let mut pose = self
+            .scene
+            .inspector_pose(&self.scene.shapes[index], self.time);
+        let previous = pose;
+        for (label, value) in [
+            ("X position", &mut pose.x),
+            ("Y position", &mut pose.y),
+            ("Z rotation", &mut pose.r),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.add_sized(
+                    [100.0, 32.0],
+                    egui::DragValue::new(value)
+                        .speed(1.0)
+                        .range(-1_000_000.0..=1_000_000.0),
+                );
+            });
+        }
+        if [pose.x, pose.y, pose.r].iter().all(|v| v.is_finite()) {
+            self.apply_inspector_pose(index, previous, pose);
+        }
+        let shape = &mut self.scene.shapes[index];
+        spatial_field(ui, shape, Property::Depth, self.time);
+        spatial_field(ui, shape, Property::FieldOfView, self.time);
+        let zoom_text = |shape: &Shape| {
+            let fov = shape.spatial_value(Property::FieldOfView, self.time)[0];
+            format!(
+                "Zoom {:.0} px",
+                crate::spatial::focal(self.scene.height, fov)
+            )
+        };
+        ui.label(egui::RichText::new(zoom_text(shape)).color(color::INK_MUTED));
+        egui::CollapsingHeader::new("Aim and focus").show(ui, |ui| {
+            let spatial = shape.spatial.get_or_insert_with(Default::default);
+            ui.add_sized(
+                [100.0, 32.0],
+                egui::Checkbox::new(&mut spatial.one_node, "One-node camera"),
+            )
+            .on_hover_text("Aim using the camera rotation");
+            let one_node = spatial.one_node;
+            ui.add_sized(
+                [100.0, 32.0],
+                egui::Checkbox::new(&mut spatial.depth_of_field, "Depth of field"),
+            )
+            .on_hover_text("Blur 3D layers in front of or behind the focus distance");
+            let depth_of_field = spatial.depth_of_field;
+            if !one_node {
+                spatial_field(ui, shape, Property::Interest, self.time);
+            }
+            for property in [
+                Property::RotationX,
+                Property::RotationY,
+                Property::Orientation,
+            ] {
+                spatial_field(ui, shape, property, self.time);
+            }
+            if depth_of_field {
+                spatial_field(ui, shape, Property::FocusDistance, self.time);
+                spatial_field(ui, shape, Property::Aperture, self.time);
+            }
+        });
+    }
+
+    fn camera_drag(&mut self, delta: Vec2, pan: bool, scale: f32) {
+        if delta == Vec2::ZERO {
+            return;
+        }
+        let camera = self
+            .scene
+            .shapes
+            .iter()
+            .rev()
+            .find(|shape| shape.is_camera() && shape.visible(self.time, self.scene.duration))
+            .map(|shape| shape.id.clone());
+        if let Some(id) = camera {
+            self.scene
+                .move_camera(&id, self.time, [delta.x, delta.y], pan, scale);
         }
     }
 
@@ -2123,7 +2301,7 @@ impl Forma {
         else {
             return;
         };
-        if self.playing || self.motion_mode.is_some() {
+        if self.playing || self.motion_mode.is_some() || self.scene.shapes[index].is_camera() {
             return;
         }
         let bar = Rect::from_center_size(
@@ -2897,8 +3075,35 @@ impl Forma {
                 } else {
                     format!("{shape} · {w} × {h}{playing}")
                 };
-                let size = ui.button(label).on_hover_text("Canvas size, length, and background");
-                back(ui, backing[0], size.rect);
+                let size = ui
+                    .button(label)
+                    .on_hover_text("Canvas size, length, and background");
+                let mut background = size.rect;
+                if self.scene.shapes.iter().any(Shape::is_3d) || self.camera_tool {
+                    let camera = ui
+                        .add(
+                            egui::Button::selectable(self.camera_tool, "Camera")
+                                .min_size(vec2(56.0, 32.0)),
+                        )
+                        .on_hover_text(
+                            "Drag to orbit the camera. Shift-drag or middle-drag to pan.",
+                        );
+                    background = background.union(camera.rect);
+                    if camera.clicked() {
+                        self.camera_tool = !self.camera_tool;
+                        if self.camera_tool {
+                            if !self.scene.shapes.iter().any(Shape::is_camera) {
+                                self.add_camera();
+                            }
+                            self.mask_editor.stop();
+                            self.vector_tools.set(None, None);
+                            (self.motion_mode, self.motion_draft) = (None, None);
+                            self.gesture = None;
+                            self.playing = false;
+                        }
+                    }
+                }
+                back(ui, backing[0], background);
                 if size.clicked() {
                     self.open_scene = true;
                 }
@@ -2966,9 +3171,12 @@ impl Forma {
             .as_ref()
             .is_none_or(|r| !r.matches(&self.scene))
         {
+            self.frame_cache.invalidate();
             self.renderer = Some(render::Renderer::new(&self.scene, &self.place));
         }
-        let renderer = self.renderer.as_ref().unwrap();
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
         // The frame and its surroundings (Electron's pasteboard: 55 % of the longer side around it), as far as they're
         // in view, drawn at the screen's pixel size, again only when the scene, the time or the view changes.
         let pixels = ui.ctx().pixels_per_point();
@@ -2980,7 +3188,7 @@ impl Forma {
             (shown.max.to_vec2() * pixels).round().to_pos2() / pixels,
         );
         let pixel_scale = scale * pixels;
-        let view = (
+        let full_view = (
             (
                 (snapped.left() - canvas.left()) / scale,
                 (snapped.top() - canvas.top()) / scale,
@@ -2992,9 +3200,24 @@ impl Forma {
             ),
         );
         let clip = self.playing;
+        if !clip {
+            self.playing_at_half = false;
+        }
+        let quality = if self.playing_at_half && self.quality == crate::preview_cache::Quality::Full
+        {
+            crate::preview_cache::Quality::Half
+        } else {
+            self.quality
+        };
+        let view = quality.view(full_view);
+        let time = if clip {
+            ((self.time * 30.0 + 1e-8).floor() / 30.0).min(self.scene.duration)
+        } else {
+            self.time
+        };
         if self
             .videos
-            .update(&self.scene, renderer, self.time, self.playing, pixel_scale)
+            .update(&self.scene, renderer, time, clip, view.1)
         {
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
@@ -3014,50 +3237,93 @@ impl Forma {
             }
             None => std::borrow::Cow::Borrowed(&self.scene),
         };
-        let stale = renderer.preview_is_waiting() || self
+        let scene_changed = self
             .preview
             .as_ref()
-            .is_none_or(|(_, scene, time, drawn, shown)| {
-                *drawn != (view, clip)
-                    || *time != self.time
-                    || *scene != *display
-                    || *shown != generation
-            });
+            .is_some_and(|(_, scene, ..)| *scene != *display);
+        if scene_changed {
+            self.frame_cache.invalidate();
+            renderer.invalidate_preview_pixels();
+        }
+        let stale = scene_changed
+            || renderer.preview_is_waiting()
+            || self
+                .preview
+                .as_ref()
+                .is_none_or(|(_, _, drawn_time, drawn, shown)| {
+                    *drawn != (view, clip) || *drawn_time != time || *shown != generation
+                });
         if stale {
-            if let Some(pixmap) = renderer.view_with_samples(
-                &display,
-                self.time,
-                view,
-                clip,
-                &self.videos.frames,
-                |sample| self.videos.sample(sample),
-            ) {
+            let start = Instant::now();
+            let key = (time, view, clip);
+            let cacheable = clip
+                && !renderer.has_nested_video()
+                && !(display.motion_blur_preview
+                    && display
+                        .shapes
+                        .iter()
+                        .any(|shape| shape.kind == "video" && shape.motion_blur));
+            let cached = if cacheable {
+                self.frame_cache.get(&key)
+            } else {
+                None
+            };
+            let pixels = if let Some((pixels, hits)) = cached {
+                renderer.restore_text_hits(hits);
+                Some(pixels)
+            } else {
+                let pixels = renderer
+                    .view_with_samples(&display, time, view, clip, &self.videos.frames, |sample| {
+                        self.videos.sample(sample)
+                    })
+                    .map(std::sync::Arc::new);
+                self.frame_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(pixels) = pixels.as_ref().filter(|_| {
+                    cacheable
+                        && !renderer.preview_is_waiting()
+                        && self.videos.have_playback_frames(&self.scene, time)
+                }) {
+                    let hits = renderer.text_hits_snapshot();
+                    let bytes = pixels.data().len()
+                        + hits
+                            .iter()
+                            .map(|(key, rects)| {
+                                key.len() + rects.len() * std::mem::size_of::<tiny_skia::Rect>()
+                            })
+                            .sum::<usize>();
+                    self.frame_cache.insert(key, (pixels.clone(), hits), bytes);
+                }
+                if clip
+                    && quality == crate::preview_cache::Quality::Full
+                    && self.frame_time_ms > 1000.0 / 30.0
+                {
+                    self.playing_at_half = true;
+                    ui.ctx().request_repaint();
+                }
+                pixels
+            };
+            if let Some(pixmap) = pixels {
                 let image = egui::ColorImage::from_rgba_premultiplied(
                     [pixmap.width() as usize, pixmap.height() as usize],
                     pixmap.data(),
                 );
-                match &mut self.preview {
-                    Some((texture, scene, time, drawn, shown)) => {
-                        texture.set(image, TextureOptions::LINEAR);
-                        (*scene, *time, *drawn, *shown) = (
-                            display.clone().into_owned(),
-                            self.time,
-                            (view, clip),
-                            generation,
-                        );
+                if let Some((texture, scene, drawn_time, drawn, shown)) = &mut self.preview {
+                    texture.set(image, TextureOptions::LINEAR);
+                    if scene_changed {
+                        *scene = display.into_owned();
                     }
-                    None => {
-                        let texture =
-                            ui.ctx()
-                                .load_texture("forma-preview", image, TextureOptions::LINEAR);
-                        self.preview = Some((
-                            texture,
-                            display.clone().into_owned(),
-                            self.time,
-                            (view, clip),
-                            generation,
-                        ));
-                    }
+                    (*drawn_time, *drawn, *shown) = (time, (view, clip), generation);
+                } else {
+                    let texture =
+                        ui.ctx()
+                            .load_texture("forma-preview", image, TextureOptions::LINEAR);
+                    self.preview = Some((
+                        texture,
+                        display.into_owned(),
+                        time,
+                        (view, clip),
+                        generation,
+                    ));
                 }
             }
         }
@@ -3088,16 +3354,94 @@ impl Forma {
             [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
                 .map(|(x, y)| from_layer(frame, x * frame.pose.w, y * frame.pose.h))
         };
+        let overlays = if self.playing {
+            std::borrow::Cow::Borrowed(&self.scene)
+        } else {
+            crate::expressions::at_time(&self.scene, time)
+        };
+        let camera = crate::spatial::Camera::at(&overlays, time);
         let mut hits = Vec::new();
-        let mattes = MatteLinks::new(&self.scene);
-        for (index, shape) in self.scene.shapes.iter().enumerate() {
-            if !shape.visible(self.time, self.scene.duration) {
+        let mut depths = Vec::new();
+        let mut projected = std::collections::HashMap::new();
+        let mattes = MatteLinks::new(&overlays);
+        for (index, shape) in overlays.shapes.iter().enumerate() {
+            if shape.is_camera() || !shape.visible(time, overlays.duration) {
                 continue;
             }
             if mattes.as_ref().is_some_and(|mattes| mattes.hidden[index]) {
                 continue;
             }
-            let frame = self.scene.layer_frame(shape, self.time);
+            let frame = overlays.layer_frame(shape, time);
+            if shape.is_3d() {
+                let plane = crate::spatial::Plane {
+                    scene: &overlays,
+                    shape,
+                    frame,
+                    time,
+                };
+                let map = |x, y, z| {
+                    let (x, y) = transform::point(frame.transform, x, y);
+                    camera
+                        .project(plane.world([x, y, z]))
+                        .map(|[x, y]| to_screen(x, y))
+                };
+                let quad: Option<Vec<_>> = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)]
+                    .into_iter()
+                    .map(|(x, y)| map(x * frame.pose.w, y * frame.pose.h, 0.0))
+                    .collect();
+                if let Some(quad) = quad {
+                    if !self.playing && self.multi_selected.contains(&shape.id) {
+                        painter.add(egui::Shape::closed_line(
+                            quad.clone(),
+                            Stroke::new(1.5, color::SUN),
+                        ));
+                    }
+                    projected.insert(index, quad);
+                }
+                if !self.playing && self.selected.as_deref() == Some(shape.id.as_str()) {
+                    let (x, y) = frame.anchor();
+                    if let Some([x, y]) = camera.project(plane.world([x, y, 0.0])) {
+                        let origin = to_screen(x, y);
+                        let length = 44.0 / scale;
+                        let (a, b) = shape.anchor.unwrap_or_default().offset_in(frame.pose);
+                        for (axis, endpoint, tint) in [
+                            (
+                                "X",
+                                map(a + length, b, 0.0),
+                                canopy_ui::Accent::Clay.color(),
+                            ),
+                            ("Y", map(a, b + length, 0.0), color::LEAF),
+                            ("Z", map(a, b, length), canopy_ui::Accent::Sky.color()),
+                        ] {
+                            if let Some(point) = endpoint {
+                                if point.distance(origin) < 4.0 {
+                                    painter.circle_stroke(origin, 6.0, Stroke::new(1.5, tint));
+                                    painter.text(
+                                        origin + vec2(9.0, -9.0),
+                                        Align2::CENTER_CENTER,
+                                        axis,
+                                        font::ui(11.0),
+                                        tint,
+                                    );
+                                } else {
+                                    painter.line_segment([origin, point], Stroke::new(2.0, tint));
+                                    painter.text(
+                                        point,
+                                        Align2::CENTER_CENTER,
+                                        axis,
+                                        font::ui(11.0),
+                                        tint,
+                                    );
+                                }
+                            }
+                        }
+                        painter.circle_filled(origin, 3.5, color::SUN);
+                    }
+                }
+                depths.push(Some(camera.depth(plane.center())));
+            } else {
+                depths.push(None);
+            }
             if renderer.leaves_out(shape) {
                 painter.add(egui::Shape::convex_polygon(
                     corners(frame).to_vec(),
@@ -3117,6 +3461,7 @@ impl Forma {
             }
             hits.push((index, frame));
             if !self.playing
+                && !shape.is_3d()
                 && self.multi_selected.contains(&shape.id)
                 && self.selected.as_deref() != Some(&shape.id)
             {
@@ -3126,12 +3471,16 @@ impl Forma {
                 ));
             }
         }
+        let order = crate::spatial::depth_order(&depths);
+        let hits: Vec<_> = order
+            .into_iter()
+            .filter_map(|index| hits.get(index).copied())
+            .collect();
         let selected = self.selected.as_deref().and_then(|id| {
-            let index = self.scene.shapes.iter().position(|shape| shape.id == id)?;
-            let shape = &self.scene.shapes[index];
-            shape
-                .visible(self.time, self.scene.duration)
-                .then(|| (index, self.scene.layer_frame(shape, self.time)))
+            let index = overlays.shapes.iter().position(|shape| shape.id == id)?;
+            let shape = &overlays.shapes[index];
+            (!shape.is_3d() && shape.visible(time, overlays.duration))
+                .then(|| (index, overlays.layer_frame(shape, time)))
         });
         let on_path = |shape: &Shape| {
             shape
@@ -3149,8 +3498,8 @@ impl Forma {
             self.vector_tools.tool,
         ) {
             if let Some(bounds) = renderer.text_bounds(&self.scene.shapes[index].id) {
-                let min = snapped.min + vec2(bounds.left(), bounds.top()) / pixels;
-                let max = snapped.min + vec2(bounds.right(), bounds.bottom()) / pixels;
+                let min = snapped.min + vec2(bounds.left(), bounds.top()) / (view.1 / scale);
+                let max = snapped.min + vec2(bounds.right(), bounds.bottom()) / (view.1 / scale);
                 painter.rect_stroke(
                     Rect::from_min_max(min, max),
                     0.0,
@@ -3215,6 +3564,19 @@ impl Forma {
             ui.scope_id().with("forma-canvas"),
             Sense::click_and_drag(),
         );
+        if self.camera_tool {
+            let middle = response.dragged_by(egui::PointerButton::Middle);
+            let primary = response.dragged_by(egui::PointerButton::Primary);
+            if !self.playing && (middle || primary) {
+                let pan = middle || ui.input(|input| input.modifiers.shift);
+                let delta = ui.input(|input| input.pointer.delta());
+                self.camera_drag(delta, pan, scale);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            return;
+        }
         // The middle button pans, whatever it's over (Electron's workspace pan).
         if ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle)) {
             if response.dragged_by(egui::PointerButton::Middle) {
@@ -3406,12 +3768,17 @@ impl Forma {
                     .rev()
                     .find(|(index, frame)| {
                         let shape = &scene.shapes[*index];
+                        if shape.is_3d() {
+                            return projected
+                                .get(index)
+                                .is_some_and(|quad| point_in_quad(screen, quad));
+                        }
                         if shape.kind == "adjustment"
                             && selected_id.as_deref() != Some(shape.id.as_str())
                         {
                             return false;
                         }
-                        let pixel = (screen - snapped.min) * pixels;
+                        let pixel = (screen - snapped.min) * (view.1 / scale);
                         if shape.kind == "text"
                             && renderer.is_some_and(|r| r.text_hit(&shape.id, pixel.x, pixel.y))
                         {
@@ -3565,6 +3932,7 @@ impl Forma {
                             .enumerate()
                             .filter(|(j, shape)| {
                                 !on_path(shape)
+                                    && !shape.is_3d()
                                     && (*j == i
                                         || (grouped && self.multi_selected.contains(&shape.id)))
                             })
@@ -3748,7 +4116,19 @@ impl Forma {
                 continue;
             }
             if self.key_editor.expanded.contains(&shape.id) {
-                rows.extend(Lane::ALL.map(|lane| Row::Property(index, lane)));
+                rows.extend(
+                    Lane::ALL
+                        .into_iter()
+                        .filter(|lane| {
+                            !shape.is_camera()
+                                || matches!(
+                                    lane,
+                                    Lane::Pose(Property::Position | Property::Rotation)
+                                )
+                        })
+                        .chain(shape.spatial_lanes())
+                        .map(|lane| Row::Property(index, lane)),
+                );
                 if let Some(vector) = &shape.vector {
                     rows.extend(vector.properties().into_iter().map(|p| Row::Property(index, Lane::Vector(p))));
                 }
@@ -3824,8 +4204,23 @@ impl Forma {
                     .font(font::ui(13.0))
                     .color(color::INK_SOFT),
             );
-            self.key_editor
-                .toolbar(ui, &mut self.scene, self.selected.as_deref());
+            let quality_label = if self.playing_at_half { "Half (auto)" } else { self.quality.label() };
+            egui::ComboBox::from_id_salt("forma-preview-quality")
+                .selected_text(quality_label)
+                .show_ui(ui, |ui| {
+                    for quality in crate::preview_cache::Quality::ALL {
+                        if ui.selectable_value(&mut self.quality, quality, quality.label()).clicked() {
+                            self.playing_at_half = false;
+                        }
+                    }
+                }).response.on_hover_text("Preview quality. Full switches to Half during playback if rendering exceeds 33 ms.");
+            if ui.available_width() > 370.0 {
+                let used = 100 * self.frame_cache.bytes() / crate::preview_cache::FRAME_BYTES;
+                ui.label(egui::RichText::new(format!("{:.0} ms · RAM {used}%", self.frame_time_ms))
+                    .font(font::ui(11.0)).color(color::INK_MUTED))
+                    .on_hover_text("Last frame render time and playback cache fill");
+            }
+            self.key_editor.toolbar(ui, &mut self.scene, self.selected.as_deref());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if pill(ui, "Onion skin", None, self.onion_skin)
                     .on_hover_text("While editing a clip, faintly show the clip before it on the same track")
@@ -5662,7 +6057,9 @@ impl CanopyApp for Forma {
                 }
                 // Escape stops drawing a move, or goes back from several selected layers to one (Electron's clips.js).
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    if self.mask_editor.active() {
+                    if self.camera_tool {
+                        self.camera_tool = false;
+                    } else if self.mask_editor.active() {
                         self.mask_editor.escape();
                     } else if self.motion_mode.is_some() {
                         (self.motion_mode, self.motion_draft) = (None, None);
@@ -5997,6 +6394,47 @@ fn pane_modal<R>(
     PaneModal { inner, close }
 }
 
+fn point_in_quad(point: Pos2, quad: &[Pos2]) -> bool {
+    let mut sides = quad
+        .iter()
+        .zip(quad.iter().cycle().skip(1))
+        .map(|(&a, &b)| {
+            let edge = b - a;
+            let offset = point - a;
+            edge.x * offset.y - edge.y * offset.x
+        });
+    let Some(first) = sides.find(|side| side.abs() > 1e-4) else {
+        return false;
+    };
+    sides.all(|side| side.abs() <= 1e-4 || side.signum() == first.signum())
+}
+
+fn spatial_field(ui: &mut Ui, shape: &mut Shape, property: crate::spatial::Property, time: f64) {
+    let mut values = shape.spatial_value(property, time);
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(property.label());
+        for (i, channel) in property.channels().iter().enumerate() {
+            if property.channels().len() > 1 {
+                ui.label(*channel);
+            }
+            let range = property.clamp(-f32::MAX)..=property.clamp(f32::MAX);
+            changed |= ui
+                .add_sized(
+                    [63.0, 32.0],
+                    egui::DragValue::new(&mut values[i])
+                        .speed(0.5)
+                        .range(range)
+                        .max_decimals(2),
+                )
+                .changed();
+        }
+    });
+    if changed {
+        shape.set_spatial(property, values, time);
+    }
+}
+
 /// When a project was saved, said the way people say it ("just now", "5 minutes ago", "3 days ago").
 fn saved_ago(saved_at: u64) -> String {
     let now = SystemTime::now()
@@ -6025,6 +6463,27 @@ fn hex(value: &str, alpha: u8) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_edit_invalidates_cached_playback_frames() {
+        let root = std::env::temp_dir().join(format!("forma-preview-{}", new_id()));
+        let mut forma = Forma::new(Place {
+            space: None,
+            projects_dir: root.clone(),
+            data_dir: root.clone(),
+            exports_dir: root,
+        });
+        let key = (0.0, ((0.0, 0.0), 1.0, (2, 2)), true);
+        let pixels = std::sync::Arc::new(tiny_skia::Pixmap::new(2, 2).unwrap());
+        forma
+            .frame_cache
+            .insert(key, (pixels, render::TextHits::new()), 16);
+        assert!(forma.frame_cache.get(&key).is_some());
+        forma.scene.bg = "#334861".into();
+        forma.edited();
+        assert!(forma.frame_cache.get(&key).is_none());
+        assert_eq!(forma.frame_cache.bytes(), 0);
+    }
 
     #[test]
     fn fade_preview_reaches_reappearance_and_stops_at_scene_end() {

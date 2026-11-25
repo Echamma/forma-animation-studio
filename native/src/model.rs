@@ -88,6 +88,12 @@ pub struct Shape {
     pub composition: Option<crate::composition::Playback>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub template_fields: Vec<crate::template::Field>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial: Option<crate::spatial::Spatial>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expressions: Vec<crate::expressions::Expression>,
+    #[serde(skip)]
+    pub(crate) onion_ghost: bool,
     #[serde(flatten, serialize_with = "serialize_shape_extra")]
     pub extra: Map<String, Value>,
 }
@@ -144,10 +150,18 @@ impl Serialize for ShapeForSave<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let Self(shape, duration) = *self;
         let path_fallback;
-        let layer = if matches!(shape.kind.as_str(), "path" | "adjustment" | "composition") {
+        let layer = if matches!(
+            shape.kind.as_str(),
+            "path" | "adjustment" | "composition" | "camera"
+        ) {
             let mut fallback = shape.clone();
             fallback.kind = "svg".into();
-            fallback.extra.insert("svgSource".into(), PATH_FALLBACK.into());
+            fallback
+                .extra
+                .insert("svgSource".into(), PATH_FALLBACK.into());
+            if shape.is_camera() {
+                fallback.extra.insert("nativeCamera".into(), true.into());
+            }
             if shape.kind == "adjustment" {
                 fallback
                     .extra
@@ -184,6 +198,13 @@ impl<'de> Deserialize<'de> for Shape {
             && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
         {
             shape.kind = "path".into();
+            shape.extra.remove("svgSource");
+        } else if shape.kind == "svg"
+            && shape.extra.get("nativeCamera").and_then(Value::as_bool) == Some(true)
+            && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
+        {
+            shape.kind = "camera".into();
+            shape.extra.remove("nativeCamera");
             shape.extra.remove("svgSource");
         } else if shape.kind == "svg" && shape.composition.is_some()
             && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
@@ -423,6 +444,14 @@ impl Scene {
         let scene = self;
         for shape in &mut scene.shapes {
             shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+            if let Some(spatial) = &mut shape.spatial
+                && !spatial.prepare(scene.duration)
+            {
+                return Err(format!(
+                    "{}: this layer has invalid 3D settings or keys.",
+                    shape.name
+                ));
+            }
             if shape.vector.as_mut().is_some_and(|vector| !vector.prepare(scene.duration)) {
                 return Err(format!("{}: this layer has invalid path or appearance data.", shape.name));
             }
@@ -554,6 +583,9 @@ impl Scene {
             motion_blur: false,
             composition: None,
             template_fields: Vec::new(),
+            spatial: None,
+            expressions: Vec::new(),
+            onion_ghost: false,
             extra: Map::new(),
         });
         id
@@ -721,7 +753,16 @@ impl Scene {
         let scale = sx.min(sy);
         let ids: std::collections::HashSet<_> = self.shapes.iter().map(|s| s.id.clone()).collect();
         for shape in &mut self.shapes {
-            if shape.parent.as_ref().is_some_and(|id| ids.contains(id)) {
+            let follows = shape.parent.as_ref().is_some_and(|id| ids.contains(id));
+            let xy = if follows || shape.parent_space.is_some() {
+                [1.0, 1.0]
+            } else {
+                [sx, sy]
+            };
+            if let Some(spatial) = &mut shape.spatial {
+                spatial.resize(xy, sy);
+            }
+            if follows {
                 continue;
             }
             let (sx, sy) = if shape.parent_space.is_some() {
@@ -824,6 +865,7 @@ impl Scene {
                     .chain(shape.vector_times())
                     .chain(shape.text_times())
                     .chain(shape.effect_times())
+                    .chain(shape.spatial_times())
                     .chain(shape.out_time)
                     .chain(
                         shape
@@ -1183,6 +1225,13 @@ impl Scene {
             .chain(shape.color_keys.iter_mut().map(|k| &mut k.t))
             .chain(
                 shape
+                    .spatial
+                    .iter_mut()
+                    .flat_map(|spatial| spatial.tracks.values_mut())
+                    .flat_map(|track| track.keys.iter_mut().map(|key| &mut key.t)),
+            )
+            .chain(
+                shape
                     .effects
                     .iter_mut()
                     .flat_map(|effect| effect.tracks.values_mut())
@@ -1386,13 +1435,18 @@ impl Scene {
                     && self.shapes[i].clip_start() >= end - 1e-6
             })
             .collect();
-        for i in later {
-            self.shift_layer(i, length);
-        }
         let source = &self.shapes[index];
-        let ending = still_pose(source, end);
         let template = template.unwrap_or(source);
         let same = template.id == source.id;
+        let at = if same { end } else { template.clip_start() };
+        let sampled_source = crate::expressions::sample_layer(self, source, end);
+        let sampled_template = if std::ptr::eq(source, template) {
+            std::borrow::Cow::Borrowed(sampled_source.as_ref())
+        } else {
+            crate::expressions::sample_layer(self, template, at)
+        };
+        let template = sampled_template.as_ref();
+        let ending = still_pose(&sampled_source, end);
         let mut copy = template.clone();
         let pose = if same {
             ending
@@ -1428,16 +1482,17 @@ impl Scene {
                 Some(template.lane_pose(if same { end } else { template.clip_start() }));
         }
         copy.color = if same {
-            source.color_at(end)
+            sampled_source.color_at(end)
         } else {
             template.color_at(template.clip_start())
         };
         copy.color_keys.clear();
-        let at = if same { end } else { template.clip_start() };
         copy.freeze_masks(at);
         copy.freeze_vector(at);
         copy.freeze_text(at);
         copy.freeze_effects(at);
+        copy.freeze_spatial(at);
+        copy.expressions.clear();
         if !same {
             copy.base_rotation = source.base_rotation;
         }
@@ -1465,6 +1520,9 @@ impl Scene {
         }
         if same && let Some(playback) = &mut copy.composition {
             playback.offset += length * playback.speed;
+        }
+        for i in later {
+            self.shift_layer(i, length);
         }
         self.duration = self.duration.max(copy.out_time.unwrap());
         self.shapes.insert(index + 1, copy);
@@ -1656,7 +1714,7 @@ impl Scene {
     /// The faint copy of the previous clip on the selected clip's track, as it ends, to line up the next pose of a
     /// stop-motion sequence (Electron's onion skin): a still layer at 30 % opacity, or `None` off a track or clip.
     pub fn onion_skin(&self, index: usize, t: f64) -> Option<Shape> {
-        let shape = &self.shapes[index];
+        let shape = self.shapes.get(index)?;
         let track = shape
             .extra
             .get("trackId")
@@ -1666,35 +1724,34 @@ impl Scene {
             return None;
         }
         let end = |s: &Shape| s.out_time.unwrap_or(self.duration);
-        let previous = self
+        let (previous_index, previous) = self
             .shapes
             .iter()
-            .filter(|s| {
+            .enumerate()
+            .filter(|(_, s)| {
                 s.id != shape.id
                     && s.extra.get("trackId").and_then(Value::as_str) == Some(track)
                     && end(s) <= shape.clip_start() + 1e-6
             })
-            .max_by(|a, b| end(a).total_cmp(&end(b)))?;
+            .max_by(|(_, a), (_, b)| end(a).total_cmp(&end(b)))?;
         let at = previous.clip_start().max(end(previous) - 0.001);
+        let sampled = crate::expressions::at_time(self, at);
         // Posed as it ends, outside its clip: the scene with the clip open-ended.
-        let mut open = previous.clone();
-        (open.in_time, open.out_time) = (None, None);
-        let frame = self.layer_frame(&open, at);
+        let mut ghost = sampled.shapes.get(previous_index)?.clone();
+        (ghost.in_time, ghost.out_time) = (None, None);
+        let frame = sampled.layer_frame(&ghost, at);
         let p = frame.pose;
         // It keeps its id, so the renderer finds its picture.
-        let mut ghost = previous.clone();
-        (
-            ghost.in_time,
-            ghost.out_time,
-            ghost.disappear,
-            ghost.base_rotation,
-        ) = (None, None, None, 0.0);
-        ghost.color = previous.color_at(at);
+        ghost.onion_ghost = true;
+        (ghost.disappear, ghost.base_rotation) = (None, 0.0);
+        ghost.color = ghost.color_at(at);
         ghost.color_keys.clear();
         ghost.freeze_masks(at);
         ghost.freeze_vector(at);
         ghost.freeze_text(at);
         ghost.freeze_effects(at);
+        ghost.freeze_spatial(at);
+        ghost.expressions.clear();
         ghost.rotation_clips.clear();
         ghost.parent = None;
         ghost.parent_space = crate::transform::matrix(frame.space);
@@ -1973,6 +2030,7 @@ impl Shape {
             .chain(self.vector_times())
             .chain(self.text_times())
             .chain(self.effect_times())
+            .chain(self.spatial_times())
             .chain(motions(self).map(|(_, start, _)| start))
             .chain(self.rotation_clips.iter().map(|c| c.start_time))
             .chain(self.disappear.iter().map(|d| d.start_time))
@@ -1988,6 +2046,7 @@ impl Shape {
             .chain(self.vector_times())
             .chain(self.text_times())
             .chain(self.effect_times())
+            .chain(self.spatial_times())
             .chain(motions(self).map(|(_, start, length)| start + length))
             .chain(
                 self.rotation_clips

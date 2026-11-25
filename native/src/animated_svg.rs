@@ -25,6 +25,14 @@ struct Sample {
 }
 
 pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
+    if let Some(layer) = scene.shapes.iter().find(|shape| shape.is_3d()) {
+        return Err(format!(
+            "{}: animated SVG can't export 3D layers or cameras.",
+            layer.name
+        ));
+    }
+    let scene = crate::expressions::bake(scene, 30.0)?;
+    let scene = scene.as_ref();
     if let Some(layer) = scene.shapes.iter().find(|shape| shape.kind == "composition") {
         return Err(format!("{}: animated SVG can't export composition layers.", layer.name));
     }
@@ -262,9 +270,15 @@ fn svg_matrix([a, b, c, d, e, f]: [f32; 6]) -> String {
 
 /// The scene at `t` as a still SVG (Electron's `svgText(false)`): each layer shown then, posed as it is then.
 pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
-    if scene.transparent_background || scene.shapes.iter().any(|shape| {
-        shape.composition.is_some() || shape.kind == "adjustment" || shape.effects.iter().any(|effect| effect.enabled)
-    }) || !crate::motion_blur::exposure(scene, t, crate::motion_blur::DEFAULT_FPS).is_empty()
+    if scene.transparent_background
+        || scene.shapes.iter().any(|shape| {
+            shape.is_3d()
+                || !shape.expressions.is_empty()
+                || shape.composition.is_some()
+                || shape.kind == "adjustment"
+                || shape.effects.iter().any(|effect| effect.enabled)
+        })
+        || !crate::motion_blur::exposure(scene, t, crate::motion_blur::DEFAULT_FPS).is_empty()
     {
         let picture = crate::render::frame(scene, place, t)?;
         let png = picture

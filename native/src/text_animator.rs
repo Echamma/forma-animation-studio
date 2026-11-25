@@ -191,7 +191,8 @@ impl TextProperty {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TextLane {
     Style(TextProperty),
     Animator(u64, TextProperty),

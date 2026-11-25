@@ -7,16 +7,16 @@ use crate::effects::Sample;
 use crate::mask_render::{LayerPixels, MaskCache};
 use crate::model::{MAX_BLUR, Scene, Shape};
 use crate::motion_blur;
+use crate::spatial::{Camera, Plane, depth_order};
 use crate::text_layout::TextCache;
 use crate::text_render::{TextInk, TextPaths};
 use crate::transform::LayerFrame;
 use crate::vector_render::{GeometryCache, VectorInk};
 use crate::{assets, svg, text};
 use canopy_ui::Place;
+use rayon::prelude::*;
 use std::collections::HashMap;
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tiny_skia::{
@@ -29,7 +29,7 @@ pub type Frames = HashMap<String, Pixmap>;
 pub(crate) type SampleFrames = HashMap<String, Arc<Pixmap>>;
 type ShutterSample<'a> = (f64, Option<&'a SampleFrames>);
 
-type TextHits = HashMap<String, Vec<Rect>>;
+pub(crate) type TextHits = HashMap<String, Vec<Rect>>;
 
 /// What the editor sees (see `Renderer::view`): the scene point at the top-left, pixels to a scene pixel, and the
 /// size in pixels.
@@ -54,6 +54,7 @@ pub struct Renderer {
     preview_videos: Mutex<HashMap<u64, (u64, crate::videos::Videos)>>,
     preview_pending: AtomicBool,
     preview_epoch: AtomicU64,
+    layer_pixels: Mutex<crate::preview_cache::Cache<LayerSample, Arc<LayerPixels>>>,
 }
 
 struct NestedVideo {
@@ -62,7 +63,7 @@ struct NestedVideo {
     size: (u32, u32),
 }
 
-type CompositionFrames = RefCell<HashMap<(String, u64, u32, u32), Arc<Pixmap>>>;
+type CompositionFrames = Mutex<HashMap<(String, u64, u32, u32), Arc<Pixmap>>>;
 
 #[derive(Clone, Copy)]
 struct CompositionRender<'a> {
@@ -87,19 +88,74 @@ impl CompositionRender<'_> {
 struct RenderFrame<'a> {
     renderer: &'a Renderer,
     scene: &'a Scene,
+    exposure_scene: Option<&'a Scene>,
     time: f64,
     view: Transform,
     scale: f32,
     size: (u32, u32),
     strict: bool,
+    cache_pixels: bool,
     videos: &'a Frames,
     sampled_videos: Option<&'a SampleFrames>,
     compositions: CompositionRender<'a>,
 }
 
+#[derive(Clone, PartialEq)]
+struct LayerSample {
+    id: String,
+    pose: crate::model::Pose,
+    transform: Transform,
+    space: Transform,
+    view: Transform,
+    size: (u32, u32),
+    color: String,
+    time: Option<u64>,
+    projection: Option<(Camera, [[f32; 3]; 3])>,
+}
+
+impl LayerSample {
+    fn of(active: &RenderFrame<'_>, shape: &Shape, frame: LayerFrame) -> Option<Self> {
+        if !active.cache_pixels
+            || matches!(shape.kind.as_str(), "video" | "composition")
+            || shape
+                .text_layout
+                .as_ref()
+                .is_some_and(|text| text.path.is_some())
+        {
+            return None;
+        }
+        let animated = shape
+            .vector_times()
+            .chain(shape.mask_times())
+            .chain(shape.text_times())
+            .chain(shape.effect_times())
+            .next()
+            .is_some()
+            || shape.expressions.iter().any(|expression| {
+                !matches!(
+                    expression.lane,
+                    crate::keyframes::Lane::Pose(_)
+                        | crate::keyframes::Lane::Color
+                        | crate::keyframes::Lane::Spatial(_)
+                )
+            });
+        Some(Self {
+            id: shape.id.clone(),
+            pose: frame.pose,
+            transform: frame.transform,
+            space: frame.space,
+            view: active.view,
+            size: active.size,
+            color: shape.color_at(active.time),
+            time: animated.then(|| active.time.to_bits()),
+            projection: None,
+        })
+    }
+}
+
 struct MatteFrame {
     links: MatteLinks,
-    cache: HashMap<usize, Option<Rc<LayerPixels>>>,
+    cache: HashMap<usize, Option<Arc<LayerPixels>>>,
     bytes: usize,
 }
 
@@ -220,7 +276,42 @@ impl Renderer {
             preview_videos: Mutex::default(),
             preview_pending: AtomicBool::default(),
             preview_epoch: AtomicU64::default(),
+            layer_pixels: Mutex::new(crate::preview_cache::Cache::new(
+                crate::preview_cache::LAYER_BYTES,
+            )),
         }
+    }
+
+    pub(crate) fn invalidate_preview_pixels(&self) {
+        self.layer_pixels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .invalidate();
+        for renderer in self.compositions.values() {
+            renderer.invalidate_preview_pixels();
+        }
+    }
+
+    fn has_video(&self) -> bool {
+        !self.videos.is_empty() || self.has_nested_video()
+    }
+
+    pub(crate) fn has_nested_video(&self) -> bool {
+        self.compositions.values().any(Self::has_video)
+    }
+
+    pub(crate) fn text_hits_snapshot(&self) -> TextHits {
+        self.text_hits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn restore_text_hits(&self, hits: TextHits) {
+        *self
+            .text_hits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hits;
     }
 
     /// Whether this renderer has read the pictures `scene` shows.
@@ -360,7 +451,16 @@ impl Renderer {
     fn draws(&self, shape: &Shape) -> bool {
         matches!(
             shape.kind.as_str(),
-            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text" | "path" | "adjustment" | "composition"
+            "circle"
+                | "rect"
+                | "triangle"
+                | "diamond"
+                | "arrow"
+                | "text"
+                | "path"
+                | "adjustment"
+                | "composition"
+                | "camera"
         ) || (matches!(shape.kind.as_str(), "image" | "video" | "svg")
             && self.images.contains_key(&shape.id))
     }
@@ -461,6 +561,7 @@ impl Renderer {
         clip: bool,
         frames: &Frames,
     ) -> Option<Pixmap> {
+        self.invalidate_preview_pixels();
         self.view_with_samples(scene, t, view, clip, frames, |_| None)
     }
 
@@ -643,14 +744,18 @@ impl Renderer {
         mut text_hits: Option<&mut TextHits>,
         compositions: CompositionRender<'_>,
     ) -> Result<(), String> {
+        let resolved = crate::expressions::at_time(scene, t);
+        let exposure = sample.map(|(time, _)| crate::expressions::at_time(scene, time));
         let frame = RenderFrame {
             renderer: self,
-            scene,
+            scene: &resolved,
+            exposure_scene: exposure.as_deref(),
             time: t,
             view,
             scale,
             size: (canvas.width(), canvas.height()),
             strict,
+            cache_pixels: text_hits.is_some(),
             videos: frames,
             sampled_videos: None,
             compositions,
@@ -660,70 +765,138 @@ impl Renderer {
             cache: HashMap::new(),
             bytes: 0,
         });
-        for (index, shape) in scene.shapes.iter().enumerate() {
-            if mattes
-                .as_ref()
-                .is_some_and(|mattes| mattes.links.hidden[index])
-            {
-                continue;
-            }
-            let active = frame.sampled(shape, sample);
-            let source = mattes
-                .as_ref()
-                .and_then(|mattes| mattes.links.sources[index]);
-            if source.is_none() && active.paint_precomposed_stack(canvas, shape)? {
-                continue;
-            }
-            if shape.kind == "adjustment" {
-                let matte = match (&mut mattes, source) {
-                    (Some(mattes), Some(source)) => mattes.source(&frame, source, sample)?,
-                    _ => None,
-                };
-                active.adjust(canvas, shape, matte.as_deref());
-                continue;
-            }
-            let Some((ink, layer_frame)) = active.visible_ink(shape)? else {
-                continue;
-            };
-            if let (Ink::Text(ink), Some(hits)) = (&ink, text_hits.as_deref_mut()) {
-                hits.insert(shape.id.clone(), ink.hit_boxes());
-            }
-            let blur = active.layer_blur(shape, layer_frame);
-            let effects = shape.sampled_effects(active.time);
-            if blur <= 0.0
-                && effects.is_empty()
-                && shape.blend() == Blend::Normal
-                && shape.masks.is_empty()
-                && source.is_none()
-                && ink.group_opacity() >= 1.0
-            {
-                ink.paint(canvas, Transform::identity());
-                continue;
-            }
-            let Some(mut layer) = active.raster_effects(shape, layer_frame, &ink, blur, effects)
-            else {
-                continue;
-            };
-            if let (Some(mattes), Some(source), Some(matte)) =
-                (&mut mattes, source, &shape.track_matte)
-            {
-                let pixels = mattes.source(&frame, source, sample)?;
-                layer.apply_matte(pixels.as_deref(), matte.mode);
-            }
-            if shape.blend() == Blend::Normal && (!shape.masks.is_empty() || source.is_some()) {
-                layer.paint_over(canvas);
+        let camera = Camera::at(frame.scene, t);
+        let exposure_camera = sample
+            .zip(frame.exposure_scene)
+            .map(|((time, _), exposed)| Camera::at(exposed, time));
+        let camera_for = |shape: &Shape| {
+            if shape.motion_blur {
+                exposure_camera.unwrap_or(camera)
             } else {
-                canvas.draw_pixmap(
-                    layer.area.x(),
-                    layer.area.y(),
-                    layer.pixmap.as_ref(),
-                    &PixmapPaint {
-                        blend_mode: shape.blend().skia(),
-                        ..PixmapPaint::default()
-                    },
-                    Transform::identity(),
-                    None,
-                );
+                camera
+            }
+        };
+        let depths: Vec<_> = frame
+            .scene
+            .shapes
+            .iter()
+            .enumerate()
+            .map(|(index, shape)| {
+                if !shape.is_3d() || shape.is_camera() {
+                    return None;
+                }
+                let active = frame.sampled(shape, sample);
+                let shape = &active.scene.shapes[index];
+                Some(camera_for(shape).depth(active.plane(shape).center()))
+            })
+            .collect();
+        let order = depth_order(&depths);
+        let mut parallel = HashMap::new();
+        // Work in small batches so completed layer tiles cannot accumulate for an entire scene.
+        for batch in order.chunks(8) {
+            parallel.clear();
+            let independent: Vec<_> = batch
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    if mattes
+                        .as_ref()
+                        .is_some_and(|m| m.links.hidden[index] || m.links.sources[index].is_some())
+                    {
+                        return false;
+                    }
+                    let shape = &frame.scene.shapes[index];
+                    let active = frame.sampled(shape, sample);
+                    let shape = &active.scene.shapes[index];
+                    active.independent_pixels(shape)
+                })
+                .collect();
+            if independent.len() > 1 {
+                let results = independent
+                    .par_iter()
+                    .map(|&i| {
+                        let shape = &frame.scene.shapes[i];
+                        let active = frame.sampled(shape, sample);
+                        let shape = &active.scene.shapes[i];
+                        Ok::<_, String>((i, active.layer_pixels(shape, camera_for(shape), None)?))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                parallel.extend(results);
+            }
+            for &index in batch {
+                let shape = &frame.scene.shapes[index];
+                if shape.is_camera()
+                    || mattes
+                        .as_ref()
+                        .is_some_and(|mattes| mattes.links.hidden[index])
+                {
+                    continue;
+                }
+                let active = frame.sampled(shape, sample);
+                let shape = &active.scene.shapes[index];
+                let source = mattes
+                    .as_ref()
+                    .and_then(|mattes| mattes.links.sources[index]);
+                if source.is_none() && active.paint_precomposed_stack(canvas, shape)? {
+                    continue;
+                }
+                if shape.kind == "adjustment" {
+                    let matte = match (&mut mattes, source) {
+                        (Some(mattes), Some(source)) => mattes.source(&frame, source, sample)?,
+                        _ => None,
+                    };
+                    active.adjust(canvas, shape, matte.as_deref());
+                    continue;
+                }
+                let layer = if let Some(layer) = parallel.remove(&index) {
+                    layer
+                } else if shape.is_3d() {
+                    active.layer_pixels(shape, camera_for(shape), None)?
+                } else {
+                    let Some((ink, layer_frame)) = active.visible_ink(shape)? else {
+                        continue;
+                    };
+                    if let (Ink::Text(ink), Some(hits)) = (&ink, text_hits.as_deref_mut()) {
+                        hits.insert(shape.id.clone(), ink.hit_boxes());
+                    }
+                    let blur = active.layer_blur(shape, layer_frame);
+                    let effects = shape.sampled_effects(active.time);
+                    if blur <= 0.0
+                        && effects.is_empty()
+                        && shape.blend() == Blend::Normal
+                        && shape.masks.is_empty()
+                        && source.is_none()
+                        && ink.group_opacity() >= 1.0
+                    {
+                        ink.paint(canvas, Transform::identity());
+                        continue;
+                    }
+                    active.layer_pixels(shape, camera_for(shape), Some((ink, layer_frame)))?
+                };
+                let Some(mut layer) = layer else {
+                    continue;
+                };
+                if let (Some(mattes), Some(source), Some(matte)) =
+                    (&mut mattes, source, &shape.track_matte)
+                {
+                    let pixels = mattes.source(&frame, source, sample)?;
+                    Arc::make_mut(&mut layer).apply_matte(pixels.as_deref(), matte.mode);
+                }
+                if shape.blend() == Blend::Normal && (!shape.masks.is_empty() || source.is_some()) {
+                    layer.paint_over(canvas);
+                } else {
+                    canvas.draw_pixmap(
+                        layer.area.x(),
+                        layer.area.y(),
+                        layer.pixmap.as_ref(),
+                        &PixmapPaint {
+                            blend_mode: shape.blend().skia(),
+                            ..PixmapPaint::default()
+                        },
+                        Transform::identity(),
+                        None,
+                    );
+                }
             }
         }
         Ok(())
@@ -740,11 +913,13 @@ impl Renderer {
         let frame = RenderFrame {
             renderer: self,
             scene,
+            exposure_scene: None,
             time,
             view: Transform::identity(),
             scale: 1.0,
             size: (scene.width.round() as u32, scene.height.round() as u32),
             strict: false,
+            cache_pixels: false,
             videos: &videos,
             sampled_videos: None,
             compositions: self.composition_render(scene, &pixels, motion_blur::DEFAULT_FPS),
@@ -804,7 +979,7 @@ fn picture_ink(pixels: PicturePixels<'_>, frame: LayerFrame, view: Transform) ->
 impl<'a> RenderFrame<'a> {
     fn paint_precomposed_stack(&self, canvas: &mut Pixmap, shape: &Shape) -> Result<bool, String> {
         let Some(playback) = &shape.composition else { return Ok(false) };
-        if !playback.preserve_stack || playback.offset != 0.0 || playback.speed != 1.0 || playback.looping
+        if shape.is_3d() || !playback.preserve_stack || playback.offset != 0.0 || playback.speed != 1.0 || playback.looping
             || shape.clip_start() != 0.0 || !shape.visible(self.time, self.scene.duration)
             || shape.blend() != Blend::Normal || !shape.masks.is_empty() || blur(shape) > 0.0
             || shape.effects.iter().any(|effect| effect.enabled)
@@ -844,12 +1019,7 @@ impl<'a> RenderFrame<'a> {
         if frame.pose.o <= 0.0 {
             return Ok(None);
         }
-        if self.strict {
-            self.renderer.exportable(shape)?;
-            if shape.kind == "video" && self.video_pixels(shape).is_none() {
-                return Err(format!("{}: no video frame", shape.name));
-            }
-        }
+        self.check_ink(shape)?;
         if let Some(playback) = &shape.composition {
             let result = self.composition_pixels(shape, playback, frame);
             return match result {
@@ -859,6 +1029,16 @@ impl<'a> RenderFrame<'a> {
             };
         }
         Ok(self.ink_at(shape, frame).map(|ink| (ink, frame)))
+    }
+
+    fn check_ink(&self, shape: &Shape) -> Result<(), String> {
+        if self.strict {
+            self.renderer.exportable(shape)?;
+            if shape.kind == "video" && self.video_pixels(shape).is_none() {
+                return Err(format!("{}: no video frame", shape.name));
+            }
+        }
+        Ok(())
     }
 
     fn composition_pixels(&self, shape: &Shape, playback: &crate::composition::Playback, frame: LayerFrame) -> Result<Arc<Pixmap>, String> {
@@ -878,7 +1058,12 @@ impl<'a> RenderFrame<'a> {
         let scale = (16_777_216.0 / (size.0 as f64 * size.1 as f64)).sqrt().min(1.0);
         let size = (((size.0 as f64 * scale) as u32).max(1), ((size.1 as f64 * scale) as u32).max(1));
         let key = (playback.source.clone(), time.to_bits(), size.0, size.1);
-        if let Some(pixels) = composition.pixels.borrow().get(&key) {
+        if let Some(pixels) = composition
+            .pixels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
             return Ok(Arc::clone(pixels));
         }
         let nested = composition.enter(&shape.id);
@@ -900,7 +1085,10 @@ impl<'a> RenderFrame<'a> {
                 renderer.draw_surface(source, time, size, self.strict, &frames, Some((sample, sampled.as_ref())), nested, false)
             })?
         });
-        let mut cache = composition.pixels.borrow_mut();
+        let mut cache = composition
+            .pixels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // A draw can contain many differently sized instances of the same composition.
         if cache.len() < 8 && u64::from(size.0) * u64::from(size.1) <= 4_194_304 {
             cache.insert(key, Arc::clone(&pixels));
@@ -955,11 +1143,215 @@ impl<'a> RenderFrame<'a> {
         match sample {
             Some((time, videos)) if shape.motion_blur => Self {
                 time,
+                scene: self.exposure_scene.unwrap_or(self.scene),
                 sampled_videos: videos,
                 ..self
             },
             _ => self,
         }
+    }
+
+    fn plane<'b>(&'b self, shape: &'b Shape) -> Plane<'b> {
+        Plane {
+            scene: self.scene,
+            shape,
+            frame: self.scene.layer_frame(shape, self.time),
+            time: self.time,
+        }
+    }
+
+    fn independent_pixels(&self, shape: &Shape) -> bool {
+        !shape.is_camera()
+            && shape.kind != "adjustment"
+            && shape.composition.is_none()
+            && shape.visible(self.time, self.scene.duration)
+            && (shape.is_3d()
+                || (!TextInk::used_by(shape)
+                    && (blur(shape) > 0.0
+                        || shape.blend() != Blend::Normal
+                        || shape.effects.iter().any(|effect| effect.enabled)
+                        || !shape.masks.is_empty())))
+    }
+
+    fn layer_pixels(
+        &self,
+        shape: &Shape,
+        camera: Camera,
+        existing: Option<(Ink<'_>, LayerFrame)>,
+    ) -> Result<Option<Arc<LayerPixels>>, String> {
+        if shape.is_camera() || !shape.visible(self.time, self.scene.duration) {
+            return Ok(None);
+        }
+        let frame = existing.as_ref().map_or_else(
+            || self.scene.layer_frame(shape, self.time),
+            |(_, frame)| *frame,
+        );
+        if frame.pose.o <= 0.0 {
+            return Ok(None);
+        }
+        let key = LayerSample::of(self, shape, frame);
+        let plane = shape.is_3d().then_some(Plane {
+            scene: self.scene,
+            shape,
+            frame,
+            time: self.time,
+        });
+        let projection = plane.zip(key.as_ref()).map(|(plane, key)| LayerSample {
+            projection: Some((
+                camera,
+                [
+                    plane.world([0.0, 0.0, 0.0]),
+                    plane.world([128.0, 0.0, 0.0]),
+                    plane.world([0.0, 128.0, 0.0]),
+                ],
+            )),
+            ..key.clone()
+        });
+        if let Some(cached) = self.cached_pixels(projection.as_ref()) {
+            return Ok(Some(cached));
+        }
+        let local = plane.is_some()
+            && shape.composition.is_none()
+            && shape.masks.is_empty()
+            && shape.effects.iter().all(|effect| !effect.enabled)
+            && shape
+                .text_layout
+                .as_ref()
+                .is_none_or(|text| text.path.is_none());
+        let (flat, flat_frame) = if local {
+            let scale = self.scale * crate::transform::max_scale(frame.transform);
+            // Tiny differences in the length of a rotated basis must not replace the flat tile.
+            let scale = ((scale * 256.0).round() / 256.0).clamp(1.0 / 256.0, 8.0);
+            (
+                Self {
+                    view: Transform::from_scale(scale, scale),
+                    scale,
+                    ..*self
+                },
+                LayerFrame {
+                    pose: crate::model::Pose {
+                        x: 0.0,
+                        y: 0.0,
+                        r: 0.0,
+                        ..frame.pose
+                    },
+                    transform: Transform::identity(),
+                    space: Transform::identity(),
+                },
+            )
+        } else {
+            (*self, frame)
+        };
+        let key = if local {
+            LayerSample::of(&flat, shape, flat_frame)
+        } else {
+            key
+        };
+        let source = if let Some(pixels) = self.cached_pixels(key.as_ref()) {
+            pixels
+        } else {
+            let ink = if local {
+                self.check_ink(shape)?;
+                let Some(ink) = flat.ink_at(shape, flat_frame) else {
+                    return Ok(None);
+                };
+                ink
+            } else {
+                match existing {
+                    Some((ink, _)) => ink,
+                    None => {
+                        let Some((ink, _)) = self.visible_ink(shape)? else {
+                            return Ok(None);
+                        };
+                        ink
+                    }
+                }
+            };
+            let Some(source) = flat.flat_pixels(shape, flat_frame, &ink) else {
+                return Ok(None);
+            };
+            let source = Arc::new(source);
+            self.cache_pixels(key, &source);
+            source
+        };
+        let Some(plane) = plane else {
+            return Ok(Some(source));
+        };
+        let dof = camera.blur(camera.depth(plane.center())) * self.scale;
+        let Some(inverse) = flat.view.invert() else {
+            return Ok(None);
+        };
+        let to_scene = if local {
+            inverse.post_concat(frame.transform)
+        } else {
+            inverse
+        };
+        let result =
+            crate::projection::warp(&source, plane, camera, to_scene, self.view, self.size, dof)
+                .map(Arc::new);
+        if let Some(pixels) = &result {
+            self.cache_pixels(projection, pixels);
+        }
+        Ok(result)
+    }
+
+    fn cached_pixels(&self, key: Option<&LayerSample>) -> Option<Arc<LayerPixels>> {
+        self.renderer
+            .layer_pixels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key?)
+    }
+
+    fn cache_pixels(&self, key: Option<LayerSample>, pixels: &Arc<LayerPixels>) {
+        if let Some(key) = key {
+            self.renderer
+                .layer_pixels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key, Arc::clone(pixels), pixels.pixmap.data().len());
+        }
+    }
+
+    fn flat_pixels(&self, shape: &Shape, frame: LayerFrame, ink: &Ink<'_>) -> Option<LayerPixels> {
+        let blur = self.layer_blur(shape, frame);
+        let effects = shape.sampled_effects(self.time);
+        if !shape.is_3d() {
+            return self.raster_effects(shape, frame, ink, blur, effects);
+        }
+        let bounds = ink.bounds()?;
+        let margin = (crate::effect_render::margin(&effects, self.scale, bounds) + blur * 3.0)
+            .clamp(0.0, 1536.0)
+            .ceil()
+            + 3.0;
+        let area = IntRect::from_ltrb(
+            (bounds.left() - margin).floor() as i32,
+            (bounds.top() - margin).floor() as i32,
+            (bounds.right() + margin).ceil() as i32,
+            (bounds.bottom() + margin).ceil() as i32,
+        )
+        .filter(|area| fits_filter(*area))?;
+        if effects.is_empty() {
+            return self.raster_area(shape, frame, ink, blur, area);
+        }
+        let view = self.view.post_translate(-area.x() as f32, -area.y() as f32);
+        let flat = Self {
+            view,
+            size: (area.width(), area.height()),
+            ..*self
+        };
+        let (ink, frame) = flat.visible_ink(shape).ok().flatten()?;
+        let filtered = flat.raster_effects(shape, frame, &ink, blur, effects)?;
+        let area = IntRect::from_xywh(
+            filtered.area.x().checked_add(area.x())?,
+            filtered.area.y().checked_add(area.y())?,
+            filtered.area.width(),
+            filtered.area.height(),
+        )?;
+        Some(LayerPixels {
+            area,
+            pixmap: filtered.pixmap,
+        })
     }
 
     fn raster_effects(
@@ -1383,7 +1775,7 @@ impl MatteFrame {
         frame: &RenderFrame<'_>,
         index: usize,
         sample: Option<ShutterSample<'_>>,
-    ) -> Result<Option<Rc<LayerPixels>>, String> {
+    ) -> Result<Option<Arc<LayerPixels>>, String> {
         let mut chain = Vec::new();
         let mut next = Some(index);
         let mut previous = None;
@@ -1398,22 +1790,15 @@ impl MatteFrame {
         for i in chain.into_iter().rev() {
             let shape = &frame.scene.shapes[i];
             let frame = frame.sampled(shape, sample);
-            let mut layer = frame.visible_ink(shape)?.and_then(|(ink, layer_frame)| {
-                frame.raster_effects(
-                    shape,
-                    layer_frame,
-                    &ink,
-                    frame.layer_blur(shape, layer_frame),
-                    shape.sampled_effects(frame.time),
-                )
-            });
+            let shape = &frame.scene.shapes[i];
+            let mut layer = frame.layer_pixels(shape, Camera::at(frame.scene, frame.time), None)?;
             if let (Some(layer), Some(matte), Some(_)) =
                 (&mut layer, &shape.track_matte, self.links.sources[i])
             {
-                layer.apply_matte(previous.as_deref(), matte.mode);
+                Arc::make_mut(layer).apply_matte(previous.as_deref(), matte.mode);
             }
             let bytes = layer.as_ref().map_or(0, |layer| layer.pixmap.data().len());
-            previous = layer.map(Rc::new);
+            previous = layer;
             if self.bytes + bytes <= 32 * 1024 * 1024 {
                 self.bytes += bytes;
                 self.cache.insert(i, previous.clone());
@@ -1749,6 +2134,70 @@ mod tests {
             projects_dir: root.clone(),
             data_dir: root.clone(),
             exports_dir: root,
+        }
+    }
+
+    #[test]
+    #[ignore = "reports 1080p software preview timing on this machine"]
+    fn thirty_spatial_layers_scrub_at_full_hd() {
+        use crate::keyframes::{Lane, Property};
+        use crate::spatial::{Property as SpatialProperty, Spatial};
+        use std::time::Instant;
+
+        let mut scene = Scene::empty("spatial-timing".into());
+        scene.add_camera("camera".into()).unwrap();
+        for i in 0..30 {
+            scene.add_shape(format!("card-{i}"), "rect");
+            let shape = scene.shapes.last_mut().unwrap();
+            let x = 140.0 + 305.0 * (i % 6) as f32;
+            let y = 105.0 + 210.0 * (i / 6) as f32;
+            (shape.keys[0].x, shape.keys[0].y) = (x, y);
+            (shape.keys[0].w, shape.keys[0].h) = (260.0, 170.0);
+            shape.spatial = Some(Spatial::default());
+            shape.set_spatial(SpatialProperty::RotationY, [20.0, 0.0, 0.0], 0.0);
+            if i % 3 == 0 {
+                shape.set_expression(
+                    Lane::Pose(Property::Rotation),
+                    Some("sin(time) * 14".into()),
+                );
+            }
+        }
+        let root = std::env::temp_dir();
+        let place = Place {
+            space: None,
+            data_dir: root.clone(),
+            projects_dir: root.clone(),
+            exports_dir: root,
+        };
+        let renderer = Renderer::new(&scene, &place);
+        let frames = Frames::new();
+        for quality in crate::preview_cache::Quality::ALL {
+            let view = quality.view(((0.0, 0.0), 1.0, (1920, 1080)));
+            let mut durations = Vec::new();
+            for frame in 0..=12 {
+                let start = Instant::now();
+                assert!(
+                    renderer
+                        .view_with_samples(
+                            &scene,
+                            f64::from(frame) / 30.0,
+                            view,
+                            true,
+                            &frames,
+                            |_| None
+                        )
+                        .is_some()
+                );
+                if frame != 0 {
+                    durations.push(start.elapsed());
+                }
+            }
+            durations.sort();
+            eprintln!(
+                "{} median {:.2} ms",
+                quality.label(),
+                durations[durations.len() / 2].as_secs_f64() * 1000.0
+            );
         }
     }
 

@@ -12,13 +12,21 @@ use std::collections::{HashMap, HashSet};
 use tiny_skia::Transform;
 
 pub fn export(scene: &Scene) -> Result<Vec<u8>, String> {
-    let errors = unsupported(scene);
-    if !errors.is_empty() {
-        return Err(format!(
-            "Lottie export is unavailable for these layers:\n{}",
-            errors.join("\n")
-        ));
+    check_exportable(scene)?;
+    let mut baked = crate::expressions::bake(scene, FPS)?;
+    for source in reachable(scene).into_iter().skip(1) {
+        if let std::borrow::Cow::Owned(child) = crate::expressions::bake(source, FPS)?
+            && let Some(destination) = baked
+                .to_mut()
+                .compositions
+                .iter_mut()
+                .find(|dest| dest.project_id == child.project_id)
+        {
+            *destination = child;
+        }
     }
+    let scene = baked.as_ref();
+    check_exportable(scene)?;
     let all = reachable(scene);
     let layers = layers(scene, scene)?;
     let assets = all
@@ -36,6 +44,18 @@ pub fn export(scene: &Scene) -> Result<Vec<u8>, String> {
         "ddd": 0, "assets": assets, "layers": layers,
     }))
     .map_err(|e| e.to_string())
+}
+
+fn check_exportable(scene: &Scene) -> Result<(), String> {
+    let errors = unsupported(scene);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Lottie export is unavailable for these layers:\n{}",
+            errors.join("\n")
+        ))
+    }
 }
 
 fn reachable(scene: &Scene) -> Vec<&Scene> {
@@ -66,7 +86,9 @@ pub fn unsupported(scene: &Scene) -> Vec<String> {
     for source in reachable(scene) {
         for shape in &source.shapes {
             let mut features = Vec::new();
-            if !matches!(
+            if shape.is_3d() {
+                features.push("3D layers or cameras");
+            } else if !matches!(
                 shape.kind.as_str(),
                 "composition"
                     | "text"

@@ -1,4 +1,3 @@
-use crate::compositing::MaskProperty;
 use crate::keyframes::{EASINGS, Lane, LaneKey, Property, same_time};
 use crate::model::{Scene, Shape, ease_at, hundredths};
 use canopy_ui::{Accent, color, font};
@@ -6,7 +5,7 @@ use egui::{Align2, Color32, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui,
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 
-pub(crate) const LABEL_WIDTH: f32 = 166.0;
+pub(crate) const LABEL_WIDTH: f32 = 199.0;
 pub(crate) const TIME_MARGIN: f32 = 14.0;
 
 #[derive(Clone, Copy)]
@@ -124,6 +123,7 @@ pub(crate) struct KeyEditor {
     pub effects_to_reveal: Option<String>,
     pub animator_to_reveal: Option<(String, u64)>,
     graph: bool,
+    expression_open: HashSet<Track>,
     lane_focus: bool,
     graph_tracks: HashSet<Track>,
     channels: HashMap<Track, usize>,
@@ -145,6 +145,8 @@ impl KeyEditor {
 
     pub fn begin_frame(&mut self, scene: &Scene) {
         self.frame_points.clear();
+        self.expression_open
+            .retain(|track| track_shape(scene, track).is_some());
         self.selected.retain(|pick| key_at(scene, pick).is_some());
         self.graph_tracks
             .retain(|track| track_shape(scene, track).is_some());
@@ -294,15 +296,16 @@ impl KeyEditor {
     }
 
     pub fn row_height(&self, id: &str, lane: Lane) -> f32 {
-        if self.graph
-            && self
-                .graph_tracks
-                .iter()
-                .any(|t| t.layer == id && t.lane == lane)
-        {
+        let is_track = |t: &Track| t.layer == id && t.lane == lane;
+        let keys = if self.graph && self.graph_tracks.iter().any(is_track) {
             136.0f32.max(34.0 + lane.channels().len() as f32 * 32.0)
         } else {
             32.0
+        };
+        keys + if self.expression_open.iter().any(is_track) {
+            56.0
+        } else {
+            0.0
         }
     }
 
@@ -380,8 +383,30 @@ impl KeyEditor {
             layer: scene.shapes[index].id.clone(),
             lane,
         };
+        let mut line = line;
+        let expression_line = self.expression_open.contains(&track).then(|| {
+            line.max.y -= 56.0;
+            Rect::from_min_max(line.left_bottom(), line.right_bottom() + vec2(0.0, 56.0))
+        });
+        if let Some(rect) = expression_line {
+            self.expression_editor(ui, scene, &track, index, rect, *playhead);
+        }
         let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(87.0, 32.0));
         let add = Rect::from_min_size(label.right_top() + vec2(3.0, 0.0), vec2(50.0, 32.0));
+        let toggle = Rect::from_min_size(add.right_top() + vec2(2.0, 0.0), vec2(32.0, 32.0));
+        let has_expression = scene.shapes[index].expression(lane).is_some();
+        if ui
+            .put(
+                toggle,
+                egui::Button::selectable(has_expression || expression_line.is_some(), "="),
+            )
+            .on_hover_text("Expression")
+            .clicked()
+        {
+            if !self.expression_open.remove(&track) {
+                self.expression_open.insert(track.clone());
+            }
+        }
         let active = self.graph_tracks.contains(&track);
         let title = match lane {
             Lane::Vector(crate::shape_style::VectorProperty::GradientStop(_, i)) => {
@@ -389,7 +414,7 @@ impl KeyEditor {
             }
             Lane::Effect(id, parameter) => scene.shapes[index].effect(id).map_or_else(
                 || parameter.label().to_owned(),
-                |effect| format!("{} ? {}", effect.kind.label(), parameter.label()),
+                |effect| format!("{} · {}", effect.kind.label(), parameter.label()),
             ),
             _ => lane.label().to_owned(),
         };
@@ -454,8 +479,19 @@ impl KeyEditor {
         let keys = scene.shapes[index].lane_keys(lane);
         let graph = self.graph && active;
         let (plot, points, handles, channel) = if graph {
-            let plot = self.graph_plot(scene, index, &track, rect, view, &keys, *playhead);
             let channel = self.graph_channels(ui, &track, line);
+            let expression = expression_samples(scene, index, lane, channel, view);
+            let plot = self.graph_plot(
+                scene,
+                index,
+                &track,
+                rect,
+                view,
+                &keys,
+                *playhead,
+                &expression,
+            );
+            draw_expression(ui, &plot, &expression);
             let mut handles = Vec::new();
             let points = self.draw_graph(
                 ui,
@@ -498,6 +534,85 @@ impl KeyEditor {
             ui, &response, scene, &track, plot, &points, &handles, graph, channel, playhead,
             playing,
         ) || selected_layer
+    }
+
+    fn expression_editor(
+        &self,
+        ui: &mut Ui,
+        scene: &mut Scene,
+        track: &Track,
+        index: usize,
+        line: Rect,
+        time: f64,
+    ) {
+        let mut source = scene.shapes[index]
+            .expression(track.lane)
+            .unwrap_or("")
+            .to_owned();
+        let mut changed = false;
+        let mut link = None;
+        let pane = Rect::from_min_max(line.min + vec2(14.0, 2.0), line.max - vec2(10.0, 0.0));
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(pane)
+                .id_salt(("expression", track)),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().interact_size.y = 32.0;
+                    let width = (ui.available_width() - 152.0).max(64.0);
+                    let field = egui::TextEdit::singleline(&mut source)
+                        .hint_text("Expression")
+                        .desired_width(width)
+                        .char_limit(1024)
+                        .show(ui);
+                    changed = field.response.changed();
+                    egui::Response::clone(&field.response).on_hover_text(
+                    "Use time, value or index. Try value + sin(time), or link to another property.",
+                );
+                    ui.menu_button("Link to…", |ui| {
+                        link = expression_links(ui, scene, track);
+                    });
+                    if ui.button("Clear").clicked() {
+                        source.clear();
+                        changed = true;
+                    }
+                    if let Some(link) = link {
+                        let (start, end) =
+                            field
+                                .cursor_range
+                                .map_or((source.len(), source.len()), |range| {
+                                    let [start, end] = range.sorted_cursors();
+                                    let byte = |i| {
+                                        source
+                                            .char_indices()
+                                            .nth(i)
+                                            .map_or(source.len(), |(byte, _)| byte)
+                                    };
+                                    (byte(start.index.into()), byte(end.index.into()))
+                                });
+                        if source.len() - (end - start) + link.len() <= 1024 {
+                            source.replace_range(start..end, &link);
+                            changed = true;
+                        }
+                    }
+                });
+                if changed {
+                    let source = (!source.trim().is_empty()).then_some(source);
+                    if let Some(shape) = track_shape_mut(scene, track) {
+                        shape.set_expression(track.lane, source);
+                    }
+                }
+                if scene.shapes[index].expression(track.lane).is_some()
+                    && let Err(error) = crate::expressions::evaluate(scene, index, track.lane, time)
+                {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(error.clone()).color(color::SUN))
+                            .truncate(),
+                    )
+                    .on_hover_text(error);
+                }
+            },
+        );
     }
 
     fn graph_channels(&mut self, ui: &mut Ui, track: &Track, line: Rect) -> usize {
@@ -597,6 +712,7 @@ impl KeyEditor {
         view: TimeView,
         keys: &[LaneKey],
         playhead: f64,
+        expression: &[(f64, Option<f32>)],
     ) -> Plot {
         if let Some(plot) = match &self.drag {
             Some(Drag::Keys(drag)) if drag.source.track == *track => Some(&drag.plot),
@@ -627,6 +743,9 @@ impl KeyEditor {
                     include(a + (b - a) * curve[3]);
                 }
             }
+        }
+        for value in expression.iter().filter_map(|(_, value)| *value) {
+            include(value);
         }
         let margin = ((hi - lo) * 0.10).max(1.0);
         Plot {
@@ -1029,7 +1148,7 @@ impl KeyEditor {
                     let track = if one_source && self.graph_tracks.len() == 1 {
                         let track = self.graph_tracks.iter().next().unwrap();
                         let compatible = match key {
-                            LaneKey::Color(_) | LaneKey::Vector(_) => track.lane == source.lane,
+                            LaneKey::Color(_) | LaneKey::Vector(_) | LaneKey::Spatial(..) => track.lane == source.lane,
                             LaneKey::Text(lane, _) => matches!(track.lane, Lane::Text(other)
                                 if std::mem::discriminant(lane) == std::mem::discriminant(&other)
                                     && lane.property() == other.property()),
@@ -1122,26 +1241,7 @@ impl KeyDrag {
             .filter(|s| self.picks.iter().any(|p| p.track.layer == s.id))
         {
             let mut shape = live.clone();
-            let lanes = Lane::ALL
-                .into_iter()
-                .chain(live.masks.iter().flat_map(|mask| {
-                    MaskProperty::ALL.map(|property| Lane::Mask(mask.id, property))
-                }))
-                .chain(
-                    live.vector
-                        .iter()
-                        .flat_map(|vector| vector.properties())
-                        .map(Lane::Vector),
-                )
-                .chain(live.text_layout.iter().flat_map(|text| text.lanes()))
-                .chain(live.effects.iter().flat_map(|effect| {
-                    effect
-                        .kind
-                        .controls()
-                        .iter()
-                        .map(|control| Lane::Effect(effect.id, control.parameter))
-                }));
-            for lane in lanes {
+            for lane in live.expression_lanes() {
                 let times: Vec<_> = self
                     .picks
                     .iter()
@@ -1212,6 +1312,107 @@ impl HandleDrag {
             key.move_handle(&shape.ease, self.handle.index, x as f32, y);
             shape.put_lane_key(t0, key);
         }
+    }
+}
+
+fn expression_samples(
+    scene: &Scene,
+    index: usize,
+    lane: Lane,
+    channel: usize,
+    view: TimeView,
+) -> Vec<(f64, Option<f32>)> {
+    if scene.shapes[index].expression(lane).is_none()
+        || lane == Lane::Vector(crate::shape_style::VectorProperty::Path)
+    {
+        return Vec::new();
+    }
+    (0..=48)
+        .map(|step| {
+            let time = view.start + view.span * f64::from(step) / 48.0;
+            let value = match crate::expressions::evaluate(scene, index, lane, time) {
+                Ok(crate::expressions::Value::Numbers(values)) => {
+                    values.get(channel).map(|&v| v as f32)
+                }
+                _ => None,
+            };
+            (time, value)
+        })
+        .collect()
+}
+
+fn draw_expression(ui: &Ui, plot: &Plot, samples: &[(f64, Option<f32>)]) {
+    let painter = ui.painter().with_clip_rect(plot.rect);
+    for pair in samples.windows(2).step_by(2) {
+        if let [(a, Some(x)), (b, Some(y))] = pair {
+            painter.line_segment(
+                [plot.point(*a, *x), plot.point(*b, *y)],
+                Stroke::new(1.5, color::LEAF),
+            );
+        }
+    }
+}
+
+fn expression_links(ui: &mut Ui, scene: &Scene, track: &Track) -> Option<String> {
+    use crate::shape_style::VectorProperty;
+    let path = Lane::Vector(VectorProperty::Path);
+    let components = track.lane.channels().len();
+    let mut linked = None;
+    egui::ScrollArea::vertical()
+        .max_height(300.0)
+        .show(ui, |ui| {
+            for target in &scene.shapes {
+                ui.push_id(&target.id, |ui| {
+                    ui.menu_button(&target.name, |ui| {
+                        for lane in target.expression_lanes() {
+                            if (target.id == track.layer && lane == track.lane)
+                                || (lane == path) != (track.lane == path)
+                            {
+                                continue;
+                            }
+                            ui.push_id(lane, |ui| {
+                                let name = expression_link_label(target, lane);
+                                let choices = lane.channels();
+                                if choices.len() == components && ui.button(&name).clicked() {
+                                    linked = crate::expressions::link_source(target, lane, None);
+                                    ui.close_kind(egui::UiKind::Menu);
+                                } else if components == 1 && choices.len() > 1 {
+                                    ui.menu_button(name, |ui| {
+                                        for (i, label) in choices.iter().enumerate() {
+                                            if ui.button(*label).clicked() {
+                                                linked = crate::expressions::link_source(
+                                                    target,
+                                                    lane,
+                                                    Some(i),
+                                                );
+                                                ui.close_kind(egui::UiKind::Menu);
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+        });
+    linked
+}
+
+fn expression_link_label(shape: &Shape, lane: Lane) -> String {
+    match lane {
+        Lane::Mask(id, _) => format!("Mask {id} · {}", lane.label()),
+        Lane::Effect(id, _) => shape.effect(id).map_or_else(
+            || lane.label().into(),
+            |effect| format!("{} · {}", effect.kind.label(), lane.label()),
+        ),
+        Lane::Text(crate::text_animator::TextLane::Animator(id, _)) => {
+            format!("Text animator {id} · {}", lane.label())
+        }
+        Lane::Vector(crate::shape_style::VectorProperty::GradientStop(_, i)) => {
+            format!("{} {}", lane.label(), i + 1)
+        }
+        _ => lane.label().into(),
     }
 }
 
@@ -1401,14 +1602,16 @@ mod tests {
             modifiers: Modifiers::NONE,
         };
         render(vec![]);
-        let start = pos2(350.0, 44.0);
-        let end = pos2(400.0, 100.0);
+        let plot = Rect::from_x_y_ranges(LABEL_WIDTH..=600.0 - TIME_MARGIN, 40.0..=104.0);
+        let key_x = view.x(plot, 2.0);
+        let start = pos2(key_x - 26.0, 44.0);
+        let end = pos2(key_x + 24.0, 100.0);
         render(vec![Event::PointerMoved(start), button(start, true)]);
         render(vec![Event::PointerMoved(end)]);
         render(vec![button(end, false)]);
 
-        let at = pos2(376.0, 56.0);
-        let to = at + vec2(52.5, 0.0);
+        let at = pos2(key_x, 56.0);
+        let to = pos2(view.x(plot, 2.5), at.y);
         render(vec![Event::PointerMoved(at), button(at, true)]);
         render(vec![Event::PointerMoved(to)]);
         render(vec![button(to, false)]);
@@ -1451,7 +1654,7 @@ mod tests {
             span: 4.0,
         };
         let keys = scene.shapes[1].lane_keys(lane);
-        let plot = editor.graph_plot(&scene, 1, &track, rect, view, &keys, 2.0);
+        let plot = editor.graph_plot(&scene, 1, &track, rect, view, &keys, 2.0, &[]);
         let at = plot.point(2.0 / 3.0, 15.0);
         let to = at + vec2(16.0, -18.0);
         let mut playhead = 2.0;

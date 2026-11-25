@@ -52,6 +52,8 @@ impl Forma {
         self.pending_auto_preview = None;
         self.renderer = None;
         self.preview = None;
+        self.frame_cache.invalidate();
+        self.camera_tool = false;
         self.videos = Videos::default();
         self.selected = None;
         self.multi_selected.clear();

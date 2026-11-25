@@ -360,6 +360,7 @@ fn blur_alpha(alpha: &mut Mask, sigma: f32) {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct LayerPixels {
     pub area: IntRect,
     pub pixmap: Pixmap,

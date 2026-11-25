@@ -17,7 +17,7 @@ impl Default for Anchor {
 }
 
 impl Anchor {
-    fn offset(self, pose: Pose) -> (f32, f32) {
+    pub(crate) fn offset_in(self, pose: Pose) -> (f32, f32) {
         ((self.x - 0.5) * pose.w, (self.y - 0.5) * pose.h)
     }
 }
@@ -105,7 +105,7 @@ fn centered(pose: Pose) -> Transform {
 
 fn placement(shape: &Shape, pose: Pose) -> Transform {
     let transform = centered(pose);
-    let (x, y) = shape.anchor.unwrap_or_default().offset(pose);
+    let (x, y) = shape.anchor.unwrap_or_default().offset_in(pose);
     if (x, y) == (0.0, 0.0) {
         transform
     } else {
