@@ -7,6 +7,8 @@ use crate::compositing::{MaskProperty, MatteLinks};
 use crate::key_editor::{KeyEditor, LABEL_WIDTH, TIME_MARGIN, TimeView};
 use crate::keyframes::{Lane, Property};
 use crate::mask_editor::MaskEditor;
+use crate::shape_panel::{self, Tool as VectorTool, VectorTools};
+use crate::shape_style::{PaintMode, PaintStyle, StrokeStyle, VectorLayer, VectorProperty, VectorValue};
 use crate::model::{self, HANDLES, Pose, RotationClip, Scene, Shape};
 use crate::motion;
 use crate::render;
@@ -183,6 +185,35 @@ fn fade_preview_range(scene: &Scene, shape: &Shape) -> Option<(f64, f64)> {
     Some(((fade.start_time - 0.25).max(0.0), end.min(scene.duration)))
 }
 
+fn solid_fill_color(ui: &mut Ui, shape: &mut Shape, time: f64) -> bool {
+    let current = shape.color_at(time);
+    let mut rgb = crate::render::rgb(&current);
+    let mut changed = ui.horizontal(|ui| {
+        ui.label("Fill color");
+        let changed = egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed();
+        ui.label(egui::RichText::new(current.to_uppercase()).color(color::INK_MUTED));
+        changed
+    }).inner;
+    if changed {
+        let [r, g, b] = rgb;
+        shape.key_color(time, format!("#{r:02x}{g:02x}{b:02x}"));
+    }
+    let mut animated = !shape.color_keys.is_empty();
+    if ui.checkbox(&mut animated, "Animate color")
+        .on_hover_text("Then move the playhead and pick another color")
+        .changed()
+    {
+        if animated {
+            shape.add_lane_key(Lane::Color, time);
+        } else {
+            shape.color = shape.color_at(time);
+            shape.color_keys.clear();
+        }
+        changed = true;
+    }
+    changed
+}
+
 pub(crate) fn new_id() -> String {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -240,6 +271,8 @@ pub struct Forma {
     timeline_drag: Option<TimelineDrag>,
     key_editor: KeyEditor,
     mask_editor: MaskEditor,
+    vector_tools: VectorTools,
+    vector_keyboard: bool,
     /// Drawing a move: the tool ("arrow" or "path"), its options, and what's drawn so far (from the layer's pose).
     motion_mode: Option<&'static str>,
     motion_options: motion::Options,
@@ -337,6 +370,8 @@ impl Forma {
             timeline_drag: None,
             key_editor: KeyEditor::default(),
             mask_editor: MaskEditor::default(),
+            vector_tools: VectorTools::default(),
+            vector_keyboard: false,
             motion_mode: None,
             motion_options: motion::Options::default(),
             motion_draft: None,
@@ -402,6 +437,7 @@ impl Forma {
         self.scene = scene;
         self.key_editor = KeyEditor::default();
         self.mask_editor = MaskEditor::default();
+        self.vector_tools = VectorTools::default();
         self.selected = None;
         self.multi_selected.clear();
         self.layer_drag = None;
@@ -564,6 +600,7 @@ impl Forma {
             self.timeline_drag = None;
             self.gesture = None;
             self.mask_editor.cancel_gesture();
+            self.vector_tools.set(None, None);
             self.suppress_history = true;
             self.playing = false;
             self.edited();
@@ -578,6 +615,7 @@ impl Forma {
             self.timeline_drag = None;
             self.gesture = None;
             self.mask_editor.cancel_gesture();
+            self.vector_tools.set(None, None);
             self.suppress_history = true;
             self.playing = false;
             self.edited();
@@ -699,6 +737,17 @@ impl Forma {
             if icon_button(ui, Icon::Image, "Add pictures, SVG artwork, or video", false).clicked() {
                 self.pick_media();
             }
+            if ui.add(egui::Button::selectable(self.vector_tools.tool == Some(VectorTool::Pen), "Pen").min_size(vec2(38.0, 40.0)))
+                .on_hover_text("Draw an editable path")
+                .clicked()
+            {
+                self.vector_tools.toggle(VectorTool::Pen, None);
+                self.mask_editor.stop();
+                (self.motion_mode, self.motion_draft) = (None, None);
+                self.gesture = None;
+                self.playing = false;
+                self.tab = Tab::Layer;
+            }
             self.mask_editor.sync(self.selected.as_deref());
             let masking = self.mask_editor.active();
             if ui
@@ -711,6 +760,7 @@ impl Forma {
             {
                 self.mask_editor.toggle(&self.scene);
                 if self.mask_editor.active() {
+                    self.vector_tools.set(None, None);
                     (self.motion_mode, self.motion_draft) = (None, None);
                     self.gesture = None;
                     self.playing = false;
@@ -727,6 +777,7 @@ impl Forma {
                         (self.motion_mode, self.motion_draft) = (None, None);
                     } else {
                         self.mask_editor.stop();
+                        self.vector_tools.set(None, None);
                         self.motion_mode = Some("arrow");
                         self.tab = Tab::Animate;
                     }
@@ -1336,10 +1387,30 @@ impl Forma {
             self.animate_tab(ui, index);
             return;
         }
+        let size = self.scene.layer_frame(&self.scene.shapes[index], self.time).pose;
+        let shape = &mut self.scene.shapes[index];
+        let tool_before = self.vector_tools.tool;
+        let show_solid = !shape.is_vector() || shape_panel::fill_panel(
+            ui, shape, [size.w, size.h], &mut self.vector_tools, self.time,
+        );
+        let mut changed = show_solid && solid_fill_color(ui, shape, self.time);
+        if shape.is_vector() {
+            shape_panel::stroke_and_trim(ui, shape, &mut self.vector_tools, self.time);
+        }
+        if self.vector_tools.tool != tool_before && self.vector_tools.tool.is_some() {
+            self.mask_editor.stop();
+            (self.motion_mode, self.motion_draft) = (None, None);
+            self.gesture = None;
+            self.playing = false;
+        }
         self.follows_picker(ui, index, false);
+        let was_masking = self.mask_editor.active();
         self.mask_editor
             .panel(ui, &mut self.scene, index, self.time, &mut self.playing);
         if self.mask_editor.active() {
+            if !was_masking {
+                self.vector_tools.set(None, None);
+            }
             (self.motion_mode, self.motion_draft) = (None, None);
         }
         self.arrange_panel(ui);
@@ -1348,7 +1419,6 @@ impl Forma {
             .scene
             .inspector_pose(&self.scene.shapes[index], self.time);
         let shape = &mut self.scene.shapes[index];
-        let mut changed = false;
         changed |= ui.text_edit_singleline(&mut shape.name).changed();
         if shape.kind == "text" {
             ui.label("Text");
@@ -1432,40 +1502,6 @@ impl Forma {
             });
         }
         let shape = &mut self.scene.shapes[index];
-        // Color edits use the same lane as the timeline.
-        let current = shape.color_at(self.time);
-        let channel =
-            |i: usize| u8::from_str_radix(current.get(i..i + 2).unwrap_or("00"), 16).unwrap_or(0);
-        let mut rgb = [channel(1), channel(3), channel(5)];
-        ui.horizontal(|ui| {
-            ui.label("Fill");
-            if egui::color_picker::color_edit_button_srgb(ui, &mut rgb).changed() {
-                let picked = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
-                shape.key_color(self.time, picked);
-                changed = true;
-            }
-            ui.label(egui::RichText::new(current.to_uppercase()).color(color::INK_MUTED));
-        });
-        let mut animated = !shape.color_keys.is_empty();
-        if ui
-            .checkbox(&mut animated, "Animate color")
-            .on_hover_text("Then move the playhead and pick another color")
-            .changed()
-        {
-            if animated {
-                shape.color_keys = vec![model::ColorKey {
-                    t: model::hundredths(self.time),
-                    color: current.clone(),
-                    ease: None,
-                    curve: None,
-                    extra: Default::default(),
-                }];
-            } else {
-                shape.color = current.clone();
-                shape.color_keys.clear();
-            }
-            changed = true;
-        }
         let mut blur = shape
             .extra
             .get("blur")
@@ -1996,7 +2032,7 @@ impl Forma {
         }
         let bar = Rect::from_center_size(
             pos2(area.center().x, area.bottom() - 22.0),
-            vec2(area.width().min(420.0), 34.0),
+            vec2(area.width().min(500.0), 40.0),
         );
         ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
             // Darker than the canvas's surroundings, with an edge, so it reads as a bar over them.
@@ -2007,8 +2043,8 @@ impl Forma {
                 .inner_margin(egui::Margin::symmetric(10, 4))
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
-                        // In a narrow canvas only the four buttons fit.
-                        if bar.width() >= 380.0 {
+                        ui.spacing_mut().interact_size.y = 32.0;
+                        if bar.width() >= 440.0 {
                             let name: String =
                                 self.scene.shapes[index].name.chars().take(18).collect();
                             ui.label(
@@ -2044,6 +2080,21 @@ impl Forma {
                             .clicked()
                         {
                             self.drop_onto_screen(index);
+                        }
+                        if self.scene.shapes[index].is_vector() && ui.button("Draw on")
+                            .on_hover_text("Reveal the outline from the playhead")
+                            .clicked()
+                        {
+                            let shape = &mut self.scene.shapes[index];
+                            let limit = shape.out_time.unwrap_or(self.scene.duration).min(self.scene.duration);
+                            let start = model::hundredths(self.time.max(shape.clip_start())).min(limit);
+                            let end = model::hundredths(start + 1.0).min(limit);
+                            if shape.draw_on(start, end) {
+                                self.key_editor.expanded.insert(shape.id.clone());
+                                self.tab = Tab::Animate;
+                            } else {
+                                self.notice = Some("Move the playhead earlier in the layer to draw it on.".into());
+                            }
                         }
                     });
                 });
@@ -2589,8 +2640,129 @@ impl Forma {
 
     fn canvas(&mut self, ui: &mut Ui) {
         let viewport = ui.max_rect();
+        self.vector_tools.sync(self.selected.as_deref(), self.time);
         self.canvas_view(ui);
         self.canvas_bar(ui, viewport);
+        if let Some(tool) = self.vector_tools.tool.filter(|_| !self.playing) {
+            shape_panel::draw_hint(ui, viewport, tool);
+        }
+    }
+
+    fn vector_canvas(
+        &mut self, ui: &Ui, painter: &egui::Painter, response: &egui::Response,
+        view: tiny_skia::Transform, tool: VectorTool,
+    ) {
+        let (finish, escape, delete) = if self.vector_keyboard {
+            ui.input(|i| (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+            ))
+        } else {
+            (false, false, false)
+        };
+        let selected = self.selected.as_deref().and_then(|id| {
+            let index = self.scene.shapes.iter().position(|shape| shape.id == id)?;
+            let shape = &self.scene.shapes[index];
+            shape.visible(self.time, self.scene.duration)
+                .then(|| (index, self.scene.layer_frame(shape, self.time)))
+        });
+        if tool == VectorTool::Pen || tool == VectorTool::Subpath {
+            let space = if tool == VectorTool::Subpath {
+                let Some((_, frame)) = selected else {
+                    self.vector_tools.set(None, None);
+                    return;
+                };
+                frame.box_transform().post_concat(view)
+            } else {
+                view
+            };
+            let contour = if finish || escape {
+                self.vector_tools.pen.finish(false)
+            } else {
+                self.vector_tools.pen.canvas(ui, painter, response, space)
+            };
+            if let Some(contour) = contour {
+                if tool == VectorTool::Subpath {
+                    if let Some((index, frame)) = selected {
+                        let shape = &mut self.scene.shapes[index];
+                        let at = model::hundredths(self.time).min(self.scene.duration);
+                        if let Some(mut path) = shape.path_at(at, [frame.pose.w, frame.pose.h]) {
+                            path.contours.push(contour);
+                            if path.valid() && let Some(vector) = &mut shape.vector {
+                                vector.edit(VectorProperty::Path, VectorValue::Path(path), at);
+                            } else {
+                                self.notice = Some("This layer has reached the path point limit.".into());
+                            }
+                        }
+                        self.vector_tools.set(Some(VectorTool::Points), self.selected.as_deref());
+                    }
+                } else {
+                    self.add_pen_layer(contour);
+                }
+            } else if escape {
+                self.vector_tools.set(None, None);
+            }
+            return;
+        }
+        if escape {
+            self.vector_tools.set(None, None);
+            return;
+        }
+        let Some((index, frame)) = selected else {
+            self.vector_tools.set(None, None);
+            return;
+        };
+        let shape = &mut self.scene.shapes[index];
+        let local = frame.box_transform().post_concat(view);
+        let at = model::hundredths(self.time).min(self.scene.duration);
+        match tool {
+            VectorTool::Points => {
+                if let Some(path) = shape.path_at(at, [frame.pose.w, frame.pose.h]) {
+                    self.vector_tools.edit_points(ui, painter, response, shape, path, local, at, delete);
+                }
+            }
+            VectorTool::Gradient(target) => {
+                self.vector_tools.gradient_canvas(ui, painter, response, shape, target, local, at);
+            }
+            _ => {}
+        }
+    }
+
+    fn add_pen_layer(&mut self, contour: crate::paths::Contour) {
+        if self.scene.shapes.len() >= 500 {
+            self.notice = Some("This scene already has 500 layers.".into());
+            return;
+        }
+        let Some(bounds) = crate::path_editor::shape_bounds(&contour) else { return; };
+        let closed = contour.closed;
+        let path = crate::paths::PathData { contours: vec![crate::path_editor::normalize(contour, bounds)] };
+        if !path.valid() {
+            return;
+        }
+        let id = self.scene.add_shape(new_id(), "path");
+        if let Some(shape) = self.scene.shapes.last_mut() {
+            shape.name = "Path".into();
+            if let Some(key) = shape.keys.first_mut() {
+                key.x = bounds.center().x.clamp(-10_000.0, 10_000.0);
+                key.y = bounds.center().y.clamp(-10_000.0, 10_000.0);
+                key.w = bounds.width().clamp(1.0, 10_000.0);
+                key.h = bounds.height().clamp(1.0, 10_000.0);
+            }
+            let color = crate::render::rgb(&shape.color).map(f32::from);
+            shape.vector = Some(VectorLayer {
+                path: Some(path),
+                fill: (!closed).then(|| PaintStyle::new(PaintMode::None)),
+                stroke: (!closed).then(|| StrokeStyle {
+                    rgba: [color[0], color[1], color[2], 100.0],
+                    ..StrokeStyle::default()
+                }),
+                ..VectorLayer::default()
+            });
+        }
+        self.select_layer(Some(id.clone()), false);
+        self.tab = Tab::Layer;
+        self.vector_tools.set(Some(VectorTool::Points), Some(&id));
     }
 
     /// Electron's canvas bar, over the top of the canvas: the scene's shape (opens Scene settings), a hint, and zoom.
@@ -2852,8 +3024,8 @@ impl Forma {
         });
         let mut handles = Vec::new();
         let (mut rotate_at, mut anchor_at) = (None, None);
-        if let (Some((_, frame)), false, false) =
-            (selected, self.playing, self.mask_editor.active())
+        if let (Some((_, frame)), false, false, None) =
+            (selected, self.playing, self.mask_editor.active(), self.vector_tools.tool)
         {
             let w = frame.pose.w;
             let h = frame.pose.h;
@@ -2913,9 +3085,21 @@ impl Forma {
             }
             return;
         }
+        if !self.playing && let Some(tool) = self.vector_tools.tool {
+            if response.clicked() || response.drag_started() {
+                self.key_editor.clear_selection();
+            }
+            let view = tiny_skia::Transform::from_scale(scale, scale)
+                .post_translate(canvas.left(), canvas.top());
+            self.vector_canvas(ui, &painter, &response, view, tool);
+            return;
+        }
         if !self.playing
             && let Some((index, frame)) = selected
         {
+            if self.mask_editor.active() && (response.clicked() || response.drag_started()) {
+                self.key_editor.clear_selection();
+            }
             let view = tiny_skia::Transform::from_scale(scale, scale)
                 .post_translate(canvas.left(), canvas.top());
             self.mask_editor.canvas(
@@ -2926,6 +3110,7 @@ impl Forma {
                 frame,
                 view,
                 self.time,
+                self.vector_keyboard,
             );
         } else {
             self.mask_editor.cancel_gesture();
@@ -3075,11 +3260,24 @@ impl Forma {
         };
         let on_rotate = |p: Pos2| rotate_at.is_some_and(|at| at.distance(p) <= 12.0);
         let on_anchor = |p: Pos2| anchor_at.is_some_and(|at| at.distance(p) <= 11.0);
-        let topmost = |p: Pos2| {
-            let p = to_scene(p);
+        let topmost = |scene: &Scene, time: f64, screen: Pos2| {
+            let p = to_scene(screen);
             hits.iter()
                 .rev()
-                .find(|(_, frame)| {
+                .find(|(index, frame)| {
+                    let shape = &scene.shapes[*index];
+                    if shape.kind == "path"
+                        && let Some(path) = shape.path_at(time, [frame.pose.w, frame.pose.h])
+                        && let Some(vector) = &shape.vector
+                    {
+                        let view = tiny_skia::Transform::from_scale(scale, scale)
+                            .post_translate(canvas.left(), canvas.top());
+                        let fill = vector.fill.as_ref().is_none_or(|fill| fill.mode != PaintMode::None);
+                        let place = frame.transform.post_concat(view);
+                        let width = vector.stroke_at(time, &shape.ease)
+                            .map_or(0.0, |stroke| stroke.width * transform::max_scale(place) / 2.0);
+                        return crate::path_editor::hits(&path, frame.box_transform().post_concat(view), screen, fill, width);
+                    }
                     frame.transform.invert().is_some_and(|inverse| {
                         let (x, y) = transform::point(inverse, p.x, p.y);
                         x.abs() <= frame.pose.w / 2.0 && y.abs() <= frame.pose.h / 2.0
@@ -3087,7 +3285,7 @@ impl Forma {
                 })
                 .map(|(index, _)| *index)
         };
-        let menu_target = response.interact_pointer_pos().and_then(topmost);
+        let menu_target = response.interact_pointer_pos().and_then(|p| topmost(&self.scene, self.time, p));
         if response.secondary_clicked() {
             let id = menu_target.map(|i| self.scene.shapes[i].id.clone());
             self.select_layer(id, false);
@@ -3117,7 +3315,7 @@ impl Forma {
                         egui::CursorIcon::ResizeNeSw,
                     ][(angle / 45.0).round() as usize % 4],
                 );
-            } else if topmost(p).is_some() {
+            } else if topmost(&self.scene, self.time, p).is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
             }
         }
@@ -3163,7 +3361,7 @@ impl Forma {
                         });
                     }
                 } else {
-                    let hit = topmost(p).map(|i| self.scene.shapes[i].id.clone());
+                    let hit = topmost(&self.scene, self.time, p).map(|i| self.scene.shapes[i].id.clone());
                     let extend = ui.input(|i| i.modifiers.shift);
                     if extend && response.clicked() {
                         self.select_layer(hit, true);
@@ -3370,6 +3568,9 @@ impl Forma {
             }
             if self.key_editor.expanded.contains(&shape.id) {
                 rows.extend(Lane::ALL.map(|lane| Row::Property(index, lane)));
+                if let Some(vector) = &shape.vector {
+                    rows.extend(vector.properties().into_iter().map(|p| Row::Property(index, Lane::Vector(p))));
+                }
                 for (number, mask) in shape.masks.iter().enumerate() {
                     rows.push(Row::Mask(index, mask.id, number + 1));
                     if self.key_editor.mask_expanded(&shape.id, mask.id) {
@@ -5079,6 +5280,7 @@ impl CanopyApp for Forma {
         self.automation(ui.ctx(), host);
         // With a dialog up, the editor's keys wait (Delete would otherwise remove a layer behind the Export dialog).
         let dialog = self.show_projects || self.show_help || self.show_export || self.svg_edit.is_some();
+        self.vector_keyboard = host.focused() && !dialog && !ui.ctx().text_edit_focused();
         if host.focused() && !dialog {
             let undo = ui.input(|i| {
                 i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift
@@ -5093,6 +5295,11 @@ impl CanopyApp for Forma {
             } else if redo {
                 self.redo();
             }
+            let mask_shortcut = self.mask_editor.editing_points() && !ui.ctx().text_edit_focused()
+                && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+            let vector_shortcut = self.vector_tools.tool.is_some() && !ui.ctx().text_edit_focused()
+                && ui.input(|i| [egui::Key::Escape, egui::Key::Enter, egui::Key::Delete, egui::Key::Backspace]
+                    .iter().any(|&key| i.key_pressed(key)));
             let key_shortcut = !ui.ctx().text_edit_focused() && {
                 let (copy, paste, delete) = ui.input(|i| {
                     let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy))
@@ -5108,7 +5315,10 @@ impl CanopyApp for Forma {
                 self.key_editor
                     .shortcut(&mut self.scene, self.time, copy, paste, delete)
             };
-            if !key_shortcut && !ui.ctx().egui_wants_keyboard_input() {
+            if key_shortcut {
+                self.vector_keyboard = false;
+            }
+            if !key_shortcut && !mask_shortcut && !vector_shortcut && !ui.ctx().egui_wants_keyboard_input() {
                 if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
                     self.multi_selected = self
                         .scene

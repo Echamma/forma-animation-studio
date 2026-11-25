@@ -2,6 +2,8 @@ use crate::compositing::{
     Blend, LayerMask, MaskMode, MaskPoint, MaskPose, MaskProperty, MaskShape, MatteMode, TrackMatte,
 };
 use crate::model::{Scene, Shape};
+use crate::path_editor::{self, Pen, PointEditor};
+use crate::paths::{Contour, PathData, Vertex};
 use crate::transform::{LayerFrame, point};
 use canopy_ui::color;
 use egui::{Color32, Pos2, Rect, Response, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
@@ -13,14 +15,13 @@ const CORNERS: [Vec2; 4] = [
     vec2(1.0, 1.0),
     vec2(-1.0, 1.0),
 ];
-const MAX_POINTS: usize = 1024;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
     Edit,
     Rectangle,
     Ellipse,
     Path,
+    Points,
 }
 
 impl Tool {
@@ -30,6 +31,7 @@ impl Tool {
             Self::Rectangle => "Rectangle",
             Self::Ellipse => "Ellipse",
             Self::Path => "Freeform path",
+            Self::Points => "Edit mask points",
         }
     }
 }
@@ -40,7 +42,8 @@ pub(crate) struct MaskEditor {
     selected: Option<u64>,
     tool: Option<Tool>,
     time: Option<f64>,
-    path: Vec<Pos2>,
+    path: Pen,
+    points: PointEditor,
     drawing: Option<Pos2>,
     dragging: Option<MaskDrag>,
     open_panel: bool,
@@ -85,12 +88,13 @@ impl MaskEditor {
 
     pub fn cancel_gesture(&mut self) {
         self.path.clear();
+        self.points.cancel();
         self.drawing = None;
         self.dragging = None;
     }
 
     pub fn escape(&mut self) {
-        if self.path.is_empty() {
+        if self.path.empty() {
             self.stop();
         } else {
             self.cancel_gesture();
@@ -143,11 +147,13 @@ impl MaskEditor {
                 ui.separator();
                 self.tool_picker(ui, playing);
                 if self.tool == Some(Tool::Path)
-                    && self.path.len() >= 3
+                    && self.path.ready(true)
                     && ui.button("Finish path").clicked()
                 {
                     let frame = scene.layer_frame(&scene.shapes[index], time);
-                    self.finish_path(&mut scene.shapes[index], frame);
+                    if let Some(contour) = self.path.finish(true) {
+                        self.finish_path(&mut scene.shapes[index], frame, contour);
+                    }
                 }
                 self.mask_fields(ui, &mut scene.shapes[index], time);
             });
@@ -169,6 +175,7 @@ impl MaskEditor {
                 Some(Tool::Ellipse),
                 Some(Tool::Path),
                 Some(Tool::Edit),
+                Some(Tool::Points),
             ],
             |tool| tool.map_or("Off", Tool::label),
         ) {
@@ -181,9 +188,10 @@ impl MaskEditor {
                 "Drag on the canvas over the area you want to keep."
             }
             Some(Tool::Path) => {
-                "Click points on the canvas. Click the first point or press Enter to close the path."
+                "Click for a corner, drag for curves. Click the first point or press Enter to close."
             }
             Some(Tool::Edit) => "Drag a mask to move it, or drag a corner to resize it.",
+            Some(Tool::Points) => "Drag mask points or handles. Click a segment to add a point.",
             None => return,
         };
         ui.label(egui::RichText::new(hint).color(color::INK_MUTED));
@@ -207,6 +215,7 @@ impl MaskEditor {
         let ids: Vec<_> = shape.masks.iter().map(|mask| mask.id).collect();
         if choose(ui, "selected-mask", &mut selected, &ids, label) {
             self.selected = Some(selected);
+            self.points.cancel();
         }
         let ease = shape.ease.clone();
         let Some(mask) = shape.mask_mut(selected) else {
@@ -265,6 +274,7 @@ impl MaskEditor {
         frame: LayerFrame,
         view: Transform,
         time: f64,
+        keyboard: bool,
     ) {
         self.sync(Some(&shape.id));
         if self.time != Some(time) {
@@ -329,6 +339,11 @@ impl MaskEditor {
         }
         match self.tool {
             Some(Tool::Edit) => self.edit_on_canvas(ui, response, shape, &outlines, selected, time),
+            Some(Tool::Points) => {
+                if let Some(id) = selected {
+                    self.edit_points(ui, painter, response, shape, id, frame, view, time, keyboard);
+                }
+            }
             Some(tool) => {
                 if response.hovered() || response.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -338,9 +353,14 @@ impl MaskEditor {
                         self.draw_box(ui, painter, response, shape, frame, layer, inverse, tool)
                     }
                     Tool::Path => {
-                        self.draw_path(ui, painter, response, shape, frame, layer, inverse)
+                        let enter = keyboard && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && (response.has_focus() || !ui.ctx().egui_wants_keyboard_input());
+                        let contour = if enter { self.path.finish(true) } else { self.path.canvas(ui, painter, response, layer) };
+                        if let Some(contour) = contour {
+                            self.finish_path(shape, frame, contour);
+                        }
                     }
-                    Tool::Edit => {}
+                    Tool::Edit | Tool::Points => {}
                 }
             }
             None => {}
@@ -467,73 +487,51 @@ impl MaskEditor {
         }
     }
 
-    fn draw_path(
-        &mut self,
-        ui: &Ui,
-        painter: &egui::Painter,
-        response: &Response,
-        shape: &mut Shape,
-        frame: LayerFrame,
-        layer: Transform,
-        inverse: Transform,
+    fn edit_points(
+        &mut self, ui: &Ui, painter: &egui::Painter, response: &Response,
+        shape: &mut Shape, id: u64, frame: LayerFrame, view: Transform, time: f64, keyboard: bool,
     ) {
-        let mut points: Vec<_> = self.path.iter().map(|&p| map(layer, p)).collect();
-        let first = points.first().copied();
-        let mut finish = ui.input(|i| i.key_pressed(egui::Key::Enter))
-            && (response.has_focus() || !ui.ctx().egui_wants_keyboard_input());
-        if response.clicked_by(egui::PointerButton::Primary)
-            && let Some(p) = response.interact_pointer_pos()
-        {
-            if self.path.len() >= 3 && first.is_some_and(|first| first.distance(p) <= 10.0) {
-                finish = true;
-            } else if self.path.len() < MAX_POINTS
-                && p.is_finite()
-                && points.last().is_none_or(|last| last.distance(p) >= 2.0)
-            {
-                self.path.push(map(inverse, p));
-                points.push(p);
+        let ease = shape.ease.clone();
+        let Some(mask) = shape.mask_mut(id) else { return; };
+        let pose = mask.pose(time, &ease);
+        let space = Transform::from_scale(pose.size[0], pose.size[1])
+            .post_concat(pose.placement()).post_concat(mask.space(frame)).post_concat(view);
+        let mut path = match &mask.shape {
+            MaskShape::Path { points } => PathData {
+                contours: vec![Contour {
+                    closed: true,
+                    points: points.iter().map(|p| Vertex {
+                        point: p.point,
+                        incoming: p.incoming,
+                        outgoing: p.outgoing,
+                        smooth: p.outgoing.is_some_and(|h| p.incoming == Some(h.map(|v| -v))),
+                    }).collect(),
+                }],
+            },
+            geometry => {
+                let Some(outline) = geometry.outline(pose.size) else { return; };
+                PathData::from_outline(&outline, pose.size)
             }
-        }
-        if finish || self.path.len() >= MAX_POINTS {
-            self.finish_path(shape, frame);
-            return;
-        }
-        let stroke = Stroke::new(1.5, color::LEAF);
-        for &p in &points {
-            painter.circle_filled(p, 3.0, color::LEAF);
-        }
-        if let Some(p) = response.hover_pos() {
-            points.push(p);
-        }
-        if points.len() > 1 {
-            painter.add(egui::Shape::line(points, stroke));
+        };
+        let delete = keyboard
+            && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+        let changed = if delete {
+            self.points.delete(&mut path, 3)
+        } else {
+            self.points.canvas(ui, painter, response, &mut path, space, color::LEAF)
+        };
+        if changed && let Some(contour) = path.contours.into_iter().next() {
+            mask.shape = mask_path(contour);
         }
     }
 
-    fn finish_path(&mut self, shape: &mut Shape, frame: LayerFrame) {
-        if self.path.len() < 3 {
-            return;
-        }
-        let bounds = Rect::from_points(&self.path);
-        if !valid_bounds(bounds) {
-            return;
-        }
-        let points = self
-            .path
-            .iter()
-            .map(|&p| {
-                let from_center = p - bounds.center();
-                MaskPoint {
-                    point: [
-                        from_center.x / bounds.width(),
-                        from_center.y / bounds.height(),
-                    ],
-                    incoming: None,
-                    outgoing: None,
-                }
-            })
-            .collect();
-        self.add(shape, frame, MaskShape::Path { points }, bounds);
+    pub fn editing_points(&self) -> bool {
+        self.tool == Some(Tool::Points)
+    }
+
+    fn finish_path(&mut self, shape: &mut Shape, frame: LayerFrame, contour: Contour) {
+        let Some(bounds) = path_editor::shape_bounds(&contour).filter(|&bounds| valid_bounds(bounds)) else { return; };
+        self.add(shape, frame, mask_path(path_editor::normalize(contour, bounds)), bounds);
     }
 
     fn add(&mut self, shape: &mut Shape, frame: LayerFrame, geometry: MaskShape, bounds: Rect) {
@@ -567,6 +565,14 @@ impl MaskEditor {
         self.tool = Some(Tool::Edit);
         self.cancel_gesture();
         self.reveal_lanes = Some((shape.id.clone(), id));
+    }
+}
+
+fn mask_path(contour: Contour) -> MaskShape {
+    MaskShape::Path {
+        points: contour.points.into_iter().map(|v| MaskPoint {
+            point: v.point, incoming: v.incoming, outgoing: v.outgoing,
+        }).collect(),
     }
 }
 
@@ -816,6 +822,7 @@ mod tests {
                             frame,
                             Transform::identity(),
                             0.0,
+                            true,
                         );
                     },
                 )
@@ -889,5 +896,28 @@ mod tests {
                 .iter()
                 .all(|p| p.incoming.is_none() && p.outgoing.is_none())
         );
+    }
+
+    #[test]
+    fn masks_use_the_same_curved_pen_and_point_drag() {
+        let mut canvas = Canvas::new(Tool::Path);
+        canvas.show(vec![]);
+        canvas.click(pos2(40.0, 40.0));
+        canvas.drag(pos2(80.0, 40.0), pos2(88.0, 54.0));
+        canvas.click(pos2(60.0, 80.0));
+        canvas.click(pos2(40.0, 40.0));
+        let MaskShape::Path { points } = &canvas.scene.shapes[0].masks[0].shape else {
+            panic!("expected a closed mask");
+        };
+        let outgoing = points[1].outgoing.unwrap();
+        let initial = points[1].point;
+        assert_eq!(points[1].incoming, Some(outgoing.map(|v| -v)));
+        canvas.editor.tool = Some(Tool::Points);
+        canvas.drag(pos2(80.0, 40.0), pos2(95.0, 45.0));
+        let MaskShape::Path { points } = &canvas.scene.shapes[0].masks[0].shape else {
+            panic!("expected a closed mask");
+        };
+        assert!(points[1].point[0] > initial[0] && points[1].point[1] > initial[1]);
+        assert_eq!(points[1].outgoing, Some(outgoing));
     }
 }

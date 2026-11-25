@@ -351,6 +351,10 @@ impl Shape {
         let Some((sx, sy, rotation)) = self.bake_components(basis) else {
             return;
         };
+        // A change of local scale alters pixel widths, dashes and the shape of radial paint.
+        if self.vector.is_some() && ((sx - 1.0).abs() > 1e-5 || (sy - 1.0).abs() > 1e-5) {
+            return;
+        }
         self.map_positions(basis);
         if let Some(pose) = &mut self.rest_pose {
             (pose.w, pose.h, pose.r) = (pose.w * sx, pose.h * sy, pose.r + rotation);

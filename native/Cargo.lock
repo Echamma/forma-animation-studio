@@ -1377,6 +1377,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "kurbo 0.11.3",
  "resvg",
  "rfd",
  "serde",

@@ -16,6 +16,10 @@ pub mod mcp;
 pub mod media;
 pub mod model;
 pub mod motion;
+pub mod paths;
+mod path_editor;
+pub mod shape_style;
+mod shape_panel;
 pub mod render;
 pub mod sound;
 pub mod storage;
@@ -24,6 +28,8 @@ pub mod text;
 pub mod transform;
 pub mod video;
 pub mod videos;
+mod vector_render;
+mod vector_svg;
 
 use canopy_ui::{Accent, AppDescriptor, CanopyApp, Place, SharedFile};
 

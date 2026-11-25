@@ -2,6 +2,7 @@
 
 use crate::compositing::{Blend, LayerMask, TrackMatte};
 use crate::keyframes::{Lane, Property};
+use crate::shape_style::VectorLayer;
 use crate::transform::Anchor;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ pub struct Scene {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(remote = "Shape", rename_all = "camelCase")]
 pub struct Shape {
     pub id: String,
     pub name: String,
@@ -66,8 +67,69 @@ pub struct Shape {
     pub masks: Vec<LayerMask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track_matte: Option<TrackMatte>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector: Option<VectorLayer>,
     #[serde(flatten, serialize_with = "serialize_shape_extra")]
     pub extra: Map<String, Value>,
+}
+
+const PATH_FALLBACK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#;
+const VECTOR_POSE_KEYS: &str = "vectorPoseKeys";
+
+impl Serialize for Shape {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let needs_pose_fallback = self.vector.is_some()
+            && (self.keys.is_empty()
+                || self.keys.len() > 1000
+                || self.keys.windows(2).any(|pair| pair[0].t == pair[1].t)
+                || self.keys.iter().any(|k| {
+                    [k.x, k.y, k.w, k.h, k.r].iter().any(|v| v.abs() > 10_000.0)
+                        || !(0.0..=100.0).contains(&k.o)
+                }));
+        if self.kind != "path" && !needs_pose_fallback {
+            return Shape::serialize(self, serializer);
+        }
+        let mut fallback = self.clone();
+        if self.kind == "path" {
+            fallback.kind = "svg".into();
+            fallback.extra.insert("svgSource".into(), PATH_FALLBACK.into());
+        }
+        if needs_pose_fallback {
+            let keys = serde_json::to_value(&self.keys).map_err(serde::ser::Error::custom)?;
+            fallback.extra.insert(VECTOR_POSE_KEYS.into(), keys);
+            let mut times: Vec<_> = self.keys.iter().map(|k| k.t).collect();
+            times.sort_by(f64::total_cmp);
+            times.dedup();
+            if times.is_empty() {
+                times.push(0.0);
+            }
+            fallback.keys = times.into_iter().take(1000).map(|t| {
+                let mut p = self.pose(t);
+                [p.x, p.y, p.r] = [p.x, p.y, p.r].map(|v| v.clamp(-10_000.0, 10_000.0));
+                [p.w, p.h] = [p.w, p.h].map(|v| v.clamp(1.0, 10_000.0));
+                p.o = p.o.clamp(0.0, 100.0);
+                Key::from_pose(t, p)
+            }).collect();
+        }
+        Shape::serialize(&fallback, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Shape {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut shape = Shape::deserialize(deserializer)?;
+        if shape.kind == "svg"
+            && shape.vector.as_ref().is_some_and(|vector| vector.path.is_some())
+            && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
+        {
+            shape.kind = "path".into();
+            shape.extra.remove("svgSource");
+        }
+        if shape.vector.is_some() && let Some(keys) = shape.extra.remove(VECTOR_POSE_KEYS) {
+            shape.keys = serde_json::from_value(keys).map_err(serde::de::Error::custom)?;
+        }
+        Ok(shape)
+    }
 }
 
 // Repair blur values from older native saves for Electron's project validator.
@@ -271,6 +333,12 @@ impl Scene {
             serde_json::from_slice(bytes).map_err(|e| format!("Invalid Forma project: {e}"))?;
         for shape in &mut scene.shapes {
             shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+            if shape.vector.as_mut().is_some_and(|vector| !vector.prepare(scene.duration)) {
+                return Err(format!("{}: this layer has invalid path or appearance data.", shape.name));
+            }
+            if shape.kind == "path" && shape.vector.as_ref().is_none_or(|vector| vector.path.is_none()) {
+                return Err(format!("{}: this layer is missing its path.", shape.name));
+            }
             let mut mask_ids = HashSet::new();
             for mask in &mut shape.masks {
                 if !mask_ids.insert(mask.id) || !mask.prepare() {
@@ -315,6 +383,7 @@ impl Scene {
             "circle" => ("Circle", "#ed795e"),
             "triangle" => ("Triangle", "#c3d77f"),
             "diamond" => ("Diamond", "#aaa0ce"),
+            "path" => ("Path", "#aaa0ce"),
             _ => ("Rectangle", "#aaa0ce"),
         };
         self.shapes.push(Shape {
@@ -351,6 +420,7 @@ impl Scene {
             blend_mode: None,
             masks: Vec::new(),
             track_matte: None,
+            vector: None,
             extra: Map::new(),
         });
         id
@@ -616,6 +686,7 @@ impl Scene {
                     .map(|key| key.t)
                     .chain(shape.color_keys.iter().map(|key| key.t))
                     .chain(shape.mask_times())
+                    .chain(shape.vector_times())
                     .chain(shape.out_time)
                     .chain(
                         shape
@@ -973,6 +1044,7 @@ impl Scene {
             .iter_mut()
             .map(|k| &mut k.t)
             .chain(shape.color_keys.iter_mut().map(|k| &mut k.t))
+            .chain(shape.vector.iter_mut().flat_map(|v| v.keys.iter_mut().map(|k| &mut k.t)))
             .chain(
                 shape
                     .masks
@@ -1197,6 +1269,7 @@ impl Scene {
         };
         copy.color_keys.clear();
         copy.freeze_masks(if same { end } else { template.clip_start() });
+        copy.freeze_vector(if same { end } else { template.clip_start() });
         if !same {
             copy.base_rotation = source.base_rotation;
         }
@@ -1436,6 +1509,7 @@ impl Scene {
         ghost.color = previous.color_at(at);
         ghost.color_keys.clear();
         ghost.freeze_masks(at);
+        ghost.freeze_vector(at);
         ghost.rotation_clips.clear();
         ghost.parent = None;
         ghost.parent_space = crate::transform::matrix(frame.space);
@@ -1711,6 +1785,7 @@ impl Shape {
             .chain(self.keys.iter().map(|k| k.t))
             .chain(self.color_keys.iter().map(|k| k.t))
             .chain(self.mask_times())
+            .chain(self.vector_times())
             .chain(motions(self).map(|(_, start, _)| start))
             .chain(self.rotation_clips.iter().map(|c| c.start_time))
             .chain(self.disappear.iter().map(|d| d.start_time))
@@ -1723,6 +1798,7 @@ impl Shape {
             .chain(self.keys.iter().map(|k| k.t))
             .chain(self.color_keys.iter().map(|k| k.t))
             .chain(self.mask_times())
+            .chain(self.vector_times())
             .chain(motions(self).map(|(_, start, length)| start + length))
             .chain(
                 self.rotation_clips

@@ -285,7 +285,7 @@ impl KeyEditor {
                 .iter()
                 .any(|t| t.layer == id && t.lane == lane)
         {
-            136.0
+            136.0f32.max(34.0 + lane.channels().len() as f32 * 32.0)
         } else {
             32.0
         }
@@ -333,8 +333,12 @@ impl KeyEditor {
         let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(87.0, 32.0));
         let add = Rect::from_min_size(label.right_top() + vec2(3.0, 0.0), vec2(50.0, 32.0));
         let active = self.graph_tracks.contains(&track);
+        let title = match lane {
+            Lane::Vector(crate::shape_style::VectorProperty::GradientStop(_, i)) => format!("{} {}", lane.label(), i + 1),
+            _ => lane.label().to_owned(),
+        };
         let label_response = ui
-            .put(label, egui::Button::selectable(active, lane.label()))
+            .put(label, egui::Button::selectable(active, title))
             .on_hover_text("Select this lane for the graph. Shift or Ctrl selects several lanes.");
         let mut selected_layer = label_response.clicked();
         if selected_layer {
@@ -635,6 +639,9 @@ impl KeyEditor {
                         let value = v0 + (v1 - v0) * ease_at(kind, f, curve);
                         let value = match track.lane {
                             Lane::Mask(_, property) => property.clamp(value),
+                            Lane::Vector(property) if property != crate::shape_style::VectorProperty::Path => {
+                                property.clamp(channel, value)
+                            }
                             _ => value,
                         };
                         plot.point(t, value)
@@ -959,7 +966,7 @@ impl KeyEditor {
                     let track = if one_source && self.graph_tracks.len() == 1 {
                         let track = self.graph_tracks.iter().next().unwrap();
                         let compatible = match key {
-                            LaneKey::Color(_) => track.lane == source.lane,
+                            LaneKey::Color(_) | LaneKey::Vector(_) => track.lane == source.lane,
                             LaneKey::Mask(_, key) => {
                                 matches!(track.lane, Lane::Mask(_, property) if property == key.property)
                             }
@@ -1051,7 +1058,8 @@ impl KeyDrag {
                     .into_iter()
                     .chain(live.masks.iter().flat_map(|mask| {
                         MaskProperty::ALL.map(|property| Lane::Mask(mask.id, property))
-                    }));
+                    }))
+                    .chain(live.vector.iter().flat_map(|vector| vector.properties()).map(Lane::Vector));
             for lane in lanes {
                 let times: Vec<_> = self
                     .picks
@@ -1142,6 +1150,8 @@ fn channel_color(channel: usize) -> Color32 {
         Accent::Clay.color(),
         Accent::Sky.color(),
         Accent::Moss.color(),
+        color::SUN,
+        color::INK,
     ][channel]
 }
 

@@ -5,6 +5,7 @@ use crate::compositing::{Blend, MatteLinks};
 use crate::mask_render::{LayerPixels, MaskCache};
 use crate::model::{MAX_BLUR, Scene, Shape};
 use crate::transform::LayerFrame;
+use crate::vector_render::{GeometryCache, VectorInk};
 use crate::{assets, svg, text};
 use canopy_ui::Place;
 use std::collections::HashMap;
@@ -33,6 +34,7 @@ pub struct Renderer {
     /// What each media layer was read from (hashed), so the editor knows when to read again.
     sources: Vec<(String, Option<u64>)>,
     masks: Mutex<MaskCache>,
+    geometry: Mutex<GeometryCache>,
 }
 
 struct RenderFrame<'a> {
@@ -55,6 +57,7 @@ struct MatteFrame {
 /// What a layer puts on the canvas, in canvas pixels.
 enum Ink<'a> {
     Fill(Outline, Paint<'static>),
+    Vector(VectorInk),
     Picture(&'a Pixmap, PixmapPaint, Transform),
 }
 
@@ -62,6 +65,7 @@ impl Ink<'_> {
     fn bounds(&self) -> Option<Rect> {
         match self {
             Ink::Fill(outline, _) => Some(outline.bounds()),
+            Ink::Vector(ink) => ink.bounds(),
             Ink::Picture(pixmap, _, transform) => {
                 let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
                 let mut corners = [
@@ -81,6 +85,7 @@ impl Ink<'_> {
             Ink::Fill(outline, paint) => {
                 target.fill_path(outline, paint, FillRule::Winding, offset, None)
             }
+            Ink::Vector(ink) => ink.paint(target, offset),
             Ink::Picture(pixmap, paint, transform) => target.draw_pixmap(
                 0,
                 0,
@@ -129,6 +134,7 @@ impl Renderer {
             missing,
             sources: sources(scene),
             masks: Mutex::default(),
+            geometry: Mutex::default(),
         }
     }
 
@@ -174,7 +180,7 @@ impl Renderer {
     fn draws(&self, shape: &Shape) -> bool {
         matches!(
             shape.kind.as_str(),
-            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text"
+            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text" | "path"
         ) || (matches!(shape.kind.as_str(), "image" | "video" | "svg")
             && self.images.contains_key(&shape.id))
     }
@@ -310,6 +316,7 @@ impl Renderer {
                 && shape.blend() == Blend::Normal
                 && shape.masks.is_empty()
                 && source.is_none()
+                && !matches!(&ink, Ink::Vector(ink) if ink.opacity < 1.0)
             {
                 ink.paint(canvas, Transform::identity());
                 continue;
@@ -351,6 +358,7 @@ impl Renderer {
         color: &str,
         view: Transform,
         frames: &'a Frames,
+        time: f64,
     ) -> Option<Ink<'a>> {
         let pose = frame.pose;
         let place = frame.transform.post_concat(view);
@@ -364,8 +372,17 @@ impl Renderer {
                 .post_concat(place);
             return Some(Ink::Picture(pixmap, paint, transform));
         }
+        if let Some(vector) = &shape.vector
+            && shape.is_vector()
+            && (vector.fill.is_some() || vector.stroke.is_some() || vector.trim.is_some()
+                || shape.kind == "path" && vector.source_shape.is_none())
+        {
+            let mut cache = self.geometry.lock().unwrap_or_else(PoisonError::into_inner);
+            return VectorInk::new(shape, vector, frame, place, time, color, &mut cache).map(Ink::Vector);
+        }
         let outline = match shape.kind.as_str() {
             "text" => text::outline(text::content(shape), pose.w, pose.h)?,
+            "path" => shape_outline(shape.vector.as_ref()?.source_shape.as_deref()?, pose.w / 2.0, pose.h / 2.0)?,
             kind => shape_outline(kind, pose.w / 2.0, pose.h / 2.0)?,
         };
         Some(Ink::Fill(outline.transform(place)?, fill(color, pose.o)))
@@ -395,6 +412,7 @@ impl RenderFrame<'_> {
                 &shape.color_at(self.time),
                 self.view,
                 self.videos,
+                self.time,
             )
             .map(|ink| (ink, frame)))
     }
@@ -434,6 +452,18 @@ impl RenderFrame<'_> {
             &mut pixmap,
             Transform::from_translate(-area.x() as f32, -area.y() as f32),
         );
+        if let Ink::Vector(ink) = ink
+            && ink.opacity < 1.0
+        {
+            for pixel in pixmap.pixels_mut() {
+                let alpha = |channel: u8| (f32::from(channel) * ink.opacity).round() as u8;
+                if let Some(scaled) = tiny_skia::PremultipliedColorU8::from_rgba(
+                    alpha(pixel.red()), alpha(pixel.green()), alpha(pixel.blue()), alpha(pixel.alpha()),
+                ) {
+                    *pixel = scaled;
+                }
+            }
+        }
         if blur > 0.0 {
             gaussian_blur(&mut pixmap, blur);
         }
@@ -492,7 +522,7 @@ impl MatteFrame {
 }
 
 /// The outline of a shape `w` and `h` from its center to its sides, as `paint.js` draws it.
-fn shape_outline(kind: &str, w: f32, h: f32) -> Option<Outline> {
+pub(crate) fn shape_outline(kind: &str, w: f32, h: f32) -> Option<Outline> {
     let mut path = PathBuilder::new();
     let mut polygon = |points: &[(f32, f32)]| {
         path.move_to(points[0].0, points[0].1);
@@ -744,7 +774,7 @@ pub fn save_png(scene: &Scene, place: &Place, t: f64, output: &Path) -> Result<(
 }
 
 /// A layer's color at opacity `o` (0-100).
-fn fill(color: &str, o: f32) -> Paint<'static> {
+pub(crate) fn fill(color: &str, o: f32) -> Paint<'static> {
     let [r, g, b] = rgb(color);
     let mut paint = Paint::default();
     paint.set_color_rgba8(r, g, b, (o * 2.55).round() as u8);
@@ -752,7 +782,7 @@ fn fill(color: &str, o: f32) -> Paint<'static> {
     paint
 }
 
-fn rgb(hex: &str) -> [u8; 3] {
+pub(crate) fn rgb(hex: &str) -> [u8; 3] {
     let channel = |i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("00"), 16).unwrap_or(0);
     [channel(1), channel(3), channel(5)]
 }

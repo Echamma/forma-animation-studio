@@ -24,7 +24,7 @@ struct Sample {
 pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     let mut defs = String::new();
     let mut layers = String::new();
-    for shape in &scene.shapes {
+    for (index, shape) in scene.shapes.iter().enumerate() {
         let p = scene.local_pose(shape, 0.0);
         let mut styling = format!(r#"<g fill="{}""#, attr(&shape.color_at(0.0)));
         styling.push_str(&compositing_style(shape, "Animated SVG")?);
@@ -49,18 +49,29 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
                 ));
             }
         }
-        let geometry = geometry(shape, place)?;
+        let vector = crate::vector_svg::geometry(scene, shape, index, &mut defs, None)?;
+        let local_pixels = vector.is_some();
+        let geometry = match vector {
+            Some(geometry) => geometry,
+            None => geometry(shape, place)?,
+        };
         let nested = chain.len() > 1 || shape.parent_space.is_some();
         if !nested {
-            styling.push_str(&blur_filter(shape, p, &mut defs));
-            layers.push_str(&animate_group(scene, shape, styling, &geometry, true));
+            if local_pixels && crate::render::blur(shape) > 0.0 {
+                styling.push_str(&canvas_blur_filter(scene, shape, 0.0, &chain, &mut defs));
+                let content = animate_group(scene, shape, "<g".into(), &geometry, true, true);
+                write!(layers, "{styling}>{content}</g>").unwrap();
+            } else {
+                styling.push_str(&blur_filter(shape, p, &mut defs));
+                layers.push_str(&animate_group(scene, shape, styling, &geometry, true, local_pixels));
+            }
             continue;
         }
         styling.push_str(&canvas_blur_filter(scene, shape, 0.0, &chain, &mut defs));
-        let mut content = animate_group(scene, shape, "<g".into(), &geometry, true);
+        let mut content = animate_group(scene, shape, "<g".into(), &geometry, true, local_pixels);
         for (i, layer) in chain.iter().enumerate() {
             if i != 0 {
-                content = animate_group(scene, layer, "<g".into(), &content, false);
+                content = animate_group(scene, layer, "<g".into(), &content, false, false);
             }
             if let Some(basis) = layer.parent_space {
                 content = format!(r#"<g transform="{}">{content}</g>"#, svg_matrix(basis));
@@ -86,6 +97,7 @@ fn animate_group(
     mut group: String,
     content: &str,
     artwork: bool,
+    local_pixels: bool,
 ) -> String {
     let p = scene.local_pose(shape, 0.0);
     let samples = sample_layer(scene, shape);
@@ -103,31 +115,42 @@ fn animate_group(
     let number = |v: f32| fixed(v as f64, 3);
     write!(
         group,
-        r#" transform="translate({} {})"><g transform="rotate({})"><g transform="scale({} {})""#,
-        p.x, p.y, p.r, p.w, p.h
+        r#" transform="translate({} {})"><g transform="rotate({})"><g"#,
+        p.x, p.y, p.r
     )
     .unwrap();
+    if !local_pixels {
+        write!(group, r#" transform="scale({} {})""#, p.w, p.h).unwrap();
+    }
     if artwork {
         write!(group, r#" opacity="{}""#, p.o / 100.0).unwrap();
     }
     group.push('>');
     if let Some(anchor) = shape.anchor {
+        let (x, y) = (0.5 - anchor.x, 0.5 - anchor.y);
+        let (sx, sy) = if local_pixels { (p.w, p.h) } else { (1.0, 1.0) };
         write!(
             group,
-            r#"<g transform="translate({} {})">{content}</g>"#,
-            0.5 - anchor.x,
-            0.5 - anchor.y
+            r#"<g transform="translate({} {})">{content}"#,
+            x * sx, y * sy
         )
         .unwrap();
+        if local_pixels {
+            write!(group, r#"<animateTransform attributeName="transform" type="translate" {timing} values="{}"/>"#,
+                values(&|s| format!("{} {}", number(s.pose.w * x), number(s.pose.h * y)))).unwrap();
+        }
+        group.push_str("</g>");
     } else {
         group.push_str(content);
     }
-    write!(
+    if !local_pixels {
+        write!(
         group,
         r#"<animateTransform attributeName="transform" type="scale" {timing} values="{}"/>"#,
         values(&|s| format!("{} {}", number(s.pose.w), number(s.pose.h)))
     )
-    .unwrap();
+        .unwrap();
+    }
     if artwork {
         write!(
             group,
@@ -173,12 +196,17 @@ pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
     }
     let mut defs = String::new();
     let mut layers = String::new();
-    for shape in scene.shapes.iter().filter(|s| s.visible(t, scene.duration)) {
+    for (index, shape) in scene.shapes.iter().enumerate().filter(|(_, s)| s.visible(t, scene.duration)) {
         let frame = scene.layer_frame(shape, t);
         let p = frame.pose;
         let mut group = format!(r#"<g fill="{}""#, attr(&shape.color_at(t)));
         group.push_str(&compositing_style(shape, "Still SVG")?);
-        if frame.space.is_identity() && shape.anchor.is_none() {
+        if let Some(geometry) = crate::vector_svg::geometry(scene, shape, index, &mut defs, Some(t))? {
+            group.push_str(&canvas_blur_filter(scene, shape, t, &[], &mut defs));
+            let ts = frame.transform;
+            let matrix = svg_matrix([ts.sx, ts.ky, ts.kx, ts.sy, ts.tx, ts.ty]);
+            write!(group, r#"><g transform="{matrix}" opacity="{}">{geometry}</g></g>"#, p.o / 100.0).unwrap();
+        } else if frame.space.is_identity() && shape.anchor.is_none() {
             group.push_str(&blur_filter(shape, p, &mut defs));
             write!(group, r#" transform="translate({} {})"><g transform="rotate({})"><g transform="scale({} {})" opacity="{}">"#,
                 p.x, p.y, p.r, p.w, p.h, p.o / 100.0).unwrap();

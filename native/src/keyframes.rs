@@ -1,5 +1,6 @@
 use crate::compositing::{MaskKey, MaskProperty};
 use crate::model::{ColorKey, Key, Pose, Shape, ease_at, hundredths, is_linked};
+use crate::shape_style::{VectorKey, VectorProperty, VectorValue};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,6 +39,7 @@ pub enum Lane {
     Pose(Property),
     Color,
     Mask(u64, MaskProperty),
+    Vector(VectorProperty),
 }
 
 impl Lane {
@@ -57,6 +59,7 @@ impl Lane {
             Self::Pose(Property::Opacity) => "Opacity",
             Self::Color => "Color",
             Self::Mask(_, property) => property.label(),
+            Self::Vector(property) => property.label(),
         }
     }
 
@@ -68,6 +71,7 @@ impl Lane {
             Self::Pose(Property::Opacity) => &["Opacity"],
             Self::Color => &["Red", "Green", "Blue"],
             Self::Mask(_, property) => property.channels(),
+            Self::Vector(property) => property.channels(),
         }
     }
 
@@ -78,12 +82,17 @@ impl Lane {
             Self::Mask(id, property) => shape.mask(id).map_or(0.0, |mask| {
                 property.clamp(mask.values(property, t, &shape.ease)[channel])
             }),
+            Self::Vector(VectorProperty::Path) => t as f32,
+            Self::Vector(property) => shape.vector.as_ref()
+                .and_then(|vector| vector.numbers_at(property, t, &shape.ease))
+                .map_or(0.0, |values| values[channel]),
         }
     }
 
     pub(crate) fn exists_on(self, shape: &Shape) -> bool {
         match self {
             Self::Mask(id, _) => shape.mask(id).is_some(),
+            Self::Vector(property) => shape.vector.as_ref().is_some_and(|vector| vector.exists(property)),
             _ => true,
         }
     }
@@ -153,6 +162,7 @@ pub enum LaneKey {
     Pose(Property, Key),
     Color(ColorKey),
     Mask(u64, MaskKey),
+    Vector(VectorKey),
 }
 
 impl LaneKey {
@@ -161,6 +171,7 @@ impl LaneKey {
             Self::Pose(property, _) => Lane::Pose(*property),
             Self::Color(_) => Lane::Color,
             Self::Mask(id, key) => Lane::Mask(*id, key.property),
+            Self::Vector(key) => Lane::Vector(key.property),
         }
     }
 
@@ -169,6 +180,7 @@ impl LaneKey {
             Self::Pose(_, key) => key.t,
             Self::Color(key) => key.t,
             Self::Mask(_, key) => key.t,
+            Self::Vector(key) => key.t,
         }
     }
 
@@ -177,6 +189,10 @@ impl LaneKey {
             Self::Pose(property, key) => property.values(Pose::from(key))[channel],
             Self::Color(key) => rgb(&key.color)[channel],
             Self::Mask(_, key) => key.values[channel],
+            Self::Vector(key) => match &key.value {
+                VectorValue::Path(_) => key.t as f32,
+                VectorValue::Numbers(values) => values[channel],
+            },
         }
     }
 
@@ -198,6 +214,11 @@ impl LaneKey {
                 key.color = format!("#{r:02x}{g:02x}{b:02x}");
             }
             Self::Mask(_, key) => key.values[channel] = key.property.clamp(value),
+            Self::Vector(key) => {
+                if let VectorValue::Numbers(values) = &mut key.value {
+                    values[channel] = key.property.clamp(channel, value);
+                }
+            }
         }
     }
 
@@ -206,6 +227,7 @@ impl LaneKey {
             Self::Pose(_, key) => (&key.ease, key.curve),
             Self::Color(key) => (&key.ease, key.curve),
             Self::Mask(_, key) => (&key.ease, key.curve),
+            Self::Vector(key) => (&key.ease, key.curve),
         };
         (ease.as_deref().unwrap_or(default), curve)
     }
@@ -215,6 +237,7 @@ impl LaneKey {
             Self::Pose(_, key) => (&mut key.ease, &mut key.curve),
             Self::Color(key) => (&mut key.ease, &mut key.curve),
             Self::Mask(_, key) => (&mut key.ease, &mut key.curve),
+            Self::Vector(key) => (&mut key.ease, &mut key.curve),
         };
         *ease = Some(kind.into());
         *curve = handles;
@@ -341,6 +364,8 @@ impl Shape {
                 .cloned()
                 .map(|key| LaneKey::Mask(id, key))
                 .collect(),
+            Lane::Vector(property) => self.vector.iter().flat_map(|vector| &vector.keys)
+                .filter(|key| key.property == property).cloned().map(LaneKey::Vector).collect(),
         }
     }
 
@@ -366,6 +391,9 @@ impl Shape {
                 .find(|key| key.property == property && same_time(key.t, t))
                 .cloned()
                 .map(|key| LaneKey::Mask(id, key)),
+            Lane::Vector(property) => self.vector.as_ref()?.keys.iter().rev()
+                .find(|key| key.property == property && same_time(key.t, t))
+                .cloned().map(LaneKey::Vector),
         }
     }
 
@@ -422,6 +450,17 @@ impl Shape {
                     );
                 }
             }
+            Lane::Vector(property) => {
+                let value = if property == VectorProperty::Path {
+                    let pose = self.pose(t);
+                    self.path_at(t, [pose.w, pose.h]).map(VectorValue::Path)
+                } else {
+                    self.vector.as_ref().and_then(|vector| vector.value_at(property, t, &self.ease))
+                };
+                if let Some(value) = value {
+                    self.put_lane_key(at, LaneKey::Vector(VectorKey::new(at, property, value)));
+                }
+            }
         }
     }
 
@@ -472,6 +511,15 @@ impl Shape {
                     }
                 }
             }
+            Lane::Vector(property) => {
+                if let Some(vector) = &mut self.vector {
+                    let value = vector.value_at(property, t, &self.ease);
+                    vector.keys.retain(|key| key.property != property || !same_time(t, key.t));
+                    if !vector.has_keys(property) && let Some(value) = value {
+                        vector.set_rest(property, value);
+                    }
+                }
+            }
         }
     }
 
@@ -510,6 +558,11 @@ impl Shape {
                     mask.put_key(key, t);
                 }
             }
+            LaneKey::Vector(key) => {
+                if let Some(vector) = &mut self.vector {
+                    vector.key(key, t);
+                }
+            }
         }
     }
 
@@ -540,6 +593,10 @@ impl Shape {
         let rest = self.rest_pose;
         let linked_rest = self.linked_rest;
         let color = self.color.clone();
+        let vector_rest = match lane {
+            Lane::Vector(property) => self.vector.as_ref().and_then(|vector| vector.rest(property).map(|value| (property, value))),
+            _ => None,
+        };
         let mask_rest = match lane {
             Lane::Mask(id, _) => self.mask(id).map(|mask| (id, mask.rest)),
             _ => None,
@@ -553,6 +610,9 @@ impl Shape {
         self.rest_pose = rest;
         self.linked_rest = linked_rest;
         self.color = color;
+        if let Some((property, value)) = vector_rest && let Some(vector) = &mut self.vector {
+            vector.set_rest(property, value);
+        }
         if let Some((id, rest)) = mask_rest
             && let Some(mask) = self.mask_mut(id)
         {
