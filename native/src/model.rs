@@ -1,10 +1,12 @@
 //! Version-one Forma scenes, preserving fields the native editor does not handle yet on every save.
 
+use crate::compositing::{Blend, LayerMask, TrackMatte};
 use crate::keyframes::{Lane, Property};
 use crate::transform::Anchor;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 pub(crate) const MAX_BLUR: f64 = 100.0;
 
@@ -58,6 +60,12 @@ pub struct Shape {
     pub parent_space: Option<[f32; 6]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<Anchor>,
+    #[serde(default, skip_serializing_if = "Blend::unused")]
+    pub blend_mode: Option<Blend>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub masks: Vec<LayerMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_matte: Option<TrackMatte>,
     #[serde(flatten, serialize_with = "serialize_shape_extra")]
     pub extra: Map<String, Value>,
 }
@@ -263,6 +271,12 @@ impl Scene {
             serde_json::from_slice(bytes).map_err(|e| format!("Invalid Forma project: {e}"))?;
         for shape in &mut scene.shapes {
             shape.keys.sort_by(|a, b| a.t.total_cmp(&b.t));
+            let mut mask_ids = HashSet::new();
+            for mask in &mut shape.masks {
+                if !mask_ids.insert(mask.id) || !mask.prepare() {
+                    return Err(format!("{}: this layer has invalid mask data.", shape.name));
+                }
+            }
         }
         if scene.version != 1
             || !(100.0..=4000.0).contains(&scene.width)
@@ -279,6 +293,19 @@ impl Scene {
             })
         {
             return Err("This is not a usable Forma version-one scene.".into());
+        }
+        scene.prune_missing_mattes();
+        for shape in &scene.shapes {
+            if shape
+                .track_matte
+                .as_ref()
+                .is_some_and(|matte| !scene.can_use_matte(&shape.id, &matte.source))
+            {
+                return Err(format!(
+                    "{}: the track matte layers form a loop.",
+                    shape.name
+                ));
+            }
         }
         Ok(scene)
     }
@@ -321,6 +348,9 @@ impl Scene {
             parent: None,
             parent_space: None,
             anchor: None,
+            blend_mode: None,
+            masks: Vec::new(),
+            track_matte: None,
             extra: Map::new(),
         });
         id
@@ -585,6 +615,7 @@ impl Scene {
                     .iter()
                     .map(|key| key.t)
                     .chain(shape.color_keys.iter().map(|key| key.t))
+                    .chain(shape.mask_times())
                     .chain(shape.out_time)
                     .chain(
                         shape
@@ -942,6 +973,12 @@ impl Scene {
             .iter_mut()
             .map(|k| &mut k.t)
             .chain(shape.color_keys.iter_mut().map(|k| &mut k.t))
+            .chain(
+                shape
+                    .masks
+                    .iter_mut()
+                    .flat_map(|mask| mask.keys.iter_mut().map(|k| &mut k.t)),
+            )
         {
             *t = hundredths(*t + delta);
         }
@@ -1159,6 +1196,7 @@ impl Scene {
             template.color_at(template.clip_start())
         };
         copy.color_keys.clear();
+        copy.freeze_masks(if same { end } else { template.clip_start() });
         if !same {
             copy.base_rotation = source.base_rotation;
         }
@@ -1219,11 +1257,12 @@ impl Scene {
             copies.push(copy.id.clone());
             self.shapes.push(copy);
         }
+        self.prune_missing_mattes();
         copies
     }
 
     fn copy_with_parents(&self, layer: &Shape, id: String, ids: &[(String, String)]) -> Shape {
-        if let Some((_, parent)) = ids
+        let mut copy = if let Some((_, parent)) = ids
             .iter()
             .find(|(source, _)| Some(source) == layer.parent.as_ref())
         {
@@ -1232,7 +1271,13 @@ impl Scene {
             copy
         } else {
             self.nudged_copy(layer, id, 20.0)
+        };
+        if let Some(matte) = &mut copy.track_matte
+            && let Some((_, target)) = ids.iter().find(|(source, _)| *source == matte.source)
+        {
+            matte.source = target.clone();
         }
+        copy
     }
 
     /// A copied layer pasted on top, nudged like a duplicate (Electron duplicates its clipboard). Returns its index.
@@ -1240,6 +1285,7 @@ impl Scene {
         let copy = self.nudged_copy(layer, id, 20.0);
         self.duration = self.duration.max(copy.latest_time());
         self.shapes.push(copy);
+        self.prune_missing_mattes();
         self.shapes.len() - 1
     }
 
@@ -1299,6 +1345,7 @@ impl Scene {
         }
         let before = self.shapes.len();
         self.shapes.retain(|shape| !ids.contains(&shape.id));
+        self.prune_missing_mattes();
         before - self.shapes.len()
     }
 
@@ -1335,6 +1382,7 @@ impl Scene {
         for (i, &index) in layers.iter().enumerate() {
             let start = hundredths(i as f64 * length);
             let shape = &mut self.shapes[index];
+            shape.freeze_masks(shape.clip_start());
             shape.name = format!("Pose {}", i + 1);
             shape.extra.insert("trackId".into(), track.clone().into());
             (shape.in_time, shape.out_time) = (Some(start), Some(hundredths(start + length)));
@@ -1387,6 +1435,7 @@ impl Scene {
         ) = (None, None, None, 0.0);
         ghost.color = previous.color_at(at);
         ghost.color_keys.clear();
+        ghost.freeze_masks(at);
         ghost.rotation_clips.clear();
         ghost.parent = None;
         ghost.parent_space = crate::transform::matrix(frame.space);
@@ -1661,6 +1710,7 @@ impl Shape {
         std::iter::once(self.clip_start())
             .chain(self.keys.iter().map(|k| k.t))
             .chain(self.color_keys.iter().map(|k| k.t))
+            .chain(self.mask_times())
             .chain(motions(self).map(|(_, start, _)| start))
             .chain(self.rotation_clips.iter().map(|c| c.start_time))
             .chain(self.disappear.iter().map(|d| d.start_time))
@@ -1672,6 +1722,7 @@ impl Shape {
         std::iter::once(self.out_time.unwrap_or(0.0))
             .chain(self.keys.iter().map(|k| k.t))
             .chain(self.color_keys.iter().map(|k| k.t))
+            .chain(self.mask_times())
             .chain(motions(self).map(|(_, start, length)| start + length))
             .chain(
                 self.rotation_clips

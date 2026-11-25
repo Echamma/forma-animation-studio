@@ -1,3 +1,4 @@
+use crate::compositing::MaskProperty;
 use crate::keyframes::{EASINGS, Lane, LaneKey, Property, same_time};
 use crate::model::{Scene, Shape, ease_at, hundredths};
 use canopy_ui::{Accent, color, font};
@@ -117,6 +118,7 @@ enum Drag {
 #[derive(Default)]
 pub(crate) struct KeyEditor {
     pub expanded: HashSet<String>,
+    expanded_masks: HashMap<String, HashSet<u64>>,
     graph: bool,
     lane_focus: bool,
     graph_tracks: HashSet<Track>,
@@ -142,6 +144,14 @@ impl KeyEditor {
         self.selected.retain(|pick| key_at(scene, pick).is_some());
         self.graph_tracks
             .retain(|track| track_shape(scene, track).is_some());
+        self.expanded_masks.retain(|id, masks| {
+            if let Some(shape) = scene.shapes.iter().find(|s| s.id == *id) {
+                masks.retain(|id| shape.mask(*id).is_some());
+            } else {
+                masks.clear();
+            }
+            !masks.is_empty()
+        });
     }
 
     pub fn time_view(&mut self, ui: &Ui, plot: Rect, duration: f64) -> TimeView {
@@ -284,6 +294,24 @@ impl KeyEditor {
     pub fn toggle_layer(&mut self, id: &str) {
         if !self.expanded.remove(id) {
             self.expanded.insert(id.to_owned());
+        }
+    }
+
+    pub fn mask_expanded(&self, layer: &str, mask: u64) -> bool {
+        self.expanded_masks
+            .get(layer)
+            .is_some_and(|ids| ids.contains(&mask))
+    }
+
+    pub fn reveal_mask(&mut self, layer: String, mask: u64) {
+        self.expanded.insert(layer.clone());
+        self.expanded_masks.entry(layer).or_default().insert(mask);
+    }
+
+    pub fn toggle_mask(&mut self, layer: &str, mask: u64) {
+        let ids = self.expanded_masks.entry(layer.to_owned()).or_default();
+        if !ids.remove(&mask) {
+            ids.insert(mask);
         }
     }
 
@@ -604,7 +632,12 @@ impl KeyEditor {
                     .map(|i| {
                         let f = i as f32 / 40.0;
                         let t = a.time() + f64::from(f) * (b.time() - a.time());
-                        plot.point(t, v0 + (v1 - v0) * ease_at(kind, f, curve))
+                        let value = v0 + (v1 - v0) * ease_at(kind, f, curve);
+                        let value = match track.lane {
+                            Lane::Mask(_, property) => property.clamp(value),
+                            _ => value,
+                        };
+                        plot.point(t, value)
                     })
                     .collect();
                 painter.add(egui::Shape::line(samples, stroke));
@@ -926,14 +959,17 @@ impl KeyEditor {
                     let track = if one_source && self.graph_tracks.len() == 1 {
                         let track = self.graph_tracks.iter().next().unwrap();
                         let compatible = match key {
-                            LaneKey::Color(_) => true,
+                            LaneKey::Color(_) => track.lane == source.lane,
+                            LaneKey::Mask(_, key) => {
+                                matches!(track.lane, Lane::Mask(_, property) if property == key.property)
+                            }
                             LaneKey::Pose(_, key) => {
-                                track_shape(scene, track).is_some_and(|shape| {
+                                track.lane == source.lane && track_shape(scene, track).is_some_and(|shape| {
                                     crate::model::is_linked(shape) == key.linked_space
                                 })
                             }
                         };
-                        if track.lane == source.lane && compatible {
+                        if compatible {
                             track
                         } else {
                             source
@@ -948,7 +984,7 @@ impl KeyEditor {
                             track: track.clone(),
                             time,
                         },
-                        key.clone(),
+                        key.clone().for_lane(track.lane),
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -1010,7 +1046,13 @@ impl KeyDrag {
             .filter(|s| self.picks.iter().any(|p| p.track.layer == s.id))
         {
             let mut shape = live.clone();
-            for lane in Lane::ALL {
+            let lanes =
+                Lane::ALL
+                    .into_iter()
+                    .chain(live.masks.iter().flat_map(|mask| {
+                        MaskProperty::ALL.map(|property| Lane::Mask(mask.id, property))
+                    }));
+            for lane in lanes {
                 let times: Vec<_> = self
                     .picks
                     .iter()
@@ -1108,14 +1150,17 @@ fn extend(ui: &Ui) -> bool {
 }
 
 fn track_shape<'a>(scene: &'a Scene, track: &Track) -> Option<&'a Shape> {
-    scene.shapes.iter().find(|shape| shape.id == track.layer)
+    scene
+        .shapes
+        .iter()
+        .find(|shape| shape.id == track.layer && track.lane.exists_on(shape))
 }
 
 fn track_shape_mut<'a>(scene: &'a mut Scene, track: &Track) -> Option<&'a mut Shape> {
     scene
         .shapes
         .iter_mut()
-        .find(|shape| shape.id == track.layer)
+        .find(|shape| shape.id == track.layer && track.lane.exists_on(shape))
 }
 
 fn key_at(scene: &Scene, pick: &Pick) -> Option<LaneKey> {

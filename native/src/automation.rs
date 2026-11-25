@@ -243,6 +243,7 @@ pub fn dispatch(e: &mut Editor, name: &str, args: &Value) -> Result<Outcome, Too
                 }
             }
             next.shapes.retain(|layer| layer.id != id);
+            next.prune_missing_mattes();
             install(e, next, None)?;
             done(json!({"deleted": id}))
         }

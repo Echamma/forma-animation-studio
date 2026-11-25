@@ -3,8 +3,10 @@
 use crate::animated_svg;
 use crate::archive;
 use crate::assets;
+use crate::compositing::{MaskProperty, MatteLinks};
 use crate::key_editor::{KeyEditor, LABEL_WIDTH, TIME_MARGIN, TimeView};
 use crate::keyframes::{Lane, Property};
+use crate::mask_editor::MaskEditor;
 use crate::model::{self, HANDLES, Pose, RotationClip, Scene, Shape};
 use crate::motion;
 use crate::render;
@@ -30,10 +32,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 enum Gesture {
     Move {
         start: Pos2,
-        poses: Vec<(usize, Pose)>,
+        poses: Vec<(String, Pose)>,
     },
     Resize {
-        index: usize,
+        id: String,
         handle: (i8, i8),
         start: Pos2,
         pose: Pose,
@@ -41,7 +43,6 @@ enum Gesture {
         anchor: Anchor,
     },
     Anchor {
-        index: usize,
         start: Pos2,
         initial: Anchor,
         inverse: tiny_skia::Transform,
@@ -49,7 +50,7 @@ enum Gesture {
         shape: Box<Shape>,
     },
     Rotate {
-        index: usize,
+        id: String,
         center: Pos2,
         inverse: tiny_skia::Transform,
         last: f32,
@@ -96,6 +97,7 @@ enum ClipAction {
 enum Row {
     Layer { name: String, clips: Vec<usize> },
     Property(usize, Lane),
+    Mask(usize, u64, usize),
     Fade(usize),
     Motion(usize, usize),
     Spin(usize, usize),
@@ -137,7 +139,6 @@ fn edge_cursor(ui: &Ui, response: &egui::Response, span: Rect, start: bool, end:
 /// A timeline drag, with the layer and scene length as they were when it began.
 #[derive(Clone)]
 struct TimelineDrag {
-    index: usize,
     part: Part,
     origin: f32,
     seconds_per_pixel: f64,
@@ -238,6 +239,7 @@ pub struct Forma {
     /// A drag on the timeline.
     timeline_drag: Option<TimelineDrag>,
     key_editor: KeyEditor,
+    mask_editor: MaskEditor,
     /// Drawing a move: the tool ("arrow" or "path"), its options, and what's drawn so far (from the layer's pose).
     motion_mode: Option<&'static str>,
     motion_options: motion::Options,
@@ -334,6 +336,7 @@ impl Forma {
             gesture: None,
             timeline_drag: None,
             key_editor: KeyEditor::default(),
+            mask_editor: MaskEditor::default(),
             motion_mode: None,
             motion_options: motion::Options::default(),
             motion_draft: None,
@@ -398,6 +401,7 @@ impl Forma {
         let _ = self.save();
         self.scene = scene;
         self.key_editor = KeyEditor::default();
+        self.mask_editor = MaskEditor::default();
         self.selected = None;
         self.multi_selected.clear();
         self.layer_drag = None;
@@ -559,6 +563,7 @@ impl Forma {
             self.key_editor.clear_selection();
             self.timeline_drag = None;
             self.gesture = None;
+            self.mask_editor.cancel_gesture();
             self.suppress_history = true;
             self.playing = false;
             self.edited();
@@ -572,6 +577,7 @@ impl Forma {
             self.key_editor.clear_selection();
             self.timeline_drag = None;
             self.gesture = None;
+            self.mask_editor.cancel_gesture();
             self.suppress_history = true;
             self.playing = false;
             self.edited();
@@ -693,6 +699,24 @@ impl Forma {
             if icon_button(ui, Icon::Image, "Add pictures, SVG artwork, or video", false).clicked() {
                 self.pick_media();
             }
+            self.mask_editor.sync(self.selected.as_deref());
+            let masking = self.mask_editor.active();
+            if ui
+                .add_enabled(
+                    self.selected.is_some(),
+                    egui::Button::selectable(masking, "Mask").min_size(vec2(38.0, 40.0)),
+                )
+                .on_hover_text("Draw and edit masks on the selected layer")
+                .clicked()
+            {
+                self.mask_editor.toggle(&self.scene);
+                if self.mask_editor.active() {
+                    (self.motion_mode, self.motion_draft) = (None, None);
+                    self.gesture = None;
+                    self.playing = false;
+                    self.tab = Tab::Layer;
+                }
+            }
             let drawing = self.motion_mode.is_some();
             let can_draw = self.selected.is_some();
             ui.add_enabled_ui(can_draw || drawing, |ui| {
@@ -702,6 +726,7 @@ impl Forma {
                     if drawing {
                         (self.motion_mode, self.motion_draft) = (None, None);
                     } else {
+                        self.mask_editor.stop();
                         self.motion_mode = Some("arrow");
                         self.tab = Tab::Animate;
                     }
@@ -1312,6 +1337,11 @@ impl Forma {
             return;
         }
         self.follows_picker(ui, index, false);
+        self.mask_editor
+            .panel(ui, &mut self.scene, index, self.time, &mut self.playing);
+        if self.mask_editor.active() {
+            (self.motion_mode, self.motion_draft) = (None, None);
+        }
         self.arrange_panel(ui);
         self.clip_fields(ui, index);
         let mut pose = self
@@ -2338,6 +2368,7 @@ impl Forma {
                     .selectable_label(self.motion_mode == Some(kind), label)
                     .clicked()
                 {
+                    self.mask_editor.stop();
                     self.motion_mode = if self.motion_mode == Some(kind) {
                         None
                     } else {
@@ -2775,8 +2806,12 @@ impl Forma {
                 .map(|(x, y)| from_layer(frame, x * frame.pose.w, y * frame.pose.h))
         };
         let mut hits = Vec::new();
+        let mattes = MatteLinks::new(&self.scene);
         for (index, shape) in self.scene.shapes.iter().enumerate() {
             if !shape.visible(self.time, self.scene.duration) {
+                continue;
+            }
+            if mattes.as_ref().is_some_and(|mattes| mattes.hidden[index]) {
                 continue;
             }
             let frame = self.scene.layer_frame(shape, self.time);
@@ -2808,13 +2843,18 @@ impl Forma {
                 ));
             }
         }
-        let selected = hits
-            .iter()
-            .copied()
-            .find(|(index, _)| self.selected.as_deref() == Some(&self.scene.shapes[*index].id));
+        let selected = self.selected.as_deref().and_then(|id| {
+            let index = self.scene.shapes.iter().position(|shape| shape.id == id)?;
+            let shape = &self.scene.shapes[index];
+            shape
+                .visible(self.time, self.scene.duration)
+                .then(|| (index, self.scene.layer_frame(shape, self.time)))
+        });
         let mut handles = Vec::new();
         let (mut rotate_at, mut anchor_at) = (None, None);
-        if let (Some((_, frame)), false) = (selected, self.playing) {
+        if let (Some((_, frame)), false, false) =
+            (selected, self.playing, self.mask_editor.active())
+        {
             let w = frame.pose.w;
             let h = frame.pose.h;
             let center = from_layer(frame, 0.0, 0.0);
@@ -2871,6 +2911,26 @@ impl Forma {
                 self.pan += response.drag_delta();
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
+            return;
+        }
+        if !self.playing
+            && let Some((index, frame)) = selected
+        {
+            let view = tiny_skia::Transform::from_scale(scale, scale)
+                .post_translate(canvas.left(), canvas.top());
+            self.mask_editor.canvas(
+                ui,
+                &painter,
+                &response,
+                &mut self.scene.shapes[index],
+                frame,
+                view,
+                self.time,
+            );
+        } else {
+            self.mask_editor.cancel_gesture();
+        }
+        if self.mask_editor.active() {
             return;
         }
         let motion_space = selected.map_or(tiny_skia::Transform::identity(), |(index, _)| {
@@ -3072,7 +3132,6 @@ impl Forma {
                     if let Some(inverse) = frame.transform.invert() {
                         let shape = self.scene.shapes[index].clone();
                         self.gesture = Some(Gesture::Anchor {
-                            index,
                             start: point,
                             initial: shape.anchor.unwrap_or_default(),
                             inverse,
@@ -3085,7 +3144,7 @@ impl Forma {
                         let center = pos2(frame.pose.x, frame.pose.y);
                         let (x, y) = transform::point(inverse, point.x, point.y);
                         self.gesture = Some(Gesture::Rotate {
-                            index,
+                            id: self.scene.shapes[index].id.clone(),
                             center,
                             inverse,
                             last: (y - center.y).atan2(x - center.x).to_degrees(),
@@ -3095,7 +3154,7 @@ impl Forma {
                     if let Some(inverse) = frame.transform.invert() {
                         let shape = &self.scene.shapes[index];
                         self.gesture = Some(Gesture::Resize {
-                            index,
+                            id: shape.id.clone(),
                             handle,
                             start: point,
                             pose: self.scene.editable_pose(shape, self.time),
@@ -3132,12 +3191,18 @@ impl Forma {
                             .filter(|(j, shape)| {
                                 *j == i || (grouped && self.multi_selected.contains(&shape.id))
                             })
-                            .map(|(j, shape)| (j, self.scene.editable_pose(shape, self.time)))
+                            .map(|(j, shape)| {
+                                (
+                                    self.scene.ancestor_depth(j),
+                                    shape.id.clone(),
+                                    self.scene.editable_pose(shape, self.time),
+                                )
+                            })
                             .collect();
-                        poses.sort_by_key(|(j, _)| self.scene.ancestor_depth(*j));
+                        poses.sort_by_key(|(depth, ..)| *depth);
                         self.gesture = Some(Gesture::Move {
                             start: point,
-                            poses,
+                            poses: poses.into_iter().map(|(_, id, pose)| (id, pose)).collect(),
                         });
                     }
                 }
@@ -3154,7 +3219,12 @@ impl Forma {
                 let lock_ratio = self.lock_ratio && !ui.input(|i| i.modifiers.shift);
                 match gesture {
                     Gesture::Move { start, poses } => {
-                        for (index, pose) in poses {
+                        for (id, pose) in poses {
+                            let Some(index) =
+                                self.scene.shapes.iter().position(|shape| shape.id == id)
+                            else {
+                                continue;
+                            };
                             let moved = Pose {
                                 x: pose.x + point.x - start.x,
                                 y: pose.y + point.y - start.y,
@@ -3169,13 +3239,18 @@ impl Forma {
                         }
                     }
                     Gesture::Resize {
-                        index,
+                        id,
                         handle,
                         start,
                         pose,
                         inverse,
                         anchor,
                     } => {
+                        let Some(index) = self.scene.shapes.iter().position(|shape| shape.id == id)
+                        else {
+                            self.gesture = None;
+                            return;
+                        };
                         let delta = point - start;
                         let delta = transform::vector(inverse, delta.x, delta.y);
                         let (w, h) =
@@ -3188,13 +3263,21 @@ impl Forma {
                         );
                     }
                     Gesture::Anchor {
-                        index,
                         start,
                         initial,
                         inverse,
                         size,
                         shape,
                     } => {
+                        let Some(index) = self
+                            .scene
+                            .shapes
+                            .iter()
+                            .position(|live| live.id == shape.id)
+                        else {
+                            self.gesture = None;
+                            return;
+                        };
                         let delta = point - start;
                         let (dx, dy) = transform::vector(inverse, delta.x, delta.y);
                         let anchor = Anchor {
@@ -3205,11 +3288,16 @@ impl Forma {
                         self.scene.set_anchor(index, anchor, self.time);
                     }
                     Gesture::Rotate {
-                        index,
+                        id,
                         center,
                         inverse,
                         last,
                     } => {
+                        let Some(index) = self.scene.shapes.iter().position(|shape| shape.id == id)
+                        else {
+                            self.gesture = None;
+                            return;
+                        };
                         let (x, y) = transform::point(inverse, point.x, point.y);
                         let angle = (y - center.y).atan2(x - center.x).to_degrees();
                         let delta = (angle - last + 540.0).rem_euclid(360.0) - 180.0;
@@ -3224,7 +3312,7 @@ impl Forma {
                             Property::Rotation,
                         );
                         self.gesture = Some(Gesture::Rotate {
-                            index,
+                            id,
                             center,
                             inverse,
                             last: angle,
@@ -3282,6 +3370,16 @@ impl Forma {
             }
             if self.key_editor.expanded.contains(&shape.id) {
                 rows.extend(Lane::ALL.map(|lane| Row::Property(index, lane)));
+                for (number, mask) in shape.masks.iter().enumerate() {
+                    rows.push(Row::Mask(index, mask.id, number + 1));
+                    if self.key_editor.mask_expanded(&shape.id, mask.id) {
+                        rows.extend(
+                            MaskProperty::ALL.map(|property| {
+                                Row::Property(index, Lane::Mask(mask.id, property))
+                            }),
+                        );
+                    }
+                }
             }
             if shape.disappear.is_some() {
                 rows.push(Row::Fade(index));
@@ -3335,7 +3433,7 @@ impl Forma {
         });
     }
 
-    fn timeline(&mut self, ui: &mut Ui) {
+    fn timeline(&mut self, ui: &mut Ui, reveal_mask: Option<&(String, u64)>) {
         let full = ui.max_rect();
         ui.painter().add(pane_frame(Mood::Ember).paint(full));
         let bar = Rect::from_min_size(full.min, vec2(full.width(), 36.0));
@@ -3422,6 +3520,9 @@ impl Forma {
                                 )
                             {
                                 self.selected = Some(id.clone());
+                                if let Lane::Mask(mask, _) = lane {
+                                    self.mask_editor.select(&id, mask);
+                                }
                                 self.multi_selected = vec![id];
                                 self.tab = Tab::Animate;
                             }
@@ -3430,6 +3531,13 @@ impl Forma {
                                 vec2(ui.available_width(), 32.0),
                                 Sense::hover(),
                             );
+                            if let (Row::Mask(index, mask, _), Some((id, reveal))) =
+                                (row, reveal_mask)
+                                && mask == reveal
+                                && self.scene.shapes[*index].id == *id
+                            {
+                                ui.scroll_to_rect(line, Some(egui::Align::TOP));
+                            }
                             if ui.is_rect_visible(line) {
                                 self.timeline_row(ui, row, line, &x, width, view);
                             }
@@ -3567,6 +3675,24 @@ impl Forma {
                 }
             }
             Row::Property(..) => {}
+            Row::Mask(index, mask, number) => {
+                let id = self.scene.shapes[*index].id.clone();
+                let open = self.key_editor.mask_expanded(&id, *mask);
+                let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(140.0, 32.0));
+                let arrow = if open { "▾" } else { "▸" };
+                if ui
+                    .put(
+                        label,
+                        egui::Button::selectable(open, format!("{arrow}  Mask {number}")),
+                    )
+                    .on_hover_text("Show or hide this mask's animation lanes")
+                    .clicked()
+                {
+                    self.key_editor.toggle_mask(&id, *mask);
+                    self.select_layer(Some(id.clone()), false);
+                    self.mask_editor.select(&id, *mask);
+                }
+            }
             Row::Fade(index) => {
                 let shape = &self.scene.shapes[*index];
                 label(ui, "Fade out", None, true);
@@ -3652,7 +3778,7 @@ impl Forma {
                 let dragging = self
                     .timeline_drag
                     .as_ref()
-                    .is_some_and(|d| d.index == *index && matches!(d.part, Part::Motion(i) | Part::MotionStart(i) | Part::MotionEnd(i) if i == *m));
+                    .is_some_and(|d| d.shape.id == id && matches!(d.part, Part::Motion(i) | Part::MotionStart(i) | Part::MotionEnd(i) if i == *m));
                 if dragging {
                     ui.painter().text(
                         span.right_center() + vec2(6.0, 0.0),
@@ -3774,7 +3900,7 @@ impl Forma {
             },
         );
         let dragging = self.timeline_drag.as_ref().is_some_and(|d| {
-            d.index == index && matches!(d.part, Part::Clip | Part::Start | Part::End)
+            d.shape.id == shape.id && matches!(d.part, Part::Clip | Part::Start | Part::End)
         });
         let track = shape
             .extra
@@ -3862,6 +3988,7 @@ impl Forma {
             .iter()
             .map(|k| k.t)
             .chain(self.scene.shapes[index].color_keys.iter().map(|k| k.t))
+            .chain(self.scene.shapes[index].mask_times())
             .collect();
         times.sort_by(f64::total_cmp);
         times.dedup_by(|a, b| crate::keyframes::same_time(*a, *b));
@@ -4057,7 +4184,6 @@ impl Forma {
                 part => part,
             };
             self.timeline_drag = Some(TimelineDrag {
-                index,
                 part,
                 origin: origin.x,
                 seconds_per_pixel: self.scene.duration / f64::from(width),
@@ -4070,7 +4196,7 @@ impl Forma {
         let Some(drag) = self
             .timeline_drag
             .clone()
-            .filter(|d| d.index == index && response.dragged())
+            .filter(|d| d.shape.id == self.scene.shapes[index].id && response.dragged())
         else {
             return;
         };
@@ -4994,7 +5120,9 @@ impl CanopyApp for Forma {
                 }
                 // Escape stops drawing a move, or goes back from several selected layers to one (Electron's clips.js).
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    if self.motion_mode.is_some() {
+                    if self.mask_editor.active() {
+                        self.mask_editor.escape();
+                    } else if self.motion_mode.is_some() {
                         (self.motion_mode, self.motion_draft) = (None, None);
                     } else if self.multi_selected.len() > 1 {
                         self.multi_selected = self.selected.clone().into_iter().collect();
@@ -5142,7 +5270,13 @@ impl CanopyApp for Forma {
             host.toast(notice);
         }
         let timeline = Rect::from_min_max(pos2(rect.left(), middle.bottom() + 6.0), rect.max);
-        ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| self.timeline(ui));
+        let reveal_mask = self.mask_editor.reveal_lanes.take();
+        if let Some((id, mask)) = &reveal_mask {
+            self.key_editor.reveal_mask(id.clone(), *mask);
+        }
+        ui.scope_builder(UiBuilder::new().max_rect(timeline), |ui| {
+            self.timeline(ui, reveal_mask.as_ref())
+        });
         self.projects_window(ui);
         self.help_window(ui);
         self.export_window(ui, host);

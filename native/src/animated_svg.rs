@@ -3,6 +3,7 @@
 //! looping. Each layer is sampled exactly at its keyframes and other events, and between them only where it moves
 //! along a curve. Pictures are embedded as data URLs, so the file stands alone; video layers show their poster.
 
+use crate::compositing::Blend;
 use crate::model::{Pose, Scene, Shape};
 use crate::{assets, text};
 use base64::Engine;
@@ -26,6 +27,7 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     for shape in &scene.shapes {
         let p = scene.local_pose(shape, 0.0);
         let mut styling = format!(r#"<g fill="{}""#, attr(&shape.color_at(0.0)));
+        styling.push_str(&compositing_style(shape, "Animated SVG")?);
         let mut chain = vec![shape];
         while let Some(parent) = chain.last().and_then(|s| {
             s.parent
@@ -165,12 +167,17 @@ fn svg_matrix([a, b, c, d, e, f]: [f32; 6]) -> String {
 
 /// The scene at `t` as a still SVG (Electron's `svgText(false)`): each layer shown then, posed as it is then.
 pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
+    // A matte may hide a layer even while its consumer is outside its clip.
+    for shape in &scene.shapes {
+        compositing_style(shape, "Still SVG")?;
+    }
     let mut defs = String::new();
     let mut layers = String::new();
     for shape in scene.shapes.iter().filter(|s| s.visible(t, scene.duration)) {
         let frame = scene.layer_frame(shape, t);
         let p = frame.pose;
         let mut group = format!(r#"<g fill="{}""#, attr(&shape.color_at(t)));
+        group.push_str(&compositing_style(shape, "Still SVG")?);
         if frame.space.is_identity() && shape.anchor.is_none() {
             group.push_str(&blur_filter(shape, p, &mut defs));
             write!(group, r#" transform="translate({} {})"><g transform="rotate({})"><g transform="scale({} {})" opacity="{}">"#,
@@ -201,6 +208,33 @@ pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" overflow="hidden">{defs}<rect width="{w}" height="{h}" fill="{}"/>{layers}</svg>"#,
         attr(&scene.bg)
     ))
+}
+
+fn compositing_style(shape: &Shape, export: &str) -> Result<String, String> {
+    if !shape.masks.is_empty() {
+        return Err(format!(
+            "{}: {export} can't export layer masks.",
+            shape.name
+        ));
+    }
+    if shape.track_matte.is_some() {
+        return Err(format!(
+            "{}: {export} can't export track mattes.",
+            shape.name
+        ));
+    }
+    let blend = shape.blend();
+    if blend == Blend::Normal {
+        return Ok(String::new());
+    }
+    let css = blend.svg().ok_or_else(|| {
+        format!(
+            "{}: {export} can't export the {} blend mode.",
+            shape.name,
+            blend.label()
+        )
+    })?;
+    Ok(format!(r#" style="mix-blend-mode:{css}""#))
 }
 
 /// A blurred layer's filter, added to `defs`; the attribute that puts it on the layer's group (empty for no blur).

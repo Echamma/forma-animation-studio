@@ -1,12 +1,16 @@
 //! Frame-accurate software rendering of a scene, the way Electron Forma's canvas paints it (`src/render/paint.js`).
 //! Exports and the editor's preview both draw through it, so what the editor shows is what gets exported.
 
+use crate::compositing::{Blend, MatteLinks};
+use crate::mask_render::{LayerPixels, MaskCache};
 use crate::model::{MAX_BLUR, Scene, Shape};
 use crate::transform::LayerFrame;
 use crate::{assets, svg, text};
 use canopy_ui::Place;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::{Mutex, PoisonError};
 use tiny_skia::{
     Color, FillRule, IntRect, IntSize, Paint, Path as Outline, PathBuilder, Pixmap, PixmapPaint,
     Point, Rect, Transform,
@@ -28,6 +32,24 @@ pub struct Renderer {
     missing: HashMap<String, String>,
     /// What each media layer was read from (hashed), so the editor knows when to read again.
     sources: Vec<(String, Option<u64>)>,
+    masks: Mutex<MaskCache>,
+}
+
+struct RenderFrame<'a> {
+    renderer: &'a Renderer,
+    scene: &'a Scene,
+    time: f64,
+    view: Transform,
+    scale: f32,
+    size: (u32, u32),
+    strict: bool,
+    videos: &'a Frames,
+}
+
+struct MatteFrame {
+    links: MatteLinks,
+    cache: HashMap<usize, Option<Rc<LayerPixels>>>,
+    bytes: usize,
 }
 
 /// What a layer puts on the canvas, in canvas pixels.
@@ -106,6 +128,7 @@ impl Renderer {
             videos,
             missing,
             sources: sources(scene),
+            masks: Mutex::default(),
         }
     }
 
@@ -254,64 +277,67 @@ impl Renderer {
         strict: bool,
         frames: &Frames,
     ) -> Result<(), String> {
-        let (width, height) = (canvas.width(), canvas.height());
-        for shape in &scene.shapes {
-            if !shape.visible(t, scene.duration) {
+        let frame = RenderFrame {
+            renderer: self,
+            scene,
+            time: t,
+            view,
+            scale,
+            size: (canvas.width(), canvas.height()),
+            strict,
+            videos: frames,
+        };
+        let mut mattes = MatteLinks::new(scene).map(|links| MatteFrame {
+            links,
+            cache: HashMap::new(),
+            bytes: 0,
+        });
+        for (index, shape) in scene.shapes.iter().enumerate() {
+            if mattes
+                .as_ref()
+                .is_some_and(|mattes| mattes.links.hidden[index])
+            {
                 continue;
             }
-            let frame = scene.layer_frame(shape, t);
-            if frame.pose.o <= 0.0 {
-                continue;
-            }
-            if strict {
-                self.exportable(shape)?;
-                if shape.kind == "video" && !frames.contains_key(&shape.id) {
-                    return Err(format!("{}: no video frame", shape.name));
-                }
-            }
-            let Some(ink) = self.ink(shape, frame, &shape.color_at(t), view, frames) else {
+            let Some((ink, layer_frame)) = frame.visible_ink(shape)? else {
                 continue;
             };
-            let blur = blur(shape) * crate::transform::max_scale(frame.space) * scale;
-            if blur <= 0.0 {
+            let blur = frame.layer_blur(shape, layer_frame);
+            let source = mattes
+                .as_ref()
+                .and_then(|mattes| mattes.links.sources[index]);
+            if blur <= 0.0
+                && shape.blend() == Blend::Normal
+                && shape.masks.is_empty()
+                && source.is_none()
+            {
                 ink.paint(canvas, Transform::identity());
                 continue;
             }
-            // A blurred layer is drawn on its own, blurred, then laid on the canvas, like canvas's `filter: blur()`.
-            let margin = (blur * 3.0).ceil() + 2.0;
-            let area = ink.bounds().and_then(|b| {
-                let (left, top) = (
-                    b.left().max(-margin) - margin,
-                    b.top().max(-margin) - margin,
-                );
-                let (right, bottom) = (
-                    b.right().min(width as f32 + margin) + margin,
-                    b.bottom().min(height as f32 + margin) + margin,
-                );
-                IntRect::from_ltrb(
-                    left.floor() as i32,
-                    top.floor() as i32,
-                    right.ceil() as i32,
-                    bottom.ceil() as i32,
-                )
-            });
-            let Some(area) = area else { continue };
-            let Some(mut layer) = Pixmap::new(area.width(), area.height()) else {
+            let Some(mut layer) = frame.raster(shape, layer_frame, &ink, blur) else {
                 continue;
             };
-            ink.paint(
-                &mut layer,
-                Transform::from_translate(-area.x() as f32, -area.y() as f32),
-            );
-            gaussian_blur(&mut layer, blur);
-            canvas.draw_pixmap(
-                area.x(),
-                area.y(),
-                layer.as_ref(),
-                &PixmapPaint::default(),
-                Transform::identity(),
-                None,
-            );
+            if let (Some(mattes), Some(source), Some(matte)) =
+                (&mut mattes, source, &shape.track_matte)
+            {
+                let pixels = mattes.source(&frame, source)?;
+                layer.apply_matte(pixels.as_deref(), matte.mode);
+            }
+            if shape.blend() == Blend::Normal && (!shape.masks.is_empty() || source.is_some()) {
+                layer.paint_over(canvas);
+            } else {
+                canvas.draw_pixmap(
+                    layer.area.x(),
+                    layer.area.y(),
+                    layer.pixmap.as_ref(),
+                    &PixmapPaint {
+                        blend_mode: shape.blend().skia(),
+                        ..PixmapPaint::default()
+                    },
+                    Transform::identity(),
+                    None,
+                );
+            }
         }
         Ok(())
     }
@@ -343,6 +369,125 @@ impl Renderer {
             kind => shape_outline(kind, pose.w / 2.0, pose.h / 2.0)?,
         };
         Some(Ink::Fill(outline.transform(place)?, fill(color, pose.o)))
+    }
+}
+
+impl RenderFrame<'_> {
+    fn visible_ink(&self, shape: &Shape) -> Result<Option<(Ink<'_>, LayerFrame)>, String> {
+        if !shape.visible(self.time, self.scene.duration) {
+            return Ok(None);
+        }
+        let frame = self.scene.layer_frame(shape, self.time);
+        if frame.pose.o <= 0.0 {
+            return Ok(None);
+        }
+        if self.strict {
+            self.renderer.exportable(shape)?;
+            if shape.kind == "video" && !self.videos.contains_key(&shape.id) {
+                return Err(format!("{}: no video frame", shape.name));
+            }
+        }
+        Ok(self
+            .renderer
+            .ink(
+                shape,
+                frame,
+                &shape.color_at(self.time),
+                self.view,
+                self.videos,
+            )
+            .map(|ink| (ink, frame)))
+    }
+
+    fn layer_blur(&self, shape: &Shape, frame: LayerFrame) -> f32 {
+        blur(shape) * crate::transform::max_scale(frame.space) * self.scale
+    }
+
+    fn raster(
+        &self,
+        shape: &Shape,
+        frame: LayerFrame,
+        ink: &Ink<'_>,
+        blur: f32,
+    ) -> Option<LayerPixels> {
+        let bounds = ink.bounds()?;
+        let (width, height) = (self.size.0 as f32, self.size.1 as f32);
+        let area = if blur > 0.0 {
+            // Preserve the blur's support outside the canvas to avoid clipping its halo.
+            let margin = (blur * 3.0).ceil() + 2.0;
+            IntRect::from_ltrb(
+                (bounds.left().max(-margin) - margin).floor() as i32,
+                (bounds.top().max(-margin) - margin).floor() as i32,
+                (bounds.right().min(width + margin) + margin).ceil() as i32,
+                (bounds.bottom().min(height + margin) + margin).ceil() as i32,
+            )?
+        } else {
+            IntRect::from_ltrb(
+                (bounds.left().floor() - 1.0).max(0.0) as i32,
+                (bounds.top().floor() - 1.0).max(0.0) as i32,
+                (bounds.right().ceil() + 1.0).min(width) as i32,
+                (bounds.bottom().ceil() + 1.0).min(height) as i32,
+            )?
+        };
+        let mut pixmap = Pixmap::new(area.width(), area.height())?;
+        ink.paint(
+            &mut pixmap,
+            Transform::from_translate(-area.x() as f32, -area.y() as f32),
+        );
+        if blur > 0.0 {
+            gaussian_blur(&mut pixmap, blur);
+        }
+        if !shape.masks.is_empty() {
+            self.renderer
+                .masks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .apply(&mut pixmap, area, shape, frame, self.view, self.time);
+        }
+        Some(LayerPixels { area, pixmap })
+    }
+}
+
+impl MatteFrame {
+    fn source(
+        &mut self,
+        frame: &RenderFrame<'_>,
+        index: usize,
+    ) -> Result<Option<Rc<LayerPixels>>, String> {
+        let mut chain = Vec::new();
+        let mut next = Some(index);
+        let mut previous = None;
+        while let Some(i) = next {
+            if let Some(cached) = self.cache.get(&i) {
+                previous = cached.clone();
+                break;
+            }
+            chain.push(i);
+            next = self.links.sources[i];
+        }
+        for i in chain.into_iter().rev() {
+            let shape = &frame.scene.shapes[i];
+            let mut layer = frame.visible_ink(shape)?.and_then(|(ink, layer_frame)| {
+                frame.raster(
+                    shape,
+                    layer_frame,
+                    &ink,
+                    frame.layer_blur(shape, layer_frame),
+                )
+            });
+            if let (Some(layer), Some(matte), Some(_)) =
+                (&mut layer, &shape.track_matte, self.links.sources[i])
+            {
+                layer.apply_matte(previous.as_deref(), matte.mode);
+            }
+            let bytes = layer.as_ref().map_or(0, |layer| layer.pixmap.data().len());
+            previous = layer.map(Rc::new);
+            if self.bytes + bytes <= 32 * 1024 * 1024 {
+                self.bytes += bytes;
+                self.cache.insert(i, previous.clone());
+            }
+        }
+        Ok(previous)
     }
 }
 
@@ -407,13 +552,13 @@ fn gaussian_blur(pixmap: &mut Pixmap, sigma: f32) {
     let mut scratch = vec![0; data.len()];
     for size in box_sizes(sigma) {
         let radius = (size - 1) / 2;
-        box_blur(data, &mut scratch, height, width, 4, width * 4, radius);
-        box_blur(&scratch, data, width, height, width * 4, 4, radius);
+        box_blur::<4>(data, &mut scratch, height, width, 4, width * 4, radius);
+        box_blur::<4>(&scratch, data, width, height, width * 4, 4, radius);
     }
 }
 
 /// The widths of three box blurs that together approximate a Gaussian.
-fn box_sizes(sigma: f32) -> [usize; 3] {
+pub(crate) fn box_sizes(sigma: f32) -> [usize; 3] {
     let variance = 12.0 * sigma * sigma;
     let ideal = (variance / 3.0 + 1.0).sqrt();
     let mut lower = ideal.floor() as i32;
@@ -435,7 +580,7 @@ fn box_sizes(sigma: f32) -> [usize; 3] {
 
 /// Averages each of `lines` lines of `length` pixels over `radius` pixels either side. Pixel `j` of line `i` starts
 /// at byte `i * stride + j * step`.
-fn box_blur(
+pub(crate) fn box_blur<const CHANNELS: usize>(
     from: &[u8],
     to: &mut [u8],
     lines: usize,
@@ -446,7 +591,7 @@ fn box_blur(
 ) {
     let window = (2 * radius + 1) as u32;
     for line in 0..lines {
-        for channel in 0..4 {
+        for channel in 0..CHANNELS {
             let at = |j: usize| line * stride + j * step + channel;
             let mut sum: u32 = (0..=radius.min(length - 1))
                 .map(|j| from[at(j)] as u32)

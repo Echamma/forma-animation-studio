@@ -1,3 +1,4 @@
+use crate::compositing::{MaskKey, MaskProperty};
 use crate::model::{ColorKey, Key, Pose, Shape, ease_at, hundredths, is_linked};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,7 @@ impl Property {
 pub enum Lane {
     Pose(Property),
     Color,
+    Mask(u64, MaskProperty),
 }
 
 impl Lane {
@@ -54,6 +56,7 @@ impl Lane {
             Self::Pose(Property::Rotation) => "Rotation",
             Self::Pose(Property::Opacity) => "Opacity",
             Self::Color => "Color",
+            Self::Mask(_, property) => property.label(),
         }
     }
 
@@ -64,6 +67,7 @@ impl Lane {
             Self::Pose(Property::Rotation) => &["Angle"],
             Self::Pose(Property::Opacity) => &["Opacity"],
             Self::Color => &["Red", "Green", "Blue"],
+            Self::Mask(_, property) => property.channels(),
         }
     }
 
@@ -71,6 +75,16 @@ impl Lane {
         match self {
             Self::Pose(property) => property.values(shape.lane_pose(t))[channel],
             Self::Color => rgb(&shape.color_at(t))[channel],
+            Self::Mask(id, property) => shape.mask(id).map_or(0.0, |mask| {
+                property.clamp(mask.values(property, t, &shape.ease)[channel])
+            }),
+        }
+    }
+
+    pub(crate) fn exists_on(self, shape: &Shape) -> bool {
+        match self {
+            Self::Mask(id, _) => shape.mask(id).is_some(),
+            _ => true,
         }
     }
 }
@@ -138,6 +152,7 @@ impl Key {
 pub enum LaneKey {
     Pose(Property, Key),
     Color(ColorKey),
+    Mask(u64, MaskKey),
 }
 
 impl LaneKey {
@@ -145,6 +160,7 @@ impl LaneKey {
         match self {
             Self::Pose(property, _) => Lane::Pose(*property),
             Self::Color(_) => Lane::Color,
+            Self::Mask(id, key) => Lane::Mask(*id, key.property),
         }
     }
 
@@ -152,6 +168,7 @@ impl LaneKey {
         match self {
             Self::Pose(_, key) => key.t,
             Self::Color(key) => key.t,
+            Self::Mask(_, key) => key.t,
         }
     }
 
@@ -159,6 +176,7 @@ impl LaneKey {
         match self {
             Self::Pose(property, key) => property.values(Pose::from(key))[channel],
             Self::Color(key) => rgb(&key.color)[channel],
+            Self::Mask(_, key) => key.values[channel],
         }
     }
 
@@ -179,6 +197,7 @@ impl LaneKey {
                 let [r, g, b] = channels.map(|v| v.round().clamp(0.0, 255.0) as u8);
                 key.color = format!("#{r:02x}{g:02x}{b:02x}");
             }
+            Self::Mask(_, key) => key.values[channel] = key.property.clamp(value),
         }
     }
 
@@ -186,6 +205,7 @@ impl LaneKey {
         let (ease, curve) = match self {
             Self::Pose(_, key) => (&key.ease, key.curve),
             Self::Color(key) => (&key.ease, key.curve),
+            Self::Mask(_, key) => (&key.ease, key.curve),
         };
         (ease.as_deref().unwrap_or(default), curve)
     }
@@ -194,6 +214,7 @@ impl LaneKey {
         let (ease, curve) = match self {
             Self::Pose(_, key) => (&mut key.ease, &mut key.curve),
             Self::Color(key) => (&mut key.ease, &mut key.curve),
+            Self::Mask(_, key) => (&mut key.ease, &mut key.curve),
         };
         *ease = Some(kind.into());
         *curve = handles;
@@ -220,6 +241,13 @@ impl LaneKey {
         if let Self::Pose(_, key) = self {
             key.extra.remove("motionId");
         }
+    }
+
+    pub(crate) fn for_lane(mut self, lane: Lane) -> Self {
+        if let (Self::Mask(id, _), Lane::Mask(target, _)) = (&mut self, lane) {
+            *id = target;
+        }
+        self
     }
 }
 
@@ -305,6 +333,14 @@ impl Shape {
                 .cloned()
                 .map(LaneKey::Color)
                 .collect(),
+            Lane::Mask(id, property) => self
+                .mask(id)
+                .into_iter()
+                .flat_map(|mask| &mask.keys)
+                .filter(|key| key.property == property)
+                .cloned()
+                .map(|key| LaneKey::Mask(id, key))
+                .collect(),
         }
     }
 
@@ -322,6 +358,14 @@ impl Shape {
                 .find(|key| same_time(key.t, t))
                 .cloned()
                 .map(LaneKey::Color),
+            Lane::Mask(id, property) => self
+                .mask(id)?
+                .keys
+                .iter()
+                .rev()
+                .find(|key| key.property == property && same_time(key.t, t))
+                .cloned()
+                .map(|key| LaneKey::Mask(id, key)),
         }
     }
 
@@ -360,6 +404,24 @@ impl Shape {
                     extra: Default::default(),
                 }),
             ),
+            Lane::Mask(id, property) => {
+                if let Some(mask) = self.mask(id) {
+                    let values = mask.pose(t, &self.ease).values(property);
+                    self.put_lane_key(
+                        at,
+                        LaneKey::Mask(
+                            id,
+                            MaskKey {
+                                t: at,
+                                property,
+                                values,
+                                ease: None,
+                                curve: None,
+                            },
+                        ),
+                    );
+                }
+            }
         }
     }
 
@@ -399,6 +461,17 @@ impl Shape {
                     self.color = color;
                 }
             }
+            Lane::Mask(id, property) => {
+                let ease = self.ease.clone();
+                if let Some(mask) = self.mask_mut(id) {
+                    let value = mask.values(property, t, &ease);
+                    mask.keys
+                        .retain(|key| key.property != property || !same_time(key.t, t));
+                    if !mask.keys.iter().any(|key| key.property == property) {
+                        mask.rest.set(property, value);
+                    }
+                }
+            }
         }
     }
 
@@ -432,6 +505,11 @@ impl Shape {
                 let i = self.color_keys.partition_point(|existing| existing.t < t);
                 self.color_keys.insert(i, key);
             }
+            LaneKey::Mask(id, key) => {
+                if let Some(mask) = self.mask_mut(id) {
+                    mask.put_key(key, t);
+                }
+            }
         }
     }
 
@@ -462,6 +540,10 @@ impl Shape {
         let rest = self.rest_pose;
         let linked_rest = self.linked_rest;
         let color = self.color.clone();
+        let mask_rest = match lane {
+            Lane::Mask(id, _) => self.mask(id).map(|mask| (id, mask.rest)),
+            _ => None,
+        };
         for key in &selected {
             self.remove_lane_key(lane, key.time());
         }
@@ -471,6 +553,11 @@ impl Shape {
         self.rest_pose = rest;
         self.linked_rest = linked_rest;
         self.color = color;
+        if let Some((id, rest)) = mask_rest
+            && let Some(mask) = self.mask_mut(id)
+        {
+            mask.rest = rest;
+        }
         true
     }
 }
