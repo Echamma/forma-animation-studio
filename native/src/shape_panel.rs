@@ -166,7 +166,10 @@ pub(crate) fn fill_panel(
                 tools.toggle(Tool::Subpath, Some(&id));
             }
         });
-    } else if ui.button("Convert to path").clicked() && shape.convert_to_path(size) {
+    } else if shape.kind != "text"
+        && ui.button("Convert to path").clicked()
+        && shape.convert_to_path(size)
+    {
         tools.set(Some(Tool::Points), Some(&id));
     }
     let vector = shape.vector.as_mut();
@@ -278,6 +281,15 @@ pub(crate) fn stroke_and_trim(ui: &mut Ui, shape: &mut Shape, tools: &mut Vector
             ease,
         );
     });
+    if shape.kind != "text" {
+        trim_panel(ui, shape, t);
+    }
+    if shape.vector.as_ref() == Some(&VectorLayer::default()) {
+        shape.vector = None;
+    }
+}
+
+fn trim_panel(ui: &mut Ui, shape: &mut Shape, t: f64) {
     egui::CollapsingHeader::new("Trim paths").show(ui, |ui| {
         let mut enabled = shape
             .vector
@@ -326,9 +338,6 @@ pub(crate) fn stroke_and_trim(ui: &mut Ui, shape: &mut Shape, tools: &mut Vector
             ui.checkbox(&mut trim.fill, "Trim the fill too");
         }
     });
-    if shape.vector.as_ref() == Some(&VectorLayer::default()) {
-        shape.vector = None;
-    }
 }
 
 fn gradient_panel(

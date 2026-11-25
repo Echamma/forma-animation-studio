@@ -57,7 +57,7 @@ impl GeometryCache {
         entry.matched.0.interpolate(&entry.matched.1, fraction)
     }
 
-    fn outline(
+    pub(crate) fn outline(
         &mut self,
         shape: &Shape,
         vector: &VectorLayer,
@@ -140,20 +140,7 @@ impl VectorInk {
                 solid(style.rgba),
             )
         {
-            let stroke = Stroke {
-                width: style.width,
-                line_cap: match style.cap {
-                    Cap::Butt => LineCap::Butt,
-                    Cap::Round => LineCap::Round,
-                    Cap::Square => LineCap::Square,
-                },
-                line_join: match style.join {
-                    Join::Miter => LineJoin::Miter,
-                    Join::Round => LineJoin::Round,
-                    Join::Bevel => LineJoin::Bevel,
-                },
-                ..Stroke::default()
-            };
+            let stroke = stroke_style(&style);
             let scale = max_scale(place).clamp(0.15, 32.0);
             let mut builder = PathBuilder::new();
             let mut add = |outline: &Path, from: f32| {
@@ -218,6 +205,23 @@ impl VectorInk {
     }
 }
 
+pub(crate) fn stroke_style(style: &crate::shape_style::StrokeStyle) -> Stroke {
+    Stroke {
+        width: style.width,
+        line_cap: match style.cap {
+            Cap::Butt => LineCap::Butt,
+            Cap::Round => LineCap::Round,
+            Cap::Square => LineCap::Square,
+        },
+        line_join: match style.join {
+            Join::Miter => LineJoin::Miter,
+            Join::Round => LineJoin::Round,
+            Join::Bevel => LineJoin::Bevel,
+        },
+        ..Stroke::default()
+    }
+}
+
 fn paint(
     vector: &VectorLayer,
     target: PaintTarget,
@@ -226,6 +230,18 @@ fn paint(
     size: [f32; 2],
     fallback: Paint<'static>,
 ) -> Option<Paint<'static>> {
+    tinted_paint(vector, target, t, ease, size, fallback, |rgba| rgba)
+}
+
+pub(crate) fn tinted_paint(
+    vector: &VectorLayer,
+    target: PaintTarget,
+    t: f64,
+    ease: &str,
+    size: [f32; 2],
+    fallback: Paint<'static>,
+    tint: impl Fn([f32; 4]) -> [f32; 4],
+) -> Option<Paint<'static>> {
     let mode = vector
         .paint(target)
         .map_or(PaintMode::Solid, |paint| paint.mode);
@@ -233,13 +249,16 @@ fn paint(
         PaintMode::None => None,
         PaintMode::Solid => Some(fallback),
         PaintMode::Linear | PaintMode::Radial => {
-            let gradient = vector.gradient_at(target, t, ease)?;
+            let mut gradient = vector.gradient_at(target, t, ease)?;
+            for stop in &mut gradient.stops {
+                stop.rgba = tint(stop.rgba);
+            }
             Some(gradient_paint(mode, gradient, size))
         }
     }
 }
 
-fn solid(rgba: [f32; 4]) -> Paint<'static> {
+pub(crate) fn solid(rgba: [f32; 4]) -> Paint<'static> {
     let mut paint = Paint {
         anti_alias: true,
         ..Paint::default()

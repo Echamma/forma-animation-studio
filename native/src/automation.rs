@@ -512,6 +512,7 @@ fn new_layer(scene: &Scene, args: &Value, kind: &str) -> Shape {
         "keys": [{"t": 0, "x": number("x", scene.width as f64 / 2.0), "y": number("y", scene.height as f64 / 2.0), "w": w, "h": h, "r": number("r", 0.0), "o": number("o", 100.0)}],
     });
     if text {
+        layer["textLayout"] = json!({});
         for (field, value) in [
             ("text", json!(args["text"].as_str().unwrap_or("Your text"))),
             ("linkId", json!("")),

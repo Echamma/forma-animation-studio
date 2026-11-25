@@ -70,6 +70,8 @@ pub struct Shape {
     pub track_matte: Option<TrackMatte>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector: Option<VectorLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_layout: Option<crate::text_animator::TextLayout>,
     #[serde(flatten, serialize_with = "serialize_shape_extra")]
     pub extra: Map<String, Value>,
 }
@@ -367,6 +369,16 @@ impl Scene {
             if shape.kind == "path" && shape.vector.as_ref().is_none_or(|vector| vector.path.is_none()) {
                 return Err(format!("{}: this layer is missing its path.", shape.name));
             }
+            if shape
+                .text_layout
+                .as_mut()
+                .is_some_and(|text| !text.prepare(scene.duration))
+            {
+                return Err(format!(
+                    "{}: this layer has invalid text animation data.",
+                    shape.name
+                ));
+            }
             let mut mask_ids = HashSet::new();
             for mask in &mut shape.masks {
                 if !mask_ids.insert(mask.id) || !mask.prepare() {
@@ -443,6 +455,7 @@ impl Scene {
             masks: Vec::new(),
             track_matte: None,
             vector: None,
+            text_layout: None,
             extra: Map::new(),
         });
         id
@@ -476,6 +489,7 @@ impl Scene {
         self.add_shape(id.clone(), "text");
         let shape = self.shapes.last_mut().unwrap();
         shape.name = "Your text".into();
+        shape.text_layout = Some(Default::default());
         shape.color = "#1F3D2B".into();
         shape.keys[0].w = text_width;
         shape.keys[0].h = font_size;
@@ -515,6 +529,7 @@ impl Scene {
         self.add_shape(id.clone(), "text");
         let shape = self.shapes.last_mut().unwrap();
         (shape.name, shape.color) = (format!("Text for {target_name}"), "#ffffff".into());
+        shape.text_layout = Some(Default::default());
         shape.keys[0] = Key {
             t: 0.0,
             x: p.x,
@@ -709,6 +724,7 @@ impl Scene {
                     .chain(shape.color_keys.iter().map(|key| key.t))
                     .chain(shape.mask_times())
                     .chain(shape.vector_times())
+                    .chain(shape.text_times())
                     .chain(shape.out_time)
                     .chain(
                         shape
@@ -1066,7 +1082,19 @@ impl Scene {
             .iter_mut()
             .map(|k| &mut k.t)
             .chain(shape.color_keys.iter_mut().map(|k| &mut k.t))
-            .chain(shape.vector.iter_mut().flat_map(|v| v.keys.iter_mut().map(|k| &mut k.t)))
+            .chain(
+                shape
+                    .vector
+                    .iter_mut()
+                    .flat_map(|v| v.keys.iter_mut().map(|k| &mut k.t)),
+            )
+            .chain(
+                shape
+                    .text_layout
+                    .iter_mut()
+                    .flat_map(|text| text.tracks_mut())
+                    .flat_map(|track| track.keys.iter_mut().map(|key| &mut key.t)),
+            )
             .chain(
                 shape
                     .masks
@@ -1291,7 +1319,9 @@ impl Scene {
         };
         copy.color_keys.clear();
         copy.freeze_masks(if same { end } else { template.clip_start() });
-        copy.freeze_vector(if same { end } else { template.clip_start() });
+        let at = if same { end } else { template.clip_start() };
+        copy.freeze_vector(at);
+        copy.freeze_text(at);
         if !same {
             copy.base_rotation = source.base_rotation;
         }
@@ -1353,6 +1383,7 @@ impl Scene {
             self.shapes.push(copy);
         }
         self.prune_missing_mattes();
+        self.prune_missing_text_paths();
         copies
     }
 
@@ -1372,6 +1403,14 @@ impl Scene {
         {
             matte.source = target.clone();
         }
+        if let Some(path) = copy
+            .text_layout
+            .as_mut()
+            .and_then(|text| text.path.as_mut())
+            && let Some((_, target)) = ids.iter().find(|(source, _)| *source == *path)
+        {
+            *path = target.clone();
+        }
         copy
     }
 
@@ -1381,6 +1420,7 @@ impl Scene {
         self.duration = self.duration.max(copy.latest_time());
         self.shapes.push(copy);
         self.prune_missing_mattes();
+        self.prune_missing_text_paths();
         self.shapes.len() - 1
     }
 
@@ -1441,6 +1481,7 @@ impl Scene {
         let before = self.shapes.len();
         self.shapes.retain(|shape| !ids.contains(&shape.id));
         self.prune_missing_mattes();
+        self.prune_missing_text_paths();
         before - self.shapes.len()
     }
 
@@ -1532,6 +1573,7 @@ impl Scene {
         ghost.color_keys.clear();
         ghost.freeze_masks(at);
         ghost.freeze_vector(at);
+        ghost.freeze_text(at);
         ghost.rotation_clips.clear();
         ghost.parent = None;
         ghost.parent_space = crate::transform::matrix(frame.space);
@@ -1808,6 +1850,7 @@ impl Shape {
             .chain(self.color_keys.iter().map(|k| k.t))
             .chain(self.mask_times())
             .chain(self.vector_times())
+            .chain(self.text_times())
             .chain(motions(self).map(|(_, start, _)| start))
             .chain(self.rotation_clips.iter().map(|c| c.start_time))
             .chain(self.disappear.iter().map(|d| d.start_time))
@@ -1821,6 +1864,7 @@ impl Shape {
             .chain(self.color_keys.iter().map(|k| k.t))
             .chain(self.mask_times())
             .chain(self.vector_times())
+            .chain(self.text_times())
             .chain(motions(self).map(|(_, start, length)| start + length))
             .chain(
                 self.rotation_clips

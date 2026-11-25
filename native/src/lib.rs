@@ -26,6 +26,13 @@ pub mod sound;
 pub mod storage;
 pub mod svg;
 pub mod text;
+pub mod text_animator;
+mod text_layout;
+mod text_panel;
+mod text_presets;
+mod text_render;
+#[cfg(test)]
+mod text_tests;
 pub mod transform;
 pub mod video;
 pub mod videos;

@@ -6,17 +6,19 @@ use std::sync::OnceLock;
 use tiny_skia::{FillRule, Paint, Path, PathBuilder, Pixmap, Transform};
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 
+pub(crate) const BUNDLED: [&[u8]; 2] = [
+    include_bytes!("../fonts/DMSans-SemiBold.ttf"),
+    include_bytes!("../fonts/DMSans-SemiBold-LatinExt.ttf"),
+];
+
 /// The two halves of DM Sans that Forma bundles (split like its web fonts), then Segoe UI for anything else.
 fn faces() -> &'static [Face<'static>] {
     static FACES: OnceLock<Vec<Face<'static>>> = OnceLock::new();
     FACES.get_or_init(|| {
-        let mut faces: Vec<Face<'static>> = [
-            include_bytes!("../fonts/DMSans-SemiBold.ttf").as_slice(),
-            include_bytes!("../fonts/DMSans-SemiBold-LatinExt.ttf").as_slice(),
-        ]
-        .into_iter()
-        .filter_map(|data| Face::parse(data, 0).ok())
-        .collect();
+        let mut faces: Vec<Face<'static>> = BUNDLED
+            .into_iter()
+            .filter_map(|data| Face::parse(data, 0).ok())
+            .collect();
         let fallback = ["seguisb.ttf", "segoeui.ttf"].iter().find_map(|name| {
             std::fs::read(std::path::Path::new(r"C:\Windows\Fonts").join(name)).ok()
         });
@@ -78,6 +80,19 @@ pub fn outline(text: &str, width: f32, size: f32) -> Option<Path> {
         faces[index].outline_glyph(id, &mut builder);
     }
     builder.path.finish()
+}
+
+pub(crate) fn glyph_outline(face: &Face, id: GlyphId) -> Option<Path> {
+    let mut pen = Pen {
+        path: PathBuilder::new(),
+        origin: 0.0,
+        scale: 1.0 / f32::from(face.units_per_em()),
+        stretch: 1.0,
+        left: 0.0,
+        baseline: 0.0,
+    };
+    face.outline_glyph(id, &mut pen)?;
+    pen.path.finish()
 }
 
 fn kerning(face: &Face, left: GlyphId, right: GlyphId) -> f32 {

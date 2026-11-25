@@ -447,6 +447,27 @@ impl MeasuredPath {
         self.total
     }
 
+    pub(crate) fn first_contour(&self) -> Option<PathSampler> {
+        let (segments, &closed) = self
+            .contours
+            .iter()
+            .zip(&self.closed)
+            .find(|(segments, _)| !segments.is_empty())?;
+        let mut length = 0.0;
+        let segments = segments
+            .iter()
+            .map(|&(segment, size)| {
+                length += size;
+                (segment, length)
+            })
+            .collect();
+        Some(PathSampler {
+            segments,
+            length,
+            closed,
+        })
+    }
+
     /// Each piece carries its starting distance within the contour for dash alignment.
     pub fn trim(&self, start: f32, end: f32, offset: f32) -> Vec<(Path, f32)> {
         let mut pieces = Vec::new();
@@ -490,6 +511,38 @@ impl MeasuredPath {
             contour_start += length;
         }
         pieces
+    }
+}
+
+pub(crate) struct PathSampler {
+    segments: Vec<(PathSeg, f64)>,
+    length: f64,
+    closed: bool,
+}
+
+impl PathSampler {
+    pub(crate) fn length(&self) -> f32 {
+        self.length as f32
+    }
+
+    pub(crate) fn at(&self, distance: f32) -> Option<(Point, Vec2)> {
+        let distance = f64::from(distance);
+        if !distance.is_finite() || (!self.closed && !(0.0..=self.length).contains(&distance)) {
+            return None;
+        }
+        let distance = if self.closed {
+            distance.rem_euclid(self.length)
+        } else {
+            distance
+        };
+        let index = self.segments.partition_point(|&(_, end)| end < distance);
+        let (segment, _) = *self.segments.get(index)?;
+        let start = index
+            .checked_sub(1)
+            .map_or(0.0, |previous| self.segments[previous].1);
+        let t = segment.inv_arclen((distance - start).max(0.0), ACCURACY);
+        let tangent = segment.eval((t + 0.0001).min(1.0)) - segment.eval((t - 0.0001).max(0.0));
+        Some((segment.eval(t), tangent))
     }
 }
 

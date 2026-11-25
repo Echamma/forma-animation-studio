@@ -4,6 +4,8 @@
 use crate::compositing::{Blend, MatteLinks};
 use crate::mask_render::{LayerPixels, MaskCache};
 use crate::model::{MAX_BLUR, Scene, Shape};
+use crate::text_layout::TextCache;
+use crate::text_render::{TextInk, TextPaths};
 use crate::transform::LayerFrame;
 use crate::vector_render::{GeometryCache, VectorInk};
 use crate::{assets, svg, text};
@@ -20,6 +22,8 @@ use tiny_skia::{
 /// Video layers' frames at one moment, by layer id.
 pub type Frames = HashMap<String, Pixmap>;
 
+type TextHits = HashMap<String, Vec<Rect>>;
+
 /// What the editor sees (see `Renderer::view`): the scene point at the top-left, pixels to a scene pixel, and the
 /// size in pixels.
 pub type View = ((f32, f32), f32, (u32, u32));
@@ -35,6 +39,8 @@ pub struct Renderer {
     sources: Vec<(String, Option<u64>)>,
     masks: Mutex<MaskCache>,
     geometry: Mutex<GeometryCache>,
+    text: Mutex<(TextCache, TextPaths)>,
+    text_hits: Mutex<TextHits>,
 }
 
 struct RenderFrame<'a> {
@@ -58,14 +64,24 @@ struct MatteFrame {
 enum Ink<'a> {
     Fill(Outline, Paint<'static>),
     Vector(VectorInk),
+    Text(TextInk),
     Picture(&'a Pixmap, PixmapPaint, Transform),
 }
 
 impl Ink<'_> {
+    fn group_opacity(&self) -> f32 {
+        match self {
+            Ink::Vector(ink) => ink.opacity,
+            Ink::Text(ink) => ink.opacity,
+            _ => 1.0,
+        }
+    }
+
     fn bounds(&self) -> Option<Rect> {
         match self {
             Ink::Fill(outline, _) => Some(outline.bounds()),
             Ink::Vector(ink) => ink.bounds(),
+            Ink::Text(ink) => ink.bounds(),
             Ink::Picture(pixmap, _, transform) => {
                 let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
                 let mut corners = [
@@ -86,6 +102,7 @@ impl Ink<'_> {
                 target.fill_path(outline, paint, FillRule::Winding, offset, None)
             }
             Ink::Vector(ink) => ink.paint(target, offset),
+            Ink::Text(ink) => ink.paint(target, offset),
             Ink::Picture(pixmap, paint, transform) => target.draw_pixmap(
                 0,
                 0,
@@ -135,6 +152,8 @@ impl Renderer {
             sources: sources(scene),
             masks: Mutex::default(),
             geometry: Mutex::default(),
+            text: Mutex::default(),
+            text_hits: Mutex::default(),
         }
     }
 
@@ -227,8 +246,22 @@ impl Renderer {
         paint.set_color(Color::from_rgba8(r, g, b, 255));
         canvas.fill_rect(frame, &paint, Transform::identity(), None);
         let view = Transform::from_row(scale, 0.0, 0.0, scale, left, top);
-        self.layers(&mut canvas, scene, t, view, scale, false, frames)
-            .ok()?;
+        let mut hits = self
+            .text_hits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        hits.clear();
+        self.layers(
+            &mut canvas,
+            scene,
+            t,
+            view,
+            scale,
+            false,
+            frames,
+            Some(&mut hits),
+        )
+        .ok()?;
         if clip {
             // Everything outside the frame goes back to clear.
             let width = canvas.width() as i32;
@@ -252,6 +285,28 @@ impl Renderer {
         Some(canvas)
     }
 
+    pub(crate) fn text_hit(&self, layer: &str, x: f32, y: f32) -> bool {
+        self.text_hits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(layer)
+            .is_some_and(|boxes| {
+                boxes
+                    .iter()
+                    .any(|r| r.left() <= x && x <= r.right() && r.top() <= y && y <= r.bottom())
+            })
+    }
+
+    pub(crate) fn text_bounds(&self, layer: &str) -> Option<Rect> {
+        self.text_hits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(layer)?
+            .iter()
+            .copied()
+            .reduce(crate::text_render::union)
+    }
+
     fn draw(
         &self,
         scene: &Scene,
@@ -267,7 +322,7 @@ impl Renderer {
         // Like Electron's export, which scales the canvas by width and height separately.
         let (scale_x, scale_y) = (width as f32 / scene.width, height as f32 / scene.height);
         let view = Transform::from_scale(scale_x, scale_y);
-        self.layers(&mut canvas, scene, t, view, scale_x, strict, frames)?;
+        self.layers(&mut canvas, scene, t, view, scale_x, strict, frames, None)?;
         Ok(canvas)
     }
 
@@ -282,6 +337,7 @@ impl Renderer {
         scale: f32,
         strict: bool,
         frames: &Frames,
+        mut text_hits: Option<&mut TextHits>,
     ) -> Result<(), String> {
         let frame = RenderFrame {
             renderer: self,
@@ -308,6 +364,9 @@ impl Renderer {
             let Some((ink, layer_frame)) = frame.visible_ink(shape)? else {
                 continue;
             };
+            if let (Ink::Text(ink), Some(hits)) = (&ink, text_hits.as_deref_mut()) {
+                hits.insert(shape.id.clone(), ink.hit_boxes());
+            }
             let blur = frame.layer_blur(shape, layer_frame);
             let source = mattes
                 .as_ref()
@@ -316,7 +375,7 @@ impl Renderer {
                 && shape.blend() == Blend::Normal
                 && shape.masks.is_empty()
                 && source.is_none()
-                && !matches!(&ink, Ink::Vector(ink) if ink.opacity < 1.0)
+                && ink.group_opacity() >= 1.0
             {
                 ink.paint(canvas, Transform::identity());
                 continue;
@@ -347,6 +406,28 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn still_text(
+        &self,
+        scene: &Scene,
+        shape: &Shape,
+        time: f64,
+    ) -> Result<Option<LayerPixels>, String> {
+        let videos = Frames::default();
+        let frame = RenderFrame {
+            renderer: self,
+            scene,
+            time,
+            view: Transform::identity(),
+            scale: 1.0,
+            size: (scene.width.round() as u32, scene.height.round() as u32),
+            strict: false,
+            videos: &videos,
+        };
+        Ok(frame.visible_ink(shape)?.and_then(|(ink, layer)| {
+            frame.raster(shape, layer, &ink, frame.layer_blur(shape, layer))
+        }))
     }
 
     /// A layer at `pose` in `color`: shapes and text as outlines, pictures as pixmaps. Each is drawn around its center,
@@ -404,6 +485,31 @@ impl RenderFrame<'_> {
                 return Err(format!("{}: no video frame", shape.name));
             }
         }
+        if TextInk::used_by(shape) {
+            let mut geometry = self
+                .renderer
+                .geometry
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut text = self
+                .renderer
+                .text
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let (cache, paths) = &mut *text;
+            let ink = TextInk::new(
+                self.scene,
+                shape,
+                frame,
+                self.view,
+                &shape.color_at(self.time),
+                self.time,
+                cache,
+                &mut geometry,
+                paths,
+            );
+            return Ok(ink.map(|ink| (Ink::Text(ink), frame)));
+        }
         Ok(self
             .renderer
             .ink(
@@ -452,11 +558,10 @@ impl RenderFrame<'_> {
             &mut pixmap,
             Transform::from_translate(-area.x() as f32, -area.y() as f32),
         );
-        if let Ink::Vector(ink) = ink
-            && ink.opacity < 1.0
-        {
+        let opacity = ink.group_opacity();
+        if opacity < 1.0 {
             for pixel in pixmap.pixels_mut() {
-                let alpha = |channel: u8| (f32::from(channel) * ink.opacity).round() as u8;
+                let alpha = |channel: u8| (f32::from(channel) * opacity).round() as u8;
                 if let Some(scaled) = tiny_skia::PremultipliedColorU8::from_rgba(
                     alpha(pixel.red()), alpha(pixel.green()), alpha(pixel.blue()), alpha(pixel.alpha()),
                 ) {
@@ -576,7 +681,7 @@ pub(crate) fn blur(shape: &Shape) -> f32 {
 
 /// Gaussian blur with standard deviation `sigma` (what CSS `blur()` means), as three box blurs each way, the
 /// approximation SVG and CSS filters use. Pixels outside are transparent.
-fn gaussian_blur(pixmap: &mut Pixmap, sigma: f32) {
+pub(crate) fn gaussian_blur(pixmap: &mut Pixmap, sigma: f32) {
     let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
     let data = pixmap.data_mut();
     let mut scratch = vec![0; data.len()];

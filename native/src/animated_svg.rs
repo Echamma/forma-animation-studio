@@ -5,6 +5,9 @@
 
 use crate::compositing::Blend;
 use crate::model::{Pose, Scene, Shape};
+use crate::text_animator::{TextLane, TextProperty};
+use crate::text_layout::TextCache;
+use crate::text_render::TextInk;
 use crate::{assets, text};
 use base64::Engine;
 use canopy_ui::Place;
@@ -24,7 +27,14 @@ struct Sample {
 pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     let mut defs = String::new();
     let mut layers = String::new();
+    let mut text_cache = TextCache::default();
     for (index, shape) in scene.shapes.iter().enumerate() {
+        let shaped_text = if TextInk::used_by(shape) {
+            Some(shaped_geometry(shape, &mut text_cache)?)
+        } else {
+            None
+        };
+        let has_shaped_text = shaped_text.is_some();
         let p = scene.local_pose(shape, 0.0);
         let mut styling = format!(r#"<g fill="{}""#, attr(&shape.color_at(0.0)));
         styling.push_str(&compositing_style(shape, "Animated SVG")?);
@@ -51,15 +61,16 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
         }
         let vector = crate::vector_svg::geometry(scene, shape, index, &mut defs, None)?;
         let local_pixels = vector.is_some();
-        let geometry = match vector {
-            Some(geometry) => geometry,
-            None => geometry(shape, place)?,
+        let geometry = match (shaped_text, vector) {
+            (Some(geometry), _) | (None, Some(geometry)) => geometry,
+            (None, None) => geometry(shape, place)?,
         };
         let nested = chain.len() > 1 || shape.parent_space.is_some();
         if !nested {
-            if local_pixels && crate::render::blur(shape) > 0.0 {
+            if (local_pixels || has_shaped_text) && crate::render::blur(shape) > 0.0 {
                 styling.push_str(&canvas_blur_filter(scene, shape, 0.0, &chain, &mut defs));
-                let content = animate_group(scene, shape, "<g".into(), &geometry, true, true);
+                let content =
+                    animate_group(scene, shape, "<g".into(), &geometry, true, local_pixels);
                 write!(layers, "{styling}>{content}</g>").unwrap();
             } else {
                 styling.push_str(&blur_filter(shape, p, &mut defs));
@@ -196,11 +207,43 @@ pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
     }
     let mut defs = String::new();
     let mut layers = String::new();
+    let mut renderer = None;
     for (index, shape) in scene.shapes.iter().enumerate().filter(|(_, s)| s.visible(t, scene.duration)) {
         let frame = scene.layer_frame(shape, t);
         let p = frame.pose;
         let mut group = format!(r#"<g fill="{}""#, attr(&shape.color_at(t)));
         group.push_str(&compositing_style(shape, "Still SVG")?);
+        if TextInk::used_by(shape) {
+            let renderer =
+                renderer.get_or_insert_with(|| crate::render::Renderer::new(scene, place));
+            let Some(pixels) = renderer.still_text(scene, shape, t)? else {
+                continue;
+            };
+            let rgba: Vec<_> = pixels
+                .pixmap
+                .pixels()
+                .iter()
+                .flat_map(|pixel| {
+                    let pixel = pixel.demultiply();
+                    [pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]
+                })
+                .collect();
+            let mut png = Vec::new();
+            use image::ImageEncoder;
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(
+                    &rgba,
+                    pixels.pixmap.width(),
+                    pixels.pixmap.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|error| format!("{}: {error}", shape.name))?;
+            let png = base64::engine::general_purpose::STANDARD.encode(png);
+            let area = pixels.area;
+            write!(layers, r#"{group}><image x="{}" y="{}" width="{}" height="{}" href="data:image/png;base64,{png}"/></g>"#,
+                area.x(), area.y(), area.width(), area.height()).unwrap();
+            continue;
+        }
         if let Some(geometry) = crate::vector_svg::geometry(scene, shape, index, &mut defs, Some(t))? {
             group.push_str(&canvas_blur_filter(scene, shape, t, &[], &mut defs));
             let ts = frame.transform;
@@ -347,6 +390,60 @@ fn canvas_blur_filter(
     }
     defs.push_str("</filter>");
     format!(r#" filter="url(#{id})""#)
+}
+
+fn shaped_geometry(shape: &Shape, cache: &mut TextCache) -> Result<String, String> {
+    let unsupported = |feature| format!("{}: animated SVG can't export {feature}.", shape.name);
+    let Some(style) = shape.text_layout.as_ref() else {
+        return Err(unsupported("text fill and stroke styling"));
+    };
+    if !style.animators.is_empty() {
+        return Err(unsupported("per-glyph text animators"));
+    }
+    if style.path.is_some() {
+        return Err(unsupported("text along a path"));
+    }
+    if shape.vector.is_some() {
+        return Err(unsupported("text fill and stroke styling"));
+    }
+    if style
+        .style
+        .get(&TextProperty::Tracking)
+        .is_some_and(|track| track.rest[0] != 0.0 || !track.keys.is_empty())
+    {
+        return Err(unsupported("text tracking"));
+    }
+    if style
+        .style
+        .get(&TextProperty::LineHeight)
+        .is_some_and(|track| !track.keys.is_empty())
+    {
+        return Err(unsupported("animated text line height"));
+    }
+    let layout = cache.layout(&shape.id, text::content(shape), style);
+    let mut geometry = format!("<g><title>{}</title>", text_content(text::content(shape)));
+    let stretch = 1.0 / layout.width.max(0.001);
+    let leading = TextLane::Style(TextProperty::LineHeight).values(shape, 0.0)[0] / 100.0;
+    for (i, line) in layout.lines.iter().enumerate() {
+        let x = -0.5 + style.alignment.inset(1.0 - line.width * stretch);
+        let y = layout.baseline
+            + (i as f32 - layout.lines.len().saturating_sub(1) as f32 / 2.0) * leading;
+        for glyph in &line.glyphs {
+            if let Some(path) = &glyph.path {
+                let outline = crate::paths::PathData::from_outline(path, [1.0, 1.0]);
+                let d = outline.svg([1.0, 1.0], false);
+                write!(
+                    geometry,
+                    r#"<path transform="translate({} {}) scale({stretch} 1)" d="{d}"/>"#,
+                    x + glyph.x * stretch,
+                    y + glyph.y
+                )
+                .unwrap();
+            }
+        }
+    }
+    geometry.push_str("</g>");
+    Ok(geometry)
 }
 
 /// A layer one unit across, centered on its origin (the groups around it scale and place it), as `geometry()` draws it.

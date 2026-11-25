@@ -15,6 +15,7 @@ use crate::render;
 use crate::sound::Sound;
 use crate::storage;
 use crate::svg;
+use crate::text_panel;
 use crate::transform::{self, Anchor, LayerFrame};
 use crate::video;
 use crate::videos::Videos;
@@ -100,6 +101,7 @@ enum Row {
     Layer { name: String, clips: Vec<usize> },
     Property(usize, Lane),
     Mask(usize, u64, usize),
+    TextAnimator(usize, u64),
     Fade(usize),
     Motion(usize, usize),
     Spin(usize, usize),
@@ -1390,11 +1392,17 @@ impl Forma {
         let size = self.scene.layer_frame(&self.scene.shapes[index], self.time).pose;
         let shape = &mut self.scene.shapes[index];
         let tool_before = self.vector_tools.tool;
-        let show_solid = !shape.is_vector() || shape_panel::fill_panel(
-            ui, shape, [size.w, size.h], &mut self.vector_tools, self.time,
-        );
+        let has_paint = shape.is_vector() || shape.kind == "text";
+        let show_solid = !has_paint
+            || shape_panel::fill_panel(
+                ui,
+                shape,
+                [size.w, size.h],
+                &mut self.vector_tools,
+                self.time,
+            );
         let mut changed = show_solid && solid_fill_color(ui, shape, self.time);
-        if shape.is_vector() {
+        if has_paint {
             shape_panel::stroke_and_trim(ui, shape, &mut self.vector_tools, self.time);
         }
         if self.vector_tools.tool != tool_before && self.vector_tools.tool.is_some() {
@@ -1421,31 +1429,7 @@ impl Forma {
         let shape = &mut self.scene.shapes[index];
         changed |= ui.text_edit_singleline(&mut shape.name).changed();
         if shape.kind == "text" {
-            ui.label("Text");
-            let mut content = shape
-                .extra
-                .get("text")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_owned();
-            if ui
-                .add(egui::TextEdit::multiline(&mut content).desired_rows(3))
-                .changed()
-            {
-                // A text layer is named after its words (Electron does the same).
-                shape.name = Some(content.chars().take(32).collect::<String>())
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "Text".into());
-                shape.extra.insert(
-                    "text".into(),
-                    if content.is_empty() {
-                        "Text".into()
-                    } else {
-                        content.into()
-                    },
-                );
-                changed = true;
-            }
+            changed |= text_panel::content(ui, shape);
             let linked = shape
                 .extra
                 .get("linkId")
@@ -1480,6 +1464,17 @@ impl Forma {
             if let Some(target) = relink {
                 self.scene.link_text(index, target, self.time);
                 changed = true;
+            }
+            let paths = self
+                .scene
+                .shapes
+                .iter()
+                .filter(|s| s.kind == "path")
+                .map(|s| (s.id.clone(), s.name.clone()))
+                .collect::<Vec<_>>();
+            let shape = &mut self.scene.shapes[index];
+            if text_panel::layout(ui, shape, &paths, self.time) {
+                self.key_editor.expanded.insert(shape.id.clone());
             }
         }
         let shape = &mut self.scene.shapes[index];
@@ -1723,6 +1718,21 @@ impl Forma {
 
     /// The Animate tab: one-click animations, easing, and the moves, spins and fades on the layer.
     fn animate_tab(&mut self, ui: &mut Ui, index: usize) {
+        if self.scene.shapes[index].kind == "text" {
+            let duration = self.scene.duration;
+            let shape = &mut self.scene.shapes[index];
+            let result = text_panel::animate(ui, shape, self.time, duration);
+            if result.full {
+                self.notice = Some("This layer has reached its limit of 64 text animators".into());
+            }
+            if let Some(id) = result.reveal {
+                self.key_editor.reveal_animator(shape.id.clone(), id);
+            }
+            if let Some(end) = result.end {
+                self.scene.duration = duration.max(end);
+            }
+            ui.separator();
+        }
         let mut changed = false;
         let shape = &mut self.scene.shapes[index];
         let pose = shape.lane_pose(self.time);
@@ -3022,11 +3032,38 @@ impl Forma {
                 .visible(self.time, self.scene.duration)
                 .then(|| (index, self.scene.layer_frame(shape, self.time)))
         });
+        let on_path = |shape: &Shape| {
+            shape
+                .text_layout
+                .as_ref()
+                .is_some_and(|text| text.path.is_some())
+        };
+        let selected_path = selected.filter(|&(index, _)| on_path(&self.scene.shapes[index]));
         let mut handles = Vec::new();
         let (mut rotate_at, mut anchor_at) = (None, None);
-        if let (Some((_, frame)), false, false, None) =
-            (selected, self.playing, self.mask_editor.active(), self.vector_tools.tool)
-        {
+        if let (Some((index, _)), false, false, None) = (
+            selected_path,
+            self.playing,
+            self.mask_editor.active(),
+            self.vector_tools.tool,
+        ) {
+            if let Some(bounds) = renderer.text_bounds(&self.scene.shapes[index].id) {
+                let min = snapped.min + vec2(bounds.left(), bounds.top()) / pixels;
+                let max = snapped.min + vec2(bounds.right(), bounds.bottom()) / pixels;
+                painter.rect_stroke(
+                    Rect::from_min_max(min, max),
+                    0.0,
+                    Stroke::new(1.5, color::SUN),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        if let (Some((_, frame)), false, false, None) = (
+            selected.filter(|_| selected_path.is_none()),
+            self.playing,
+            self.mask_editor.active(),
+            self.vector_tools.tool,
+        ) {
             let w = frame.pose.w;
             let h = frame.pose.h;
             let center = from_layer(frame, 0.0, 0.0);
@@ -3260,32 +3297,54 @@ impl Forma {
         };
         let on_rotate = |p: Pos2| rotate_at.is_some_and(|at| at.distance(p) <= 12.0);
         let on_anchor = |p: Pos2| anchor_at.is_some_and(|at| at.distance(p) <= 11.0);
-        let topmost = |scene: &Scene, time: f64, screen: Pos2| {
-            let p = to_scene(screen);
-            hits.iter()
-                .rev()
-                .find(|(index, frame)| {
-                    let shape = &scene.shapes[*index];
-                    if shape.kind == "path"
-                        && let Some(path) = shape.path_at(time, [frame.pose.w, frame.pose.h])
-                        && let Some(vector) = &shape.vector
-                    {
-                        let view = tiny_skia::Transform::from_scale(scale, scale)
-                            .post_translate(canvas.left(), canvas.top());
-                        let fill = vector.fill.as_ref().is_none_or(|fill| fill.mode != PaintMode::None);
-                        let place = frame.transform.post_concat(view);
-                        let width = vector.stroke_at(time, &shape.ease)
-                            .map_or(0.0, |stroke| stroke.width * transform::max_scale(place) / 2.0);
-                        return crate::path_editor::hits(&path, frame.box_transform().post_concat(view), screen, fill, width);
-                    }
-                    frame.transform.invert().is_some_and(|inverse| {
-                        let (x, y) = transform::point(inverse, p.x, p.y);
-                        x.abs() <= frame.pose.w / 2.0 && y.abs() <= frame.pose.h / 2.0
+        let topmost =
+            |scene: &Scene, time: f64, screen: Pos2, renderer: Option<&render::Renderer>| {
+                let p = to_scene(screen);
+                hits.iter()
+                    .rev()
+                    .find(|(index, frame)| {
+                        let shape = &scene.shapes[*index];
+                        let pixel = (screen - snapped.min) * pixels;
+                        if shape.kind == "text"
+                            && renderer.is_some_and(|r| r.text_hit(&shape.id, pixel.x, pixel.y))
+                        {
+                            return true;
+                        }
+                        if on_path(shape) {
+                            return false;
+                        }
+                        if shape.kind == "path"
+                            && let Some(path) = shape.path_at(time, [frame.pose.w, frame.pose.h])
+                            && let Some(vector) = &shape.vector
+                        {
+                            let view = tiny_skia::Transform::from_scale(scale, scale)
+                                .post_translate(canvas.left(), canvas.top());
+                            let fill = vector
+                                .fill
+                                .as_ref()
+                                .is_none_or(|fill| fill.mode != PaintMode::None);
+                            let place = frame.transform.post_concat(view);
+                            let width = vector.stroke_at(time, &shape.ease).map_or(0.0, |stroke| {
+                                stroke.width * transform::max_scale(place) / 2.0
+                            });
+                            return crate::path_editor::hits(
+                                &path,
+                                frame.box_transform().post_concat(view),
+                                screen,
+                                fill,
+                                width,
+                            );
+                        }
+                        frame.transform.invert().is_some_and(|inverse| {
+                            let (x, y) = transform::point(inverse, p.x, p.y);
+                            x.abs() <= frame.pose.w / 2.0 && y.abs() <= frame.pose.h / 2.0
+                        })
                     })
-                })
-                .map(|(index, _)| *index)
-        };
-        let menu_target = response.interact_pointer_pos().and_then(|p| topmost(&self.scene, self.time, p));
+                    .map(|(index, _)| *index)
+            };
+        let menu_target = response
+            .interact_pointer_pos()
+            .and_then(|p| topmost(&self.scene, self.time, p, self.renderer.as_ref()));
         if response.secondary_clicked() {
             let id = menu_target.map(|i| self.scene.shapes[i].id.clone());
             self.select_layer(id, false);
@@ -3315,8 +3374,14 @@ impl Forma {
                         egui::CursorIcon::ResizeNeSw,
                     ][(angle / 45.0).round() as usize % 4],
                 );
-            } else if topmost(&self.scene, self.time, p).is_some() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            } else if let Some(index) = topmost(&self.scene, self.time, p, self.renderer.as_ref()) {
+                if on_path(&self.scene.shapes[index]) {
+                    response
+                        .clone()
+                        .on_hover_text("Change Path offset in the Layer tab to move this text.");
+                } else {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                }
             }
         }
         if response.drag_started_by(egui::PointerButton::Primary) || response.clicked() {
@@ -3361,7 +3426,8 @@ impl Forma {
                         });
                     }
                 } else {
-                    let hit = topmost(&self.scene, self.time, p).map(|i| self.scene.shapes[i].id.clone());
+                    let hit = topmost(&self.scene, self.time, p, self.renderer.as_ref())
+                        .map(|i| self.scene.shapes[i].id.clone());
                     let extend = ui.input(|i| i.modifiers.shift);
                     if extend && response.clicked() {
                         self.select_layer(hit, true);
@@ -3387,7 +3453,9 @@ impl Forma {
                             .iter()
                             .enumerate()
                             .filter(|(j, shape)| {
-                                *j == i || (grouped && self.multi_selected.contains(&shape.id))
+                                !on_path(shape)
+                                    && (*j == i
+                                        || (grouped && self.multi_selected.contains(&shape.id)))
                             })
                             .map(|(j, shape)| {
                                 (
@@ -3398,10 +3466,12 @@ impl Forma {
                             })
                             .collect();
                         poses.sort_by_key(|(depth, ..)| *depth);
-                        self.gesture = Some(Gesture::Move {
-                            start: point,
-                            poses: poses.into_iter().map(|(_, id, pose)| (id, pose)).collect(),
-                        });
+                        if !poses.is_empty() {
+                            self.gesture = Some(Gesture::Move {
+                                start: point,
+                                poses: poses.into_iter().map(|(_, id, pose)| (id, pose)).collect(),
+                            });
+                        }
                     }
                 }
                 if response.clicked() {
@@ -3571,6 +3641,18 @@ impl Forma {
                 if let Some(vector) = &shape.vector {
                     rows.extend(vector.properties().into_iter().map(|p| Row::Property(index, Lane::Vector(p))));
                 }
+                if let Some(text) = &shape.text_layout {
+                    rows.extend(text.style_lanes().map(|lane| Row::Property(index, lane)));
+                    for animator in &text.animators {
+                        rows.push(Row::TextAnimator(index, animator.id));
+                        if self.key_editor.animator_expanded(&shape.id, animator.id) {
+                            rows.extend(
+                                text.animator_lanes(animator.id)
+                                    .map(|lane| Row::Property(index, lane)),
+                            );
+                        }
+                    }
+                }
                 for (number, mask) in shape.masks.iter().enumerate() {
                     rows.push(Row::Mask(index, mask.id, number + 1));
                     if self.key_editor.mask_expanded(&shape.id, mask.id) {
@@ -3643,6 +3725,7 @@ impl Forma {
         });
         let rect = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
         self.key_editor.begin_frame(&self.scene);
+        let reveal_animator = self.key_editor.animator_to_reveal.take();
         let plot = Rect::from_min_max(
             pos2(rect.left() + LABEL_WIDTH, rect.top()),
             pos2(
@@ -3735,6 +3818,13 @@ impl Forma {
                             if let (Row::Mask(index, mask, _), Some((id, reveal))) =
                                 (row, reveal_mask)
                                 && mask == reveal
+                                && self.scene.shapes[*index].id == *id
+                            {
+                                ui.scroll_to_rect(line, Some(egui::Align::TOP));
+                            }
+                            if let (Row::TextAnimator(index, animator), Some((id, reveal))) =
+                                (row, reveal_animator.as_ref())
+                                && animator == reveal
                                 && self.scene.shapes[*index].id == *id
                             {
                                 ui.scroll_to_rect(line, Some(egui::Align::TOP));
@@ -3876,6 +3966,33 @@ impl Forma {
                 }
             }
             Row::Property(..) => {}
+            Row::TextAnimator(index, animator) => {
+                let shape = &self.scene.shapes[*index];
+                let Some(animation) = shape
+                    .text_layout
+                    .as_ref()
+                    .and_then(|text| text.animator(*animator))
+                else {
+                    return;
+                };
+                let id = shape.id.clone();
+                let open = self.key_editor.animator_expanded(&id, *animator);
+                let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(140.0, 32.0));
+                let arrow = if open { "\u{25be}" } else { "\u{25b8}" };
+                if ui
+                    .put(
+                        label,
+                        egui::Button::selectable(open, format!("{arrow}  {}", animation.name))
+                            .truncate(),
+                    )
+                    .on_hover_text(format!("Show or hide lanes for {}", animation.name))
+                    .clicked()
+                {
+                    self.key_editor.toggle_animator(id.clone(), *animator);
+                    self.select_layer(Some(id), false);
+                    self.tab = Tab::Animate;
+                }
+            }
             Row::Mask(index, mask, number) => {
                 let id = self.scene.shapes[*index].id.clone();
                 let open = self.key_editor.mask_expanded(&id, *mask);

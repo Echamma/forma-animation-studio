@@ -1,6 +1,7 @@
 use crate::compositing::{MaskKey, MaskProperty};
 use crate::model::{ColorKey, Key, Pose, Shape, ease_at, hundredths, is_linked};
 use crate::shape_style::{VectorKey, VectorProperty, VectorValue};
+use crate::text_animator::{TextKey, TextLane};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -40,6 +41,7 @@ pub enum Lane {
     Color,
     Mask(u64, MaskProperty),
     Vector(VectorProperty),
+    Text(TextLane),
 }
 
 impl Lane {
@@ -60,6 +62,7 @@ impl Lane {
             Self::Color => "Color",
             Self::Mask(_, property) => property.label(),
             Self::Vector(property) => property.label(),
+            Self::Text(lane) => lane.property().label(),
         }
     }
 
@@ -72,6 +75,7 @@ impl Lane {
             Self::Color => &["Red", "Green", "Blue"],
             Self::Mask(_, property) => property.channels(),
             Self::Vector(property) => property.channels(),
+            Self::Text(lane) => lane.property().channels(),
         }
     }
 
@@ -82,6 +86,7 @@ impl Lane {
             Self::Mask(id, property) => shape.mask(id).map_or(0.0, |mask| {
                 property.clamp(mask.values(property, t, &shape.ease)[channel])
             }),
+            Self::Text(lane) => lane.values(shape, t)[channel],
             Self::Vector(VectorProperty::Path) => t as f32,
             Self::Vector(property) => shape.vector.as_ref()
                 .and_then(|vector| vector.numbers_at(property, t, &shape.ease))
@@ -91,6 +96,10 @@ impl Lane {
 
     pub(crate) fn exists_on(self, shape: &Shape) -> bool {
         match self {
+            Self::Text(lane) => shape
+                .text_layout
+                .as_ref()
+                .is_some_and(|text| lane.exists(text)),
             Self::Mask(id, _) => shape.mask(id).is_some(),
             Self::Vector(property) => shape.vector.as_ref().is_some_and(|vector| vector.exists(property)),
             _ => true,
@@ -163,6 +172,7 @@ pub enum LaneKey {
     Color(ColorKey),
     Mask(u64, MaskKey),
     Vector(VectorKey),
+    Text(TextLane, TextKey),
 }
 
 impl LaneKey {
@@ -172,6 +182,7 @@ impl LaneKey {
             Self::Color(_) => Lane::Color,
             Self::Mask(id, key) => Lane::Mask(*id, key.property),
             Self::Vector(key) => Lane::Vector(key.property),
+            Self::Text(lane, _) => Lane::Text(*lane),
         }
     }
 
@@ -181,6 +192,7 @@ impl LaneKey {
             Self::Color(key) => key.t,
             Self::Mask(_, key) => key.t,
             Self::Vector(key) => key.t,
+            Self::Text(_, key) => key.t,
         }
     }
 
@@ -189,6 +201,7 @@ impl LaneKey {
             Self::Pose(property, key) => property.values(Pose::from(key))[channel],
             Self::Color(key) => rgb(&key.color)[channel],
             Self::Mask(_, key) => key.values[channel],
+            Self::Text(_, key) => key.value[channel],
             Self::Vector(key) => match &key.value {
                 VectorValue::Path(_) => key.t as f32,
                 VectorValue::Numbers(values) => values[channel],
@@ -214,6 +227,7 @@ impl LaneKey {
                 key.color = format!("#{r:02x}{g:02x}{b:02x}");
             }
             Self::Mask(_, key) => key.values[channel] = key.property.clamp(value),
+            Self::Text(lane, key) => key.value[channel] = lane.property().clamp(value),
             Self::Vector(key) => {
                 if let VectorValue::Numbers(values) = &mut key.value {
                     values[channel] = key.property.clamp(channel, value);
@@ -228,6 +242,7 @@ impl LaneKey {
             Self::Color(key) => (&key.ease, key.curve),
             Self::Mask(_, key) => (&key.ease, key.curve),
             Self::Vector(key) => (&key.ease, key.curve),
+            Self::Text(_, key) => (&key.ease, key.curve),
         };
         (ease.as_deref().unwrap_or(default), curve)
     }
@@ -238,6 +253,7 @@ impl LaneKey {
             Self::Color(key) => (&mut key.ease, &mut key.curve),
             Self::Mask(_, key) => (&mut key.ease, &mut key.curve),
             Self::Vector(key) => (&mut key.ease, &mut key.curve),
+            Self::Text(_, key) => (&mut key.ease, &mut key.curve),
         };
         *ease = Some(kind.into());
         *curve = handles;
@@ -269,6 +285,9 @@ impl LaneKey {
     pub(crate) fn for_lane(mut self, lane: Lane) -> Self {
         if let (Self::Mask(id, _), Lane::Mask(target, _)) = (&mut self, lane) {
             *id = target;
+        }
+        if let (Self::Text(source, _), Lane::Text(target)) = (&mut self, lane) {
+            *source = target;
         }
         self
     }
@@ -364,8 +383,21 @@ impl Shape {
                 .cloned()
                 .map(|key| LaneKey::Mask(id, key))
                 .collect(),
-            Lane::Vector(property) => self.vector.iter().flat_map(|vector| &vector.keys)
-                .filter(|key| key.property == property).cloned().map(LaneKey::Vector).collect(),
+            Lane::Text(lane) => lane
+                .track(self)
+                .into_iter()
+                .flat_map(|track| &track.keys)
+                .cloned()
+                .map(|key| LaneKey::Text(lane, key))
+                .collect(),
+            Lane::Vector(property) => self
+                .vector
+                .iter()
+                .flat_map(|vector| &vector.keys)
+                .filter(|key| key.property == property)
+                .cloned()
+                .map(LaneKey::Vector)
+                .collect(),
         }
     }
 
@@ -391,7 +423,17 @@ impl Shape {
                 .find(|key| key.property == property && same_time(key.t, t))
                 .cloned()
                 .map(|key| LaneKey::Mask(id, key)),
-            Lane::Vector(property) => self.vector.as_ref()?.keys.iter().rev()
+            Lane::Text(lane) => lane
+                .track(self)?
+                .key(t)
+                .cloned()
+                .map(|key| LaneKey::Text(lane, key)),
+            Lane::Vector(property) => self
+                .vector
+                .as_ref()?
+                .keys
+                .iter()
+                .rev()
                 .find(|key| key.property == property && same_time(key.t, t))
                 .cloned().map(LaneKey::Vector),
         }
@@ -449,6 +491,10 @@ impl Shape {
                         ),
                     );
                 }
+            }
+            Lane::Text(lane) => {
+                let key = TextKey::new(at, lane.values(self, t));
+                self.put_lane_key(at, LaneKey::Text(lane, key));
             }
             Lane::Vector(property) => {
                 let value = if property == VectorProperty::Path {
@@ -511,6 +557,12 @@ impl Shape {
                     }
                 }
             }
+            Lane::Text(lane) => {
+                let ease = self.ease.clone();
+                if let Some(track) = lane.track_mut(self) {
+                    track.remove(t, lane.property(), &ease);
+                }
+            }
             Lane::Vector(property) => {
                 if let Some(vector) = &mut self.vector {
                     let value = vector.value_at(property, t, &self.ease);
@@ -558,6 +610,11 @@ impl Shape {
                     mask.put_key(key, t);
                 }
             }
+            LaneKey::Text(lane, key) => {
+                if let Some(track) = lane.track_mut(self) {
+                    track.put(t, key, lane.property());
+                }
+            }
             LaneKey::Vector(key) => {
                 if let Some(vector) = &mut self.vector {
                     vector.key(key, t);
@@ -601,6 +658,10 @@ impl Shape {
             Lane::Mask(id, _) => self.mask(id).map(|mask| (id, mask.rest)),
             _ => None,
         };
+        let text_rest = match lane {
+            Lane::Text(track) => track.track(self).map(|key| (track, key.rest)),
+            _ => None,
+        };
         for key in &selected {
             self.remove_lane_key(lane, key.time());
         }
@@ -617,6 +678,11 @@ impl Shape {
             && let Some(mask) = self.mask_mut(id)
         {
             mask.rest = rest;
+        }
+        if let Some((track, rest)) = text_rest
+            && let Some(track) = track.track_mut(self)
+        {
+            track.rest = rest;
         }
         true
     }

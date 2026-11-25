@@ -119,6 +119,8 @@ enum Drag {
 pub(crate) struct KeyEditor {
     pub expanded: HashSet<String>,
     expanded_masks: HashMap<String, HashSet<u64>>,
+    expanded_animators: HashSet<(String, u64)>,
+    pub animator_to_reveal: Option<(String, u64)>,
     graph: bool,
     lane_focus: bool,
     graph_tracks: HashSet<Track>,
@@ -144,6 +146,15 @@ impl KeyEditor {
         self.selected.retain(|pick| key_at(scene, pick).is_some());
         self.graph_tracks
             .retain(|track| track_shape(scene, track).is_some());
+        self.expanded_animators.retain(|(id, animator)| {
+            scene
+                .shapes
+                .iter()
+                .find(|shape| shape.id == *id)
+                .and_then(|shape| shape.text_layout.as_ref())
+                .and_then(|text| text.animator(*animator))
+                .is_some()
+        });
         self.expanded_masks.retain(|id, masks| {
             if let Some(shape) = scene.shapes.iter().find(|s| s.id == *id) {
                 masks.retain(|id| shape.mask(*id).is_some());
@@ -315,6 +326,25 @@ impl KeyEditor {
         }
     }
 
+    pub fn animator_expanded(&self, layer: &str, animator: u64) -> bool {
+        self.expanded_animators
+            .iter()
+            .any(|(id, a)| id == layer && *a == animator)
+    }
+
+    pub fn reveal_animator(&mut self, layer: String, animator: u64) {
+        self.expanded.insert(layer.clone());
+        self.expanded_animators.insert((layer.clone(), animator));
+        self.animator_to_reveal = Some((layer, animator));
+    }
+
+    pub fn toggle_animator(&mut self, layer: String, animator: u64) {
+        let entry = (layer, animator);
+        if !self.expanded_animators.remove(&entry) {
+            self.expanded_animators.insert(entry);
+        }
+    }
+
     pub fn row(
         &mut self,
         ui: &mut Ui,
@@ -338,8 +368,10 @@ impl KeyEditor {
             _ => lane.label().to_owned(),
         };
         let label_response = ui
-            .put(label, egui::Button::selectable(active, title))
-            .on_hover_text("Select this lane for the graph. Shift or Ctrl selects several lanes.");
+            .put(label, egui::Button::selectable(active, &title).truncate())
+            .on_hover_text(format!(
+                "{title}. Select for the graph. Shift or Ctrl selects several lanes."
+            ));
         let mut selected_layer = label_response.clicked();
         if selected_layer {
             self.lane_focus = true;
@@ -639,6 +671,7 @@ impl KeyEditor {
                         let value = v0 + (v1 - v0) * ease_at(kind, f, curve);
                         let value = match track.lane {
                             Lane::Mask(_, property) => property.clamp(value),
+                            Lane::Text(lane) => lane.property().clamp(value),
                             Lane::Vector(property) if property != crate::shape_style::VectorProperty::Path => {
                                 property.clamp(channel, value)
                             }
@@ -967,6 +1000,9 @@ impl KeyEditor {
                         let track = self.graph_tracks.iter().next().unwrap();
                         let compatible = match key {
                             LaneKey::Color(_) | LaneKey::Vector(_) => track.lane == source.lane,
+                            LaneKey::Text(lane, _) => matches!(track.lane, Lane::Text(other)
+                                if std::mem::discriminant(lane) == std::mem::discriminant(&other)
+                                    && lane.property() == other.property()),
                             LaneKey::Mask(_, key) => {
                                 matches!(track.lane, Lane::Mask(_, property) if property == key.property)
                             }
@@ -1053,13 +1089,18 @@ impl KeyDrag {
             .filter(|s| self.picks.iter().any(|p| p.track.layer == s.id))
         {
             let mut shape = live.clone();
-            let lanes =
-                Lane::ALL
-                    .into_iter()
-                    .chain(live.masks.iter().flat_map(|mask| {
-                        MaskProperty::ALL.map(|property| Lane::Mask(mask.id, property))
-                    }))
-                    .chain(live.vector.iter().flat_map(|vector| vector.properties()).map(Lane::Vector));
+            let lanes = Lane::ALL
+                .into_iter()
+                .chain(live.masks.iter().flat_map(|mask| {
+                    MaskProperty::ALL.map(|property| Lane::Mask(mask.id, property))
+                }))
+                .chain(
+                    live.vector
+                        .iter()
+                        .flat_map(|vector| vector.properties())
+                        .map(Lane::Vector),
+                )
+                .chain(live.text_layout.iter().flat_map(|text| text.lanes()));
             for lane in lanes {
                 let times: Vec<_> = self
                     .picks
