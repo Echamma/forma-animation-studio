@@ -273,7 +273,7 @@ pub fn dispatch(e: &mut Editor, name: &str, args: &Value) -> Result<Outcome, Too
                 (e.scene.height as f64 * ratio).round().max(1.0) as u32,
             );
             let png = png_bytes(
-                &render::frame_sized(e.scene, e.place, at, size)
+                &render::preview_sized(e.scene, e.place, at, size)
                     .map_err(|e| fail("EXPORT_FAILED", e))?,
             )?;
             done(

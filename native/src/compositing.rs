@@ -106,6 +106,9 @@ impl Scene {
             let Some(shape) = self.shapes.iter().find(|shape| shape.id == id) else {
                 return id != source;
             };
+            if shape.kind == "adjustment" {
+                return false;
+            }
             next = shape
                 .track_matte
                 .as_ref()
@@ -156,6 +159,7 @@ impl MatteLinks {
             .shapes
             .iter()
             .enumerate()
+            .filter(|(_, shape)| shape.kind != "adjustment")
             .map(|(i, shape)| (shape.id.as_str(), i))
             .collect();
         let mut sources: Vec<_> = scene

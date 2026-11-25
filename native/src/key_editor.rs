@@ -120,6 +120,8 @@ pub(crate) struct KeyEditor {
     pub expanded: HashSet<String>,
     expanded_masks: HashMap<String, HashSet<u64>>,
     expanded_animators: HashSet<(String, u64)>,
+    expanded_effects: HashSet<String>,
+    pub effects_to_reveal: Option<String>,
     pub animator_to_reveal: Option<(String, u64)>,
     graph: bool,
     lane_focus: bool,
@@ -155,6 +157,8 @@ impl KeyEditor {
                 .and_then(|text| text.animator(*animator))
                 .is_some()
         });
+        self.expanded_effects
+            .retain(|id| scene.shapes.iter().any(|shape| shape.id == *id));
         self.expanded_masks.retain(|id, masks| {
             if let Some(shape) = scene.shapes.iter().find(|s| s.id == *id) {
                 masks.retain(|id| shape.mask(*id).is_some());
@@ -326,6 +330,22 @@ impl KeyEditor {
         }
     }
 
+    pub fn effects_expanded(&self, layer: &str) -> bool {
+        self.expanded_effects.contains(layer)
+    }
+
+    pub fn reveal_effects(&mut self, layer: String) {
+        self.expanded.insert(layer.clone());
+        self.expanded_effects.insert(layer.clone());
+        self.effects_to_reveal = Some(layer);
+    }
+
+    pub fn toggle_effects(&mut self, layer: String) {
+        if !self.expanded_effects.remove(&layer) {
+            self.expanded_effects.insert(layer);
+        }
+    }
+
     pub fn animator_expanded(&self, layer: &str, animator: u64) -> bool {
         self.expanded_animators
             .iter()
@@ -364,7 +384,13 @@ impl KeyEditor {
         let add = Rect::from_min_size(label.right_top() + vec2(3.0, 0.0), vec2(50.0, 32.0));
         let active = self.graph_tracks.contains(&track);
         let title = match lane {
-            Lane::Vector(crate::shape_style::VectorProperty::GradientStop(_, i)) => format!("{} {}", lane.label(), i + 1),
+            Lane::Vector(crate::shape_style::VectorProperty::GradientStop(_, i)) => {
+                format!("{} {}", lane.label(), i + 1)
+            }
+            Lane::Effect(id, parameter) => scene.shapes[index].effect(id).map_or_else(
+                || parameter.label().to_owned(),
+                |effect| format!("{} ? {}", effect.kind.label(), parameter.label()),
+            ),
             _ => lane.label().to_owned(),
         };
         let label_response = ui
@@ -394,6 +420,9 @@ impl KeyEditor {
         {
             let time = hundredths(*playhead);
             scene.shapes[index].add_lane_key(lane, time);
+            if matches!(lane, Lane::Effect(..)) {
+                scene.duration = scene.duration.max(time);
+            }
             self.select(&track, time, extend(ui), false);
             selected_layer = true;
             *playing = false;
@@ -672,6 +701,7 @@ impl KeyEditor {
                         let value = match track.lane {
                             Lane::Mask(_, property) => property.clamp(value),
                             Lane::Text(lane) => lane.property().clamp(value),
+                            Lane::Effect(_, parameter) => parameter.clamp(value),
                             Lane::Vector(property) if property != crate::shape_style::VectorProperty::Path => {
                                 property.clamp(channel, value)
                             }
@@ -1003,6 +1033,9 @@ impl KeyEditor {
                             LaneKey::Text(lane, _) => matches!(track.lane, Lane::Text(other)
                                 if std::mem::discriminant(lane) == std::mem::discriminant(&other)
                                     && lane.property() == other.property()),
+                            LaneKey::Effect(_, parameter, _) => {
+                                matches!(track.lane, Lane::Effect(_, other) if other == *parameter)
+                            }
                             LaneKey::Mask(_, key) => {
                                 matches!(track.lane, Lane::Mask(_, property) if property == key.property)
                             }
@@ -1100,7 +1133,14 @@ impl KeyDrag {
                         .flat_map(|vector| vector.properties())
                         .map(Lane::Vector),
                 )
-                .chain(live.text_layout.iter().flat_map(|text| text.lanes()));
+                .chain(live.text_layout.iter().flat_map(|text| text.lanes()))
+                .chain(live.effects.iter().flat_map(|effect| {
+                    effect
+                        .kind
+                        .controls()
+                        .iter()
+                        .map(|control| Lane::Effect(effect.id, control.parameter))
+                }));
             for lane in lanes {
                 let times: Vec<_> = self
                     .picks

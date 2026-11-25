@@ -8,6 +8,10 @@ pub mod automation;
 pub mod bridge;
 pub mod compositing;
 pub mod contract;
+pub mod effects;
+mod effect_render;
+mod effect_panel;
+mod effect_svg;
 mod key_editor;
 mod mask_editor;
 mod mask_render;
@@ -16,6 +20,7 @@ pub mod mcp;
 pub mod media;
 pub mod model;
 pub mod motion;
+pub mod motion_blur;
 pub mod paths;
 mod path_editor;
 mod project_keys;
@@ -38,6 +43,7 @@ pub mod video;
 pub mod videos;
 mod vector_render;
 mod vector_svg;
+mod value_track;
 
 use canopy_ui::{Accent, AppDescriptor, CanopyApp, Place, SharedFile};
 

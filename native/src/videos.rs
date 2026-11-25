@@ -3,9 +3,12 @@
 //! StreamCuts' preview does. Frames are decoded at the size the layer is shown.
 
 use crate::media;
-use crate::model::Scene;
+use crate::model::{Scene, Shape};
+use crate::motion_blur;
 use crate::render::{self, Renderer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, channel, sync_channel};
 use tiny_skia::Pixmap;
 
@@ -23,6 +26,7 @@ pub struct Videos {
     shown: HashMap<String, Key>,
     stills: HashMap<String, (Key, Receiver<Option<Pixmap>>)>,
     streams: HashMap<String, Stream>,
+    shutter: HashMap<String, ShutterPreview>,
 }
 
 /// Frames from one FFmpeg run: frame `n` belongs at scene time `from + n / 30`.
@@ -127,7 +131,182 @@ impl Videos {
                 waiting = true;
             }
         }
+        self.update_shutter(scene, renderer, time, scale) || waiting
+    }
+
+    fn update_shutter(
+        &mut self,
+        scene: &Scene,
+        renderer: &Renderer,
+        time: f64,
+        scale: f32,
+    ) -> bool {
+        let fps = motion_blur::DEFAULT_FPS;
+        let exposure = scene
+            .motion_blur_preview
+            .then(|| motion_blur::exposure(scene, time, fps))
+            .unwrap_or_default();
+        let mut showing = HashSet::new();
+        let mut waiting = false;
+        for shape in scene
+            .shapes
+            .iter()
+            .filter(|shape| shape.kind == "video" && shape.motion_blur)
+        {
+            let visible: Vec<_> = exposure
+                .iter()
+                .copied()
+                .filter(|&t| shape.visible(t, scene.duration))
+                .collect();
+            let (Some(&first), Some(&last), Some(file), Some(duration)) = (
+                visible.first(),
+                visible.last(),
+                renderer.video(&shape.id),
+                shape
+                    .extra
+                    .get("mediaDuration")
+                    .and_then(|value| value.as_f64()),
+            ) else {
+                continue;
+            };
+            let (w, h) = visible
+                .iter()
+                .map(|&t| scene.render_pose(shape, t))
+                .fold((2.0_f32, 2.0_f32), |(w, h), pose| {
+                    (w.max(pose.w * scale), h.max(pose.h * scale))
+                });
+            let source = ShutterSource {
+                file: file.to_owned(),
+                duration,
+                size: (
+                    w.round().clamp(2.0, 1920.0) as u32,
+                    h.round().clamp(2.0, 1920.0) as u32,
+                ),
+                clip_start: shape.clip_start(),
+                media_start: shape.media_time(shape.clip_start(), duration),
+            };
+            showing.insert(shape.id.as_str());
+            let start = media::ShutterReader::step(source.clip_start, first, fps);
+            let end = media::ShutterReader::step(source.clip_start, last, fps);
+            let preview = self
+                .shutter
+                .entry(shape.id.clone())
+                .or_insert_with(|| ShutterPreview::start(source.clone(), shape.clone()));
+            if preview.source != source {
+                *preview = ShutterPreview::start(source, shape.clone());
+                self.generation += 1;
+            }
+            let result = preview.update((start, end));
+            waiting |= result.0;
+            if result.1 {
+                self.generation += 1;
+            }
+        }
+        let before = self.shutter.len();
+        self.shutter.retain(|id, _| showing.contains(id.as_str()));
+        if before != self.shutter.len() {
+            self.generation += 1;
+        }
         waiting
+    }
+
+    pub(crate) fn sample(&self, time: f64) -> Option<render::SampleFrames> {
+        if self.shutter.is_empty() {
+            return None;
+        }
+        Some(
+            self.shutter
+                .iter()
+                .filter_map(|(id, preview)| {
+                    let step = media::ShutterReader::step(
+                        preview.source.clip_start,
+                        time,
+                        motion_blur::DEFAULT_FPS,
+                    );
+                    Some((id.clone(), preview.pixels.get(&step)?.clone()))
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct ShutterSource {
+    file: PathBuf,
+    duration: f64,
+    size: (u32, u32),
+    clip_start: f64,
+    media_start: f64,
+}
+
+type ShutterRange = (i64, i64);
+type ShutterPictures = HashMap<i64, Arc<Pixmap>>;
+
+struct ShutterPreview {
+    source: ShutterSource,
+    request: SyncSender<ShutterRange>,
+    response: Receiver<ShutterPictures>,
+    pending: bool,
+    requested: Option<ShutterRange>,
+    pixels: ShutterPictures,
+}
+
+impl ShutterPreview {
+    fn start(source: ShutterSource, shape: Shape) -> Self {
+        let (request, incoming) = sync_channel::<ShutterRange>(1);
+        let (outgoing, response) = channel();
+        let worker = source.clone();
+        std::thread::spawn(move || {
+            let mut reader = None;
+            let fps = motion_blur::DEFAULT_FPS;
+            while let Ok((start, end)) = incoming.recv() {
+                let mut pictures = HashMap::new();
+                for step in start..=end {
+                    let time = worker.clip_start + step as f64 / f64::from(fps.max(60));
+                    let source = (worker.file.as_path(), worker.duration, worker.size);
+                    match media::ShutterReader::at(&mut reader, source, &shape, time, fps) {
+                        Ok(picture) => {
+                            pictures.insert(step, picture);
+                        }
+                        Err(_) => {
+                            reader = None;
+                            break;
+                        }
+                    }
+                }
+                if outgoing.send(pictures).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            source,
+            request,
+            response,
+            pending: false,
+            requested: None,
+            pixels: HashMap::new(),
+        }
+    }
+
+    fn update(&mut self, range: ShutterRange) -> (bool, bool) {
+        let mut received = false;
+        if self.pending {
+            match self.response.try_recv() {
+                Ok(pictures) => {
+                    self.pixels = pictures;
+                    self.pending = false;
+                    received = true;
+                }
+                Err(TryRecvError::Empty) => return (true, false),
+                Err(TryRecvError::Disconnected) => return (false, false),
+            }
+        }
+        if self.requested != Some(range) {
+            self.pending = self.request.try_send(range).is_ok();
+            self.requested = Some(range);
+        }
+        (self.pending, received)
     }
 }
 

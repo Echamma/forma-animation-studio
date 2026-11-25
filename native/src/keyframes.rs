@@ -1,7 +1,9 @@
 use crate::compositing::{MaskKey, MaskProperty};
+use crate::effects::Parameter;
 use crate::model::{ColorKey, Key, Pose, Shape, ease_at, hundredths, is_linked};
 use crate::shape_style::{VectorKey, VectorProperty, VectorValue};
 use crate::text_animator::{TextKey, TextLane};
+use crate::value_track::ValueKey;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,6 +44,7 @@ pub enum Lane {
     Mask(u64, MaskProperty),
     Vector(VectorProperty),
     Text(TextLane),
+    Effect(u64, Parameter),
 }
 
 impl Lane {
@@ -63,6 +66,7 @@ impl Lane {
             Self::Mask(_, property) => property.label(),
             Self::Vector(property) => property.label(),
             Self::Text(lane) => lane.property().label(),
+            Self::Effect(_, parameter) => parameter.label(),
         }
     }
 
@@ -76,6 +80,7 @@ impl Lane {
             Self::Mask(_, property) => property.channels(),
             Self::Vector(property) => property.channels(),
             Self::Text(lane) => lane.property().channels(),
+            Self::Effect(_, parameter) => parameter.channels(),
         }
     }
 
@@ -87,6 +92,9 @@ impl Lane {
                 property.clamp(mask.values(property, t, &shape.ease)[channel])
             }),
             Self::Text(lane) => lane.values(shape, t)[channel],
+            Self::Effect(id, parameter) => shape.effect(id).map_or(0.0, |effect| {
+                effect.values(parameter, t, &shape.ease)[channel]
+            }),
             Self::Vector(VectorProperty::Path) => t as f32,
             Self::Vector(property) => shape.vector.as_ref()
                 .and_then(|vector| vector.numbers_at(property, t, &shape.ease))
@@ -101,7 +109,13 @@ impl Lane {
                 .as_ref()
                 .is_some_and(|text| lane.exists(text)),
             Self::Mask(id, _) => shape.mask(id).is_some(),
-            Self::Vector(property) => shape.vector.as_ref().is_some_and(|vector| vector.exists(property)),
+            Self::Effect(id, parameter) => shape
+                .effect(id)
+                .is_some_and(|effect| effect.control(parameter).is_some()),
+            Self::Vector(property) => shape
+                .vector
+                .as_ref()
+                .is_some_and(|vector| vector.exists(property)),
             _ => true,
         }
     }
@@ -173,6 +187,7 @@ pub enum LaneKey {
     Mask(u64, MaskKey),
     Vector(VectorKey),
     Text(TextLane, TextKey),
+    Effect(u64, Parameter, ValueKey),
 }
 
 impl LaneKey {
@@ -183,6 +198,7 @@ impl LaneKey {
             Self::Mask(id, key) => Lane::Mask(*id, key.property),
             Self::Vector(key) => Lane::Vector(key.property),
             Self::Text(lane, _) => Lane::Text(*lane),
+            Self::Effect(id, parameter, _) => Lane::Effect(*id, *parameter),
         }
     }
 
@@ -192,7 +208,7 @@ impl LaneKey {
             Self::Color(key) => key.t,
             Self::Mask(_, key) => key.t,
             Self::Vector(key) => key.t,
-            Self::Text(_, key) => key.t,
+            Self::Text(_, key) | Self::Effect(_, _, key) => key.t,
         }
     }
 
@@ -201,7 +217,7 @@ impl LaneKey {
             Self::Pose(property, key) => property.values(Pose::from(key))[channel],
             Self::Color(key) => rgb(&key.color)[channel],
             Self::Mask(_, key) => key.values[channel],
-            Self::Text(_, key) => key.value[channel],
+            Self::Text(_, key) | Self::Effect(_, _, key) => key.value[channel],
             Self::Vector(key) => match &key.value {
                 VectorValue::Path(_) => key.t as f32,
                 VectorValue::Numbers(values) => values[channel],
@@ -228,6 +244,7 @@ impl LaneKey {
             }
             Self::Mask(_, key) => key.values[channel] = key.property.clamp(value),
             Self::Text(lane, key) => key.value[channel] = lane.property().clamp(value),
+            Self::Effect(_, parameter, key) => key.value[channel] = (*parameter).clamp(value),
             Self::Vector(key) => {
                 if let VectorValue::Numbers(values) = &mut key.value {
                     values[channel] = key.property.clamp(channel, value);
@@ -242,7 +259,7 @@ impl LaneKey {
             Self::Color(key) => (&key.ease, key.curve),
             Self::Mask(_, key) => (&key.ease, key.curve),
             Self::Vector(key) => (&key.ease, key.curve),
-            Self::Text(_, key) => (&key.ease, key.curve),
+            Self::Text(_, key) | Self::Effect(_, _, key) => (&key.ease, key.curve),
         };
         (ease.as_deref().unwrap_or(default), curve)
     }
@@ -253,7 +270,7 @@ impl LaneKey {
             Self::Color(key) => (&mut key.ease, &mut key.curve),
             Self::Mask(_, key) => (&mut key.ease, &mut key.curve),
             Self::Vector(key) => (&mut key.ease, &mut key.curve),
-            Self::Text(_, key) => (&mut key.ease, &mut key.curve),
+            Self::Text(_, key) | Self::Effect(_, _, key) => (&mut key.ease, &mut key.curve),
         };
         *ease = Some(kind.into());
         *curve = handles;
@@ -288,6 +305,9 @@ impl LaneKey {
         }
         if let (Self::Text(source, _), Lane::Text(target)) = (&mut self, lane) {
             *source = target;
+        }
+        if let (Self::Effect(id, _, _), Lane::Effect(target, _)) = (&mut self, lane) {
+            *id = target;
         }
         self
     }
@@ -390,6 +410,14 @@ impl Shape {
                 .cloned()
                 .map(|key| LaneKey::Text(lane, key))
                 .collect(),
+            Lane::Effect(id, parameter) => self
+                .effect(id)
+                .and_then(|effect| effect.tracks.get(&parameter))
+                .into_iter()
+                .flat_map(|track| &track.keys)
+                .cloned()
+                .map(|key| LaneKey::Effect(id, parameter, key))
+                .collect(),
             Lane::Vector(property) => self
                 .vector
                 .iter()
@@ -428,6 +456,13 @@ impl Shape {
                 .key(t)
                 .cloned()
                 .map(|key| LaneKey::Text(lane, key)),
+            Lane::Effect(id, parameter) => self
+                .effect(id)?
+                .tracks
+                .get(&parameter)?
+                .key(t)
+                .cloned()
+                .map(|key| LaneKey::Effect(id, parameter, key)),
             Lane::Vector(property) => self
                 .vector
                 .as_ref()?
@@ -496,6 +531,12 @@ impl Shape {
                 let key = TextKey::new(at, lane.values(self, t));
                 self.put_lane_key(at, LaneKey::Text(lane, key));
             }
+            Lane::Effect(id, parameter) => {
+                if let Some(effect) = self.effect(id) {
+                    let key = ValueKey::new(at, effect.values(parameter, t, &self.ease));
+                    self.put_lane_key(at, LaneKey::Effect(id, parameter, key));
+                }
+            }
             Lane::Vector(property) => {
                 let value = if property == VectorProperty::Path {
                     let pose = self.pose(t);
@@ -563,6 +604,12 @@ impl Shape {
                     track.remove(t, lane.property(), &ease);
                 }
             }
+            Lane::Effect(id, parameter) => {
+                let ease = self.ease.clone();
+                if let Some(effect) = self.effect_mut(id) {
+                    effect.remove(parameter, t, &ease);
+                }
+            }
             Lane::Vector(property) => {
                 if let Some(vector) = &mut self.vector {
                     let value = vector.value_at(property, t, &self.ease);
@@ -615,6 +662,11 @@ impl Shape {
                     track.put(t, key, lane.property());
                 }
             }
+            LaneKey::Effect(id, parameter, key) => {
+                if let Some(effect) = self.effect_mut(id) {
+                    effect.put(parameter, t, key);
+                }
+            }
             LaneKey::Vector(key) => {
                 if let Some(vector) = &mut self.vector {
                     vector.key(key, t);
@@ -662,6 +714,13 @@ impl Shape {
             Lane::Text(track) => track.track(self).map(|key| (track, key.rest)),
             _ => None,
         };
+        let effect_rest = match lane {
+            Lane::Effect(id, parameter) => self
+                .effect(id)
+                .and_then(|effect| effect.tracks.get(&parameter))
+                .map(|track| (id, parameter, track.rest)),
+            _ => None,
+        };
         for key in &selected {
             self.remove_lane_key(lane, key.time());
         }
@@ -681,6 +740,13 @@ impl Shape {
         }
         if let Some((track, rest)) = text_rest
             && let Some(track) = track.track_mut(self)
+        {
+            track.rest = rest;
+        }
+        if let Some((id, parameter, rest)) = effect_rest
+            && let Some(track) = self
+                .effect_mut(id)
+                .and_then(|effect| effect.tracks.get_mut(&parameter))
         {
             track.rest = rest;
         }

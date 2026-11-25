@@ -228,7 +228,15 @@ fn render_video(
         let info = media::probe(file)?;
         let times = (0..frames)
             .take_while(|_| !cancel.load(Ordering::Relaxed))
-            .map(|index| index as f64 / f64::from(settings.fps));
+            .flat_map(|index| {
+                let time = index as f64 / f64::from(settings.fps);
+                let shutter = if shape.motion_blur {
+                    crate::motion_blur::exposure(scene, time, settings.fps)
+                } else {
+                    Vec::new()
+                };
+                std::iter::once(time).chain(shutter)
+            });
         let decode_size =
             render::limit_decode_size(render::video_size(scene, shape, size, times), info);
         if cancel.load(Ordering::Relaxed) {
@@ -268,11 +276,23 @@ fn render_video(
     });
     // Each video layer on screen reads its frames from one FFmpeg run that started where its clip comes in.
     let mut readers: HashMap<String, media::Frames> = HashMap::new();
+    let mut shutter_readers: HashMap<String, Option<media::ShutterReader>> = HashMap::new();
     let mut frame_at = |t: f64| -> Result<tiny_skia::Pixmap, String> {
+        let shutter = crate::motion_blur::exposure(scene, t, settings.fps);
+        let sampled = !shutter.is_empty();
+        if let Some(&first) = shutter.first() {
+            shutter_readers.retain(|id, _| {
+                scene.shapes.iter().any(|shape| {
+                    &shape.id == id && first <= shape.out_time.unwrap_or(scene.duration)
+                })
+            });
+        }
         let showing: Vec<_> = scene
             .shapes
             .iter()
-            .filter(|s| s.kind == "video" && s.visible(t, scene.duration))
+            .filter(|s| {
+                s.kind == "video" && s.visible(t, scene.duration) && !(sampled && s.motion_blur)
+            })
             .collect();
         readers.retain(|id, _| showing.iter().any(|s| &s.id == id));
         let mut current = render::Frames::new();
@@ -295,7 +315,27 @@ fn render_video(
                 readers.get_mut(&shape.id).unwrap().next()?,
             );
         }
-        renderer.frame(scene, t, size, &current)
+        renderer.exposed_frame(scene, t, size, settings.fps, &current, |sample| {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Export stopped".into());
+            }
+            let mut pixels = render::SampleFrames::new();
+            for shape in scene.shapes.iter().filter(|shape| {
+                shape.kind == "video" && shape.motion_blur && shape.visible(sample, scene.duration)
+            }) {
+                let (file, info, size) = videos[&shape.id];
+                let reader = shutter_readers.entry(shape.id.clone()).or_default();
+                let frame = media::ShutterReader::at(
+                    reader,
+                    (file, info.duration, size),
+                    shape,
+                    sample,
+                    settings.fps,
+                )?;
+                pixels.insert(shape.id.clone(), frame);
+            }
+            Ok(Some(pixels))
+        })
     };
     let mut failure = None;
     if let Some(mut stdin) = child.stdin.take() {
@@ -389,6 +429,81 @@ mod tests {
         let info = media::probe(&output).unwrap();
         assert!(!info.sound, "nothing in the scene makes sound");
         assert!((info.duration - 1.0).abs() < 0.05, "{info:?}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn motion_blur_export_samples_video_content_across_an_edit() {
+        let root =
+            std::env::temp_dir().join(format!("forma-native-shutter-video-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let place = place(&root);
+        let source = media::tests::video(&root, "source.mp4", 2, false);
+        let (url, poster, info) = crate::assets::import_video(&source, &place).unwrap();
+        let mut scene = Scene::empty("test".into());
+        (scene.width, scene.height, scene.duration) = (64.0, 48.0, 1.25);
+        scene.motion_blur = Some(crate::motion_blur::Settings {
+            shutter_angle: 720.0,
+            samples: 16,
+        });
+        scene.add_shape("video".into(), "video");
+        let layer = &mut scene.shapes[0];
+        layer.motion_blur = true;
+        layer.extra.extend([
+            ("assetData".into(), url.into()),
+            ("posterData".into(), poster.into()),
+            ("mediaDuration".into(), info.duration.into()),
+        ]);
+        let (p, q) = (32.0, 24.0);
+        layer.edit_pose(
+            0.0,
+            crate::model::Pose {
+                x: p,
+                y: q,
+                w: 64.0,
+                h: 48.0,
+                ..layer.pose(0.0)
+            },
+        );
+        let output = root.join("blurred.mp4");
+        let settings = Settings {
+            fps: 24,
+            ..Settings::default()
+        };
+        let run = start(
+            &scene,
+            &place,
+            output.clone(),
+            settings,
+            egui::Context::default(),
+        )
+        .unwrap();
+        assert_eq!(run.result.recv().unwrap(), Ok(output.clone()));
+        let frame = |time| {
+            media::Frames::start(&output, time, 24, 64, 48)
+                .unwrap()
+                .next()
+                .unwrap()
+                .pixel(32, 24)
+                .unwrap()
+        };
+        let (before, mixed, after) = (frame(0.8), frame(1.0), frame(1.12));
+        assert!(before.red() > 200 && before.green() < 30, "{before:?}");
+        assert!(
+            mixed.red() > 35 && mixed.green() > 35 && mixed.blue() < 30,
+            "{mixed:?}"
+        );
+        assert!(after.green() > 200 && after.red() < 30, "{after:?}");
+        let still = render::frame(&scene, &place, 1.0)
+            .unwrap()
+            .pixel(32, 24)
+            .unwrap();
+        assert!(still.red() > 35 && still.green() > 35, "{still:?}");
+        let preview = render::preview_sized(&scene, &place, 1.0, (64, 48))
+            .unwrap()
+            .pixel(32, 24)
+            .unwrap();
+        assert!(preview.green() > 200 && preview.red() < 30, "{preview:?}");
         std::fs::remove_dir_all(root).unwrap();
     }
 

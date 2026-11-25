@@ -1,5 +1,5 @@
 use crate::keyframes::{Lane, same_time};
-use crate::model::{Shape, ease_at, hundredths};
+use crate::model::{Shape, hundredths};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -271,84 +271,20 @@ impl TextLane {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TextKey {
-    pub t: f64,
-    pub value: [f32; 3],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ease: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub curve: Option<[f32; 4]>,
-}
-
-impl TextKey {
-    pub fn new(t: f64, value: [f32; 3]) -> Self {
-        Self {
-            t,
-            value,
-            ease: None,
-            curve: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TextTrack {
-    pub rest: [f32; 3],
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub keys: Vec<TextKey>,
-}
+pub use crate::value_track::{ValueKey as TextKey, ValueTrack as TextTrack};
 
 impl TextTrack {
-    fn new(rest: [f32; 3]) -> Self {
-        Self {
-            rest,
-            keys: Vec::new(),
-        }
-    }
-
     pub fn at(&self, property: TextProperty, t: f64, ease: &str) -> [f32; 3] {
-        let Some(first) = self.keys.first() else {
-            return property.values(self.rest);
-        };
-        let after = self.keys.partition_point(|key| key.t <= t);
-        let a = self.keys.get(after.saturating_sub(1)).unwrap_or(first);
-        let b = self.keys.get(after).unwrap_or(a);
-        if b.t <= a.t || t <= a.t {
-            return property.values(a.value);
-        }
-        let fraction = ease_at(
-            a.ease.as_deref().unwrap_or(ease),
-            ((t - a.t) / (b.t - a.t)) as f32,
-            a.curve,
-        );
-        property.values(std::array::from_fn(|i| {
-            a.value[i] + (b.value[i] - a.value[i]) * fraction
-        }))
-    }
-
-    pub fn key(&self, t: f64) -> Option<&TextKey> {
-        self.keys.iter().find(|key| same_time(t, key.t))
+        property.values(self.sample(t, ease))
     }
 
     pub fn put(&mut self, t: f64, mut key: TextKey, property: TextProperty) {
-        if !t.is_finite() || t < 0.0 {
-            return;
-        }
-        key.t = t;
         key.value = property.values(key.value);
-        self.keys.retain(|old| !same_time(t, old.t));
-        let slot = self.keys.partition_point(|old| old.t < t);
-        self.keys.insert(slot, key);
+        self.insert(t, key);
     }
 
     pub fn remove(&mut self, t: f64, property: TextProperty, ease: &str) {
-        let value = self.at(property, t, ease);
-        self.keys.retain(|key| !same_time(key.t, t));
-        if self.keys.is_empty() {
-            self.rest = value;
-        }
+        self.erase(t, self.at(property, t, ease));
     }
 }
 

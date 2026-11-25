@@ -102,6 +102,7 @@ enum Row {
     Property(usize, Lane),
     Mask(usize, u64, usize),
     TextAnimator(usize, u64),
+    Effects(usize),
     Fade(usize),
     Motion(usize, usize),
     Spin(usize, usize),
@@ -882,6 +883,15 @@ impl Forma {
             self.add_text();
         }
         ui.add_space(6.0);
+        if quiet_button(ui, "Adjustment layer", Some(Icon::Plus))
+            .on_hover_text("Apply effects to the layers below")
+            .clicked()
+        {
+            let id = self.scene.add_shape(new_id(), "adjustment");
+            self.select_layer(Some(id), false);
+            self.tab = Tab::Layer;
+            self.edited();
+        }
         section_label(ui, "Your files");
         if quiet_button(ui, "Picture, SVG or video…", Some(Icon::Image)).clicked() {
             self.pick_media();
@@ -1105,6 +1115,30 @@ impl Forma {
                     self.edited();
                 }
             });
+        self.motion_blur_settings(ui);
+    }
+
+    fn motion_blur_settings(&mut self, ui: &mut Ui) {
+        egui::CollapsingHeader::new("Motion blur").show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 32.0;
+            let mut settings = self.scene.motion_blur.unwrap_or_default();
+            let previous = settings;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Shutter angle");
+                ui.add(
+                    egui::DragValue::new(&mut settings.shutter_angle)
+                        .range(0.0..=720.0)
+                        .suffix("?"),
+                );
+                ui.label("Samples");
+                ui.add(egui::DragValue::new(&mut settings.samples).range(2..=32));
+            });
+            if settings.valid() && settings != previous {
+                self.scene.motion_blur =
+                    (settings != crate::motion_blur::Settings::default()).then_some(settings);
+            }
+            ui.checkbox(&mut self.scene.motion_blur_preview, "Motion blur preview");
+        });
     }
 
     /// The selected layers, in the order they were picked (the main one included once).
@@ -1393,14 +1427,15 @@ impl Forma {
         let shape = &mut self.scene.shapes[index];
         let tool_before = self.vector_tools.tool;
         let has_paint = shape.is_vector() || shape.kind == "text";
-        let show_solid = !has_paint
-            || shape_panel::fill_panel(
-                ui,
-                shape,
-                [size.w, size.h],
-                &mut self.vector_tools,
-                self.time,
-            );
+        let show_solid = shape.kind != "adjustment"
+            && (!has_paint
+                || shape_panel::fill_panel(
+                    ui,
+                    shape,
+                    [size.w, size.h],
+                    &mut self.vector_tools,
+                    self.time,
+                ));
         let mut changed = show_solid && solid_fill_color(ui, shape, self.time);
         if has_paint {
             shape_panel::stroke_and_trim(ui, shape, &mut self.vector_tools, self.time);
@@ -1497,20 +1532,30 @@ impl Forma {
             });
         }
         let shape = &mut self.scene.shapes[index];
+        if crate::effect_panel::layer(
+            ui,
+            shape,
+            self.time,
+            self.key_editor.effects_expanded(&shape.id),
+        ) {
+            self.key_editor.reveal_effects(shape.id.clone());
+        }
+        self.scene.duration = shape.effect_times().fold(self.scene.duration, f64::max);
         let mut blur = shape
             .extra
             .get("blur")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32;
-        if ui
-            .add(
-                egui::Slider::new(&mut blur, 0.0..=100.0)
-                    .clamping(egui::SliderClamping::Edits)
-                    .step_by(1.0)
-                    .text("Blur")
-                    .suffix(" px"),
-            )
-            .changed()
+        if shape.kind != "adjustment"
+            && ui
+                .add(
+                    egui::Slider::new(&mut blur, 0.0..=100.0)
+                        .clamping(egui::SliderClamping::Edits)
+                        .step_by(1.0)
+                        .text("Blur")
+                        .suffix(" px"),
+                )
+                .changed()
         {
             if blur > 0.0 {
                 shape.extra.insert("blur".into(), serde_json::json!(blur));
@@ -1718,6 +1763,10 @@ impl Forma {
 
     /// The Animate tab: one-click animations, easing, and the moves, spins and fades on the layer.
     fn animate_tab(&mut self, ui: &mut Ui, index: usize) {
+        let shape = &self.scene.shapes[index];
+        if !shape.effects.is_empty() && quiet_button(ui, "Effect animation lanes", None).clicked() {
+            self.key_editor.reveal_effects(shape.id.clone());
+        }
         if self.scene.shapes[index].kind == "text" {
             let duration = self.scene.duration;
             let shape = &mut self.scene.shapes[index];
@@ -2931,9 +2980,14 @@ impl Forma {
                     || *shown != generation
             });
         if stale {
-            if let Some(pixmap) =
-                renderer.view(&display, self.time, view, clip, &self.videos.frames)
-            {
+            if let Some(pixmap) = renderer.view_with_samples(
+                &display,
+                self.time,
+                view,
+                clip,
+                &self.videos.frames,
+                |sample| self.videos.sample(sample),
+            ) {
                 let image = egui::ColorImage::from_rgba_premultiplied(
                     [pixmap.width() as usize, pixmap.height() as usize],
                     pixmap.data(),
@@ -3297,6 +3351,7 @@ impl Forma {
         };
         let on_rotate = |p: Pos2| rotate_at.is_some_and(|at| at.distance(p) <= 12.0);
         let on_anchor = |p: Pos2| anchor_at.is_some_and(|at| at.distance(p) <= 11.0);
+        let selected_id = self.selected.clone();
         let topmost =
             |scene: &Scene, time: f64, screen: Pos2, renderer: Option<&render::Renderer>| {
                 let p = to_scene(screen);
@@ -3304,6 +3359,11 @@ impl Forma {
                     .rev()
                     .find(|(index, frame)| {
                         let shape = &scene.shapes[*index];
+                        if shape.kind == "adjustment"
+                            && selected_id.as_deref() != Some(shape.id.as_str())
+                        {
+                            return false;
+                        }
                         let pixel = (screen - snapped.min) * pixels;
                         if shape.kind == "text"
                             && renderer.is_some_and(|r| r.text_hit(&shape.id, pixel.x, pixel.y))
@@ -3653,6 +3713,16 @@ impl Forma {
                         }
                     }
                 }
+                if !shape.effects.is_empty() {
+                    rows.push(Row::Effects(index));
+                    if self.key_editor.effects_expanded(&shape.id) {
+                        rows.extend(shape.effects.iter().flat_map(|effect| {
+                            effect.kind.controls().iter().map(move |control| {
+                                Row::Property(index, Lane::Effect(effect.id, control.parameter))
+                            })
+                        }));
+                    }
+                }
                 for (number, mask) in shape.masks.iter().enumerate() {
                     rows.push(Row::Mask(index, mask.id, number + 1));
                     if self.key_editor.mask_expanded(&shape.id, mask.id) {
@@ -3726,6 +3796,7 @@ impl Forma {
         let rect = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
         self.key_editor.begin_frame(&self.scene);
         let reveal_animator = self.key_editor.animator_to_reveal.take();
+        let reveal_effects = self.key_editor.effects_to_reveal.take();
         let plot = Rect::from_min_max(
             pos2(rect.left() + LABEL_WIDTH, rect.top()),
             pos2(
@@ -3819,6 +3890,15 @@ impl Forma {
                                 (row, reveal_mask)
                                 && mask == reveal
                                 && self.scene.shapes[*index].id == *id
+                            {
+                                ui.scroll_to_rect(line, Some(egui::Align::TOP));
+                            }
+                            if let (Row::Effects(index), Some(id)) = (row, reveal_effects.as_ref())
+                                && self
+                                    .scene
+                                    .shapes
+                                    .get(*index)
+                                    .is_some_and(|shape| &shape.id == id)
                             {
                                 ui.scroll_to_rect(line, Some(egui::Align::TOP));
                             }
@@ -3989,6 +4069,27 @@ impl Forma {
                     .clicked()
                 {
                     self.key_editor.toggle_animator(id.clone(), *animator);
+                    self.select_layer(Some(id), false);
+                    self.tab = Tab::Animate;
+                }
+            }
+            Row::Effects(index) => {
+                let Some(shape) = self.scene.shapes.get(*index) else {
+                    return;
+                };
+                let id = shape.id.clone();
+                let open = self.key_editor.effects_expanded(&id);
+                let label = Rect::from_min_size(line.min + vec2(14.0, 0.0), vec2(140.0, 32.0));
+                let arrow = if open { "?" } else { "?" };
+                if ui
+                    .put(
+                        label,
+                        egui::Button::selectable(open, format!("{arrow}  Effects")),
+                    )
+                    .on_hover_text("Show or hide effect parameter lanes")
+                    .clicked()
+                {
+                    self.key_editor.toggle_effects(id.clone());
                     self.select_layer(Some(id), false);
                     self.tab = Tab::Animate;
                 }

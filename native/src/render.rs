@@ -2,8 +2,11 @@
 //! Exports and the editor's preview both draw through it, so what the editor shows is what gets exported.
 
 use crate::compositing::{Blend, MatteLinks};
+use crate::effect_render::{self, Region};
+use crate::effects::Sample;
 use crate::mask_render::{LayerPixels, MaskCache};
 use crate::model::{MAX_BLUR, Scene, Shape};
+use crate::motion_blur;
 use crate::text_layout::TextCache;
 use crate::text_render::{TextInk, TextPaths};
 use crate::transform::LayerFrame;
@@ -13,7 +16,7 @@ use canopy_ui::Place;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use tiny_skia::{
     Color, FillRule, IntRect, IntSize, Paint, Path as Outline, PathBuilder, Pixmap, PixmapPaint,
     Point, Rect, Transform,
@@ -21,6 +24,8 @@ use tiny_skia::{
 
 /// Video layers' frames at one moment, by layer id.
 pub type Frames = HashMap<String, Pixmap>;
+pub(crate) type SampleFrames = HashMap<String, Arc<Pixmap>>;
+type ShutterSample<'a> = (f64, Option<&'a SampleFrames>);
 
 type TextHits = HashMap<String, Vec<Rect>>;
 
@@ -38,11 +43,13 @@ pub struct Renderer {
     /// What each media layer was read from (hashed), so the editor knows when to read again.
     sources: Vec<(String, Option<u64>)>,
     masks: Mutex<MaskCache>,
+    effects: Mutex<effect_render::Cache>,
     geometry: Mutex<GeometryCache>,
     text: Mutex<(TextCache, TextPaths)>,
     text_hits: Mutex<TextHits>,
 }
 
+#[derive(Clone, Copy)]
 struct RenderFrame<'a> {
     renderer: &'a Renderer,
     scene: &'a Scene,
@@ -52,6 +59,7 @@ struct RenderFrame<'a> {
     size: (u32, u32),
     strict: bool,
     videos: &'a Frames,
+    sampled_videos: Option<&'a SampleFrames>,
 }
 
 struct MatteFrame {
@@ -151,6 +159,7 @@ impl Renderer {
             missing,
             sources: sources(scene),
             masks: Mutex::default(),
+            effects: Mutex::default(),
             geometry: Mutex::default(),
             text: Mutex::default(),
             text_hits: Mutex::default(),
@@ -199,7 +208,7 @@ impl Renderer {
     fn draws(&self, shape: &Shape) -> bool {
         matches!(
             shape.kind.as_str(),
-            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text" | "path"
+            "circle" | "rect" | "triangle" | "diamond" | "arrow" | "text" | "path" | "adjustment"
         ) || (matches!(shape.kind.as_str(), "image" | "video" | "svg")
             && self.images.contains_key(&shape.id))
     }
@@ -213,7 +222,40 @@ impl Renderer {
         (width, height): (u32, u32),
         frames: &Frames,
     ) -> Result<Pixmap, String> {
-        self.draw(scene, t, (width, height), true, frames)
+        self.exposed_frame(
+            scene,
+            t,
+            (width, height),
+            motion_blur::DEFAULT_FPS,
+            frames,
+            |_| Ok(None),
+        )
+    }
+
+    pub(crate) fn exposed_frame(
+        &self,
+        scene: &Scene,
+        time: f64,
+        size: (u32, u32),
+        fps: u32,
+        frames: &Frames,
+        mut read_sample: impl FnMut(f64) -> Result<Option<SampleFrames>, String>,
+    ) -> Result<Pixmap, String> {
+        let times = motion_blur::exposure(scene, time, fps);
+        if times.is_empty() {
+            return self.draw(scene, time, size, true, frames, None);
+        }
+        average(&times, |sample| {
+            let videos = read_sample(sample)?;
+            self.draw(
+                scene,
+                time,
+                size,
+                true,
+                frames,
+                Some((sample, videos.as_ref())),
+            )
+        })
     }
 
     /// The frame at `t` at `scale` times the scene's size, for the editor: layers it can't draw are left out, and
@@ -223,7 +265,19 @@ impl Renderer {
             (scene.width * scale).round().max(1.0) as u32,
             (scene.height * scale).round().max(1.0) as u32,
         );
-        self.draw(scene, t, size, false, frames).ok()
+        let times = if scene.motion_blur_preview {
+            motion_blur::exposure(scene, t, motion_blur::DEFAULT_FPS)
+        } else {
+            Vec::new()
+        };
+        if times.is_empty() {
+            self.draw(scene, t, size, false, frames, None).ok()
+        } else {
+            average(&times, |sample| {
+                self.draw(scene, t, size, false, frames, Some((sample, None)))
+            })
+            .ok()
+        }
     }
 
     /// The editor's view of the scene and its surroundings (Electron's pasteboard): `size` pixels whose top-left is
@@ -234,9 +288,53 @@ impl Renderer {
         &self,
         scene: &Scene,
         t: f64,
+        view: View,
+        clip: bool,
+        frames: &Frames,
+    ) -> Option<Pixmap> {
+        self.view_with_samples(scene, t, view, clip, frames, |_| None)
+    }
+
+    pub(crate) fn view_with_samples(
+        &self,
+        scene: &Scene,
+        t: f64,
+        view: View,
+        clip: bool,
+        frames: &Frames,
+        read_sample: impl Fn(f64) -> Option<SampleFrames>,
+    ) -> Option<Pixmap> {
+        let canvas = self.draw_view(scene, t, view, clip, frames, None)?;
+        if !scene.motion_blur_preview {
+            return Some(canvas);
+        }
+        let times = motion_blur::exposure(scene, t, motion_blur::DEFAULT_FPS);
+        if times.is_empty() {
+            return Some(canvas);
+        }
+        average(&times, |sample| {
+            let videos = read_sample(sample);
+            self.draw_view(
+                scene,
+                t,
+                view,
+                clip,
+                frames,
+                Some((sample, videos.as_ref())),
+            )
+            .ok_or("Scene is too large to render".to_owned())
+        })
+        .ok()
+    }
+
+    fn draw_view(
+        &self,
+        scene: &Scene,
+        t: f64,
         (origin, scale, size): View,
         clip: bool,
         frames: &Frames,
+        sample: Option<ShutterSample<'_>>,
     ) -> Option<Pixmap> {
         let mut canvas = Pixmap::new(size.0.max(1), size.1.max(1))?;
         let (left, top) = (-origin.0 * scale, -origin.1 * scale);
@@ -250,7 +348,9 @@ impl Renderer {
             .text_hits
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        hits.clear();
+        if sample.is_none() {
+            hits.clear();
+        }
         self.layers(
             &mut canvas,
             scene,
@@ -259,7 +359,8 @@ impl Renderer {
             scale,
             false,
             frames,
-            Some(&mut hits),
+            sample,
+            sample.is_none().then_some(&mut hits),
         )
         .ok()?;
         if clip {
@@ -314,6 +415,7 @@ impl Renderer {
         (width, height): (u32, u32),
         strict: bool,
         frames: &Frames,
+        sample: Option<ShutterSample<'_>>,
     ) -> Result<Pixmap, String> {
         let mut canvas =
             Pixmap::new(width.max(1), height.max(1)).ok_or("Scene is too large to render")?;
@@ -322,7 +424,17 @@ impl Renderer {
         // Like Electron's export, which scales the canvas by width and height separately.
         let (scale_x, scale_y) = (width as f32 / scene.width, height as f32 / scene.height);
         let view = Transform::from_scale(scale_x, scale_y);
-        self.layers(&mut canvas, scene, t, view, scale_x, strict, frames, None)?;
+        self.layers(
+            &mut canvas,
+            scene,
+            t,
+            view,
+            scale_x,
+            strict,
+            frames,
+            sample,
+            None,
+        )?;
         Ok(canvas)
     }
 
@@ -337,6 +449,7 @@ impl Renderer {
         scale: f32,
         strict: bool,
         frames: &Frames,
+        sample: Option<ShutterSample<'_>>,
         mut text_hits: Option<&mut TextHits>,
     ) -> Result<(), String> {
         let frame = RenderFrame {
@@ -348,6 +461,7 @@ impl Renderer {
             size: (canvas.width(), canvas.height()),
             strict,
             videos: frames,
+            sampled_videos: None,
         };
         let mut mattes = MatteLinks::new(scene).map(|links| MatteFrame {
             links,
@@ -361,17 +475,28 @@ impl Renderer {
             {
                 continue;
             }
-            let Some((ink, layer_frame)) = frame.visible_ink(shape)? else {
+            let active = frame.sampled(shape, sample);
+            let source = mattes
+                .as_ref()
+                .and_then(|mattes| mattes.links.sources[index]);
+            if shape.kind == "adjustment" {
+                let matte = match (&mut mattes, source) {
+                    (Some(mattes), Some(source)) => mattes.source(&frame, source, sample)?,
+                    _ => None,
+                };
+                active.adjust(canvas, shape, matte.as_deref());
+                continue;
+            }
+            let Some((ink, layer_frame)) = active.visible_ink(shape)? else {
                 continue;
             };
             if let (Ink::Text(ink), Some(hits)) = (&ink, text_hits.as_deref_mut()) {
                 hits.insert(shape.id.clone(), ink.hit_boxes());
             }
-            let blur = frame.layer_blur(shape, layer_frame);
-            let source = mattes
-                .as_ref()
-                .and_then(|mattes| mattes.links.sources[index]);
+            let blur = active.layer_blur(shape, layer_frame);
+            let effects = shape.sampled_effects(active.time);
             if blur <= 0.0
+                && effects.is_empty()
                 && shape.blend() == Blend::Normal
                 && shape.masks.is_empty()
                 && source.is_none()
@@ -380,13 +505,14 @@ impl Renderer {
                 ink.paint(canvas, Transform::identity());
                 continue;
             }
-            let Some(mut layer) = frame.raster(shape, layer_frame, &ink, blur) else {
+            let Some(mut layer) = active.raster_effects(shape, layer_frame, &ink, blur, effects)
+            else {
                 continue;
             };
             if let (Some(mattes), Some(source), Some(matte)) =
                 (&mut mattes, source, &shape.track_matte)
             {
-                let pixels = mattes.source(&frame, source)?;
+                let pixels = mattes.source(&frame, source, sample)?;
                 layer.apply_matte(pixels.as_deref(), matte.mode);
             }
             if shape.blend() == Blend::Normal && (!shape.masks.is_empty() || source.is_some()) {
@@ -424,6 +550,7 @@ impl Renderer {
             size: (scene.width.round() as u32, scene.height.round() as u32),
             strict: false,
             videos: &videos,
+            sampled_videos: None,
         };
         Ok(frame.visible_ink(shape)?.and_then(|(ink, layer)| {
             frame.raster(shape, layer, &ink, frame.layer_blur(shape, layer))
@@ -438,12 +565,12 @@ impl Renderer {
         frame: LayerFrame,
         color: &str,
         view: Transform,
-        frames: &'a Frames,
+        video_pixels: Option<&'a Pixmap>,
         time: f64,
     ) -> Option<Ink<'a>> {
         let pose = frame.pose;
         let place = frame.transform.post_concat(view);
-        if let Some(pixmap) = frames.get(&shape.id).or_else(|| self.images.get(&shape.id)) {
+        if let Some(pixmap) = video_pixels.or_else(|| self.images.get(&shape.id)) {
             let (w, h) = (pixmap.width() as f32, pixmap.height() as f32);
             let mut paint = PixmapPaint::default();
             paint.opacity = (pose.o / 100.0).clamp(0.0, 1.0);
@@ -470,7 +597,7 @@ impl Renderer {
     }
 }
 
-impl RenderFrame<'_> {
+impl<'a> RenderFrame<'a> {
     fn visible_ink(&self, shape: &Shape) -> Result<Option<(Ink<'_>, LayerFrame)>, String> {
         if !shape.visible(self.time, self.scene.duration) {
             return Ok(None);
@@ -481,10 +608,14 @@ impl RenderFrame<'_> {
         }
         if self.strict {
             self.renderer.exportable(shape)?;
-            if shape.kind == "video" && !self.videos.contains_key(&shape.id) {
+            if shape.kind == "video" && self.video_pixels(shape).is_none() {
                 return Err(format!("{}: no video frame", shape.name));
             }
         }
+        Ok(self.ink_at(shape, frame).map(|ink| (ink, frame)))
+    }
+
+    fn ink_at(&self, shape: &Shape, frame: LayerFrame) -> Option<Ink<'_>> {
         if TextInk::used_by(shape) {
             let mut geometry = self
                 .renderer
@@ -508,19 +639,179 @@ impl RenderFrame<'_> {
                 &mut geometry,
                 paths,
             );
-            return Ok(ink.map(|ink| (Ink::Text(ink), frame)));
+            return ink.map(Ink::Text);
         }
-        Ok(self
-            .renderer
-            .ink(
-                shape,
-                frame,
-                &shape.color_at(self.time),
-                self.view,
-                self.videos,
-                self.time,
-            )
-            .map(|ink| (ink, frame)))
+        self.renderer.ink(
+            shape,
+            frame,
+            &shape.color_at(self.time),
+            self.view,
+            self.video_pixels(shape),
+            self.time,
+        )
+    }
+
+    fn video_pixels(&self, shape: &Shape) -> Option<&Pixmap> {
+        self.sampled_videos
+            .and_then(|videos| videos.get(&shape.id))
+            .map(Arc::as_ref)
+            .or_else(|| self.videos.get(&shape.id))
+    }
+
+    fn sampled(self, shape: &Shape, sample: Option<ShutterSample<'a>>) -> Self {
+        match sample {
+            Some((time, videos)) if shape.motion_blur => Self {
+                time,
+                sampled_videos: videos,
+                ..self
+            },
+            _ => self,
+        }
+    }
+
+    fn raster_effects(
+        &self,
+        shape: &Shape,
+        frame: LayerFrame,
+        ink: &Ink<'_>,
+        blur: f32,
+        effects: Vec<Sample>,
+    ) -> Option<LayerPixels> {
+        if effects.is_empty() {
+            return self.raster(shape, frame, ink, blur);
+        }
+        let local_frame = if shape
+            .text_layout
+            .as_ref()
+            .is_some_and(|text| text.path.is_some())
+        {
+            // Text on an external path resolves that path in scene coordinates.
+            frame
+        } else {
+            LayerFrame {
+                transform: Transform::identity(),
+                ..frame
+            }
+        };
+        for quality in FILTER_QUALITY {
+            let local = LocalPixels::new(frame, self.view, self.size, quality)?;
+            let local_view = if local_frame.transform.is_identity() {
+                Transform::from_scale(local.scale, local.scale)
+            } else {
+                local_frame
+                    .transform
+                    .invert()?
+                    .post_scale(local.scale, local.scale)
+            };
+            let local_renderer = Self {
+                view: local_view,
+                ..*self
+            };
+            let ink = local_renderer.ink_at(shape, local_frame)?;
+            let bounds = ink.bounds()?;
+            let local_blur = crate::render::blur(shape) * local.scale;
+            let region = local.region(bounds, &effects, local_blur * 3.0)?;
+            if !fits_filter(region.area) {
+                continue;
+            }
+            let input =
+                local_renderer.raster_area(shape, local_frame, &ink, local_blur, region.area)?;
+            let output = self.apply_stack(shape, effects, region, input.pixmap);
+            return local.to_view(output, region.area, self.size);
+        }
+        self.raster(shape, frame, ink, blur)
+    }
+
+    fn apply_stack(
+        &self,
+        shape: &Shape,
+        effects: Vec<Sample>,
+        region: Region,
+        input: Pixmap,
+    ) -> Pixmap {
+        self.renderer
+            .effects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .apply(&shape.id, effects, region, input)
+    }
+
+    fn adjust(&self, canvas: &mut Pixmap, shape: &Shape, matte: Option<&LayerPixels>) {
+        if !shape.visible(self.time, self.scene.duration) {
+            return;
+        }
+        let frame = self.scene.layer_frame(shape, self.time);
+        let opacity = (frame.pose.o / 100.0).clamp(0.0, 1.0);
+        if opacity <= 0.0 {
+            return;
+        }
+        let effects = shape.sampled_effects(self.time);
+        if effects.is_empty() {
+            return;
+        }
+        let Some((local, region)) = FILTER_QUALITY.into_iter().find_map(|quality| {
+            let local = LocalPixels::new(frame, self.view, self.size, quality)?;
+            let bounds = Rect::from_xywh(
+                -frame.pose.w * local.scale / 2.0,
+                -frame.pose.h * local.scale / 2.0,
+                frame.pose.w * local.scale,
+                frame.pose.h * local.scale,
+            )?;
+            let region = local.region(bounds, &effects, 0.0)?;
+            fits_filter(region.area).then_some((local, region))
+        }) else {
+            return;
+        };
+        let bounds = region.bounds;
+        let Some(input) = local.capture(canvas, region.area) else {
+            return;
+        };
+        let output = self.apply_stack(shape, effects, region, input);
+        let Some(mut coverage) = Pixmap::new(region.area.width(), region.area.height()) else {
+            return;
+        };
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(
+            255,
+            255,
+            255,
+            (opacity * 255.0).round() as u8,
+        ));
+        let offset = Transform::from_translate(-region.area.x() as f32, -region.area.y() as f32);
+        coverage.fill_rect(bounds, &paint, offset, None);
+        if !shape.masks.is_empty() {
+            let mask_view = frame
+                .transform
+                .invert()
+                .map(|inverse| inverse.post_scale(local.scale, local.scale));
+            if let Some(mask_view) = mask_view {
+                self.renderer
+                    .masks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .apply(
+                        &mut coverage,
+                        region.area,
+                        shape,
+                        frame,
+                        mask_view,
+                        self.time,
+                    );
+            }
+        }
+        let Some(mut filtered) = local.to_view(output, region.area, self.size) else {
+            return;
+        };
+        let Some(mut coverage) = local.to_view(coverage, region.area, self.size) else {
+            return;
+        };
+        if let Some(track) = &shape.track_matte {
+            coverage.apply_matte(matte, track.mode);
+        }
+        if shape.blend() != Blend::Normal {
+            blend_adjustment(canvas, &mut filtered, shape.blend());
+        }
+        replace_region(canvas, &filtered, &coverage);
     }
 
     fn layer_blur(&self, shape: &Shape, frame: LayerFrame) -> f32 {
@@ -553,6 +844,17 @@ impl RenderFrame<'_> {
                 (bounds.bottom().ceil() + 1.0).min(height) as i32,
             )?
         };
+        self.raster_area(shape, frame, ink, blur, area)
+    }
+
+    fn raster_area(
+        &self,
+        shape: &Shape,
+        frame: LayerFrame,
+        ink: &Ink<'_>,
+        blur: f32,
+        area: IntRect,
+    ) -> Option<LayerPixels> {
         let mut pixmap = Pixmap::new(area.width(), area.height())?;
         ink.paint(
             &mut pixmap,
@@ -583,11 +885,206 @@ impl RenderFrame<'_> {
     }
 }
 
+// Extreme zoom or shear can make a layer-space temporary much larger than the viewport.
+const FILTER_QUALITY: [f32; 5] = [1.0, 0.5, 0.25, 0.125, 0.0625];
+
+fn fits_filter(area: IntRect) -> bool {
+    u64::from(area.width()) * u64::from(area.height()) <= 24 * 1024 * 1024
+}
+
+struct LocalPixels {
+    scale: f32,
+    to_view: Transform,
+    from_view: Transform,
+    visible: Rect,
+}
+
+impl LocalPixels {
+    fn new(frame: LayerFrame, view: Transform, (w, h): (u32, u32), quality: f32) -> Option<Self> {
+        let place = frame.transform.post_concat(view);
+        let scale = (crate::transform::max_scale(place).min(8.0) * quality).max(0.0001);
+        let to_view = Transform::from_scale(1.0 / scale, 1.0 / scale).post_concat(place);
+        let from_view = to_view.invert()?;
+        let visible = transformed(Rect::from_xywh(0.0, 0.0, w as f32, h as f32)?, from_view)?;
+        Some(Self {
+            scale,
+            to_view,
+            from_view,
+            visible,
+        })
+    }
+
+    fn region(&self, bounds: Rect, effects: &[Sample], extra: f32) -> Option<Region> {
+        let margin = (effect_render::margin(effects, self.scale, bounds) + extra)
+            .ceil()
+            .clamp(0.0, 1536.0)
+            + 2.0;
+        // Input beyond the visible viewport can still contribute to its filter halo.
+        let area = IntRect::from_ltrb(
+            ((bounds.left() - margin).max(self.visible.left() - margin * 2.0)).floor() as i32,
+            ((bounds.top() - margin).max(self.visible.top() - margin * 2.0)).floor() as i32,
+            ((bounds.right() + margin).min(self.visible.right() + margin * 2.0)).ceil() as i32,
+            ((bounds.bottom() + margin).min(self.visible.bottom() + margin * 2.0)).ceil() as i32,
+        )?;
+        Some(Region {
+            area,
+            bounds,
+            scale: self.scale,
+        })
+    }
+
+    fn capture(&self, canvas: &Pixmap, area: IntRect) -> Option<Pixmap> {
+        let mut pixels = Pixmap::new(area.width(), area.height())?;
+        let transform = self
+            .from_view
+            .post_translate(-area.x() as f32, -area.y() as f32);
+        pixels.draw_pixmap(0, 0, canvas.as_ref(), &sampling(), transform, None);
+        Some(pixels)
+    }
+
+    fn to_view(&self, pixels: Pixmap, area: IntRect, (w, h): (u32, u32)) -> Option<LayerPixels> {
+        let placed =
+            Transform::from_translate(area.x() as f32, area.y() as f32).post_concat(self.to_view);
+        if placed.is_translate() || placed.is_identity() {
+            let (x, y) = (placed.tx, placed.ty);
+            if x.fract() == 0.0
+                && y.fract() == 0.0
+                && x >= 0.0
+                && y >= 0.0
+                && x + pixels.width() as f32 <= w as f32
+                && y + pixels.height() as f32 <= h as f32
+            {
+                let area = IntRect::from_xywh(x as i32, y as i32, pixels.width(), pixels.height())?;
+                return Some(LayerPixels {
+                    area,
+                    pixmap: pixels,
+                });
+            }
+        }
+        let bounds = transformed(
+            Rect::from_xywh(0.0, 0.0, pixels.width() as f32, pixels.height() as f32)?,
+            placed,
+        )?;
+        let area = IntRect::from_ltrb(
+            (bounds.left().floor() - 1.0).max(0.0) as i32,
+            (bounds.top().floor() - 1.0).max(0.0) as i32,
+            (bounds.right().ceil() + 1.0).min(w as f32) as i32,
+            (bounds.bottom().ceil() + 1.0).min(h as f32) as i32,
+        )?;
+        let mut pixmap = Pixmap::new(area.width(), area.height())?;
+        let placed = placed.post_translate(-area.x() as f32, -area.y() as f32);
+        pixmap.draw_pixmap(0, 0, pixels.as_ref(), &sampling(), placed, None);
+        Some(LayerPixels { area, pixmap })
+    }
+}
+
+fn sampling() -> PixmapPaint {
+    PixmapPaint {
+        quality: tiny_skia::FilterQuality::Bilinear,
+        ..PixmapPaint::default()
+    }
+}
+
+fn transformed(rect: Rect, transform: Transform) -> Option<Rect> {
+    let mut points = [
+        Point::from_xy(rect.left(), rect.top()),
+        Point::from_xy(rect.right(), rect.top()),
+        Point::from_xy(rect.left(), rect.bottom()),
+        Point::from_xy(rect.right(), rect.bottom()),
+    ];
+    transform.map_points(&mut points);
+    Rect::from_points(&points)
+}
+
+fn blend_adjustment(canvas: &Pixmap, filtered: &mut LayerPixels, blend: Blend) {
+    let Some(mut backdrop) = canvas.clone_rect(filtered.area) else {
+        return;
+    };
+    backdrop.draw_pixmap(
+        0,
+        0,
+        filtered.pixmap.as_ref(),
+        &PixmapPaint {
+            blend_mode: blend.skia(),
+            ..PixmapPaint::default()
+        },
+        Transform::identity(),
+        None,
+    );
+    filtered.pixmap = backdrop;
+}
+
+fn replace_region(canvas: &mut Pixmap, filtered: &LayerPixels, coverage: &LayerPixels) {
+    use rayon::prelude::*;
+    let width = canvas.width() as usize * 4;
+    let start = filtered.area.x() as usize * 4;
+    let top = filtered.area.y() as usize;
+    let stride = filtered.area.width() as usize * 4;
+    let blend = |((row, changed), mask): ((&mut [u8], &[u8]), &[u8])| {
+        for ((dst, src), a) in row[start..start + stride]
+            .chunks_exact_mut(4)
+            .zip(changed.chunks_exact(4))
+            .zip(mask.chunks_exact(4))
+        {
+            let a = u16::from(a[3]);
+            for (dst, src) in dst.iter_mut().zip(src) {
+                *dst = ((u16::from(*dst) * (255 - a) + u16::from(*src) * a + 127) / 255) as u8;
+            }
+        }
+    };
+    let rows = &mut canvas.data_mut()[top * width..(top + filtered.area.height() as usize) * width];
+    if filtered.pixmap.data().len() < 98_304 {
+        rows.chunks_exact_mut(width)
+            .zip(filtered.pixmap.data().chunks_exact(stride))
+            .zip(coverage.pixmap.data().chunks_exact(stride))
+            .for_each(blend);
+    } else {
+        rows.par_chunks_mut(width)
+            .zip(filtered.pixmap.data().par_chunks(stride))
+            .zip(coverage.pixmap.data().par_chunks(stride))
+            .for_each(blend);
+    }
+}
+
+fn average(
+    times: &[f64],
+    mut draw: impl FnMut(f64) -> Result<Pixmap, String>,
+) -> Result<Pixmap, String> {
+    use rayon::prelude::*;
+    let Some((&time, rest)) = times.split_first() else {
+        return Err("No shutter samples".into());
+    };
+    let mut picture = draw(time)?;
+    let mut sum: Vec<u16> = picture.data().iter().map(|&byte| u16::from(byte)).collect();
+    for &time in rest {
+        let sample = draw(time)?;
+        sum.par_chunks_mut(32_768)
+            .zip(sample.data().par_chunks(32_768))
+            .for_each(|(sum, src)| {
+                for (sum, &src) in sum.iter_mut().zip(src) {
+                    *sum += u16::from(src);
+                }
+            });
+    }
+    let count = times.len() as u16;
+    picture
+        .data_mut()
+        .par_chunks_mut(32_768)
+        .zip(sum.par_chunks(32_768))
+        .for_each(|(dst, sum)| {
+            for (dst, &sum) in dst.iter_mut().zip(sum) {
+                *dst = ((sum + count / 2) / count) as u8;
+            }
+        });
+    Ok(picture)
+}
+
 impl MatteFrame {
     fn source(
         &mut self,
         frame: &RenderFrame<'_>,
         index: usize,
+        sample: Option<ShutterSample<'_>>,
     ) -> Result<Option<Rc<LayerPixels>>, String> {
         let mut chain = Vec::new();
         let mut next = Some(index);
@@ -602,12 +1099,14 @@ impl MatteFrame {
         }
         for i in chain.into_iter().rev() {
             let shape = &frame.scene.shapes[i];
+            let frame = frame.sampled(shape, sample);
             let mut layer = frame.visible_ink(shape)?.and_then(|(ink, layer_frame)| {
-                frame.raster(
+                frame.raster_effects(
                     shape,
                     layer_frame,
                     &ink,
                     frame.layer_blur(shape, layer_frame),
+                    shape.sampled_effects(frame.time),
                 )
             });
             if let (Some(layer), Some(matte), Some(_)) =
@@ -799,32 +1298,81 @@ pub fn frame_sized(
     t: f64,
     size: (u32, u32),
 ) -> Result<Pixmap, String> {
+    frame_with_media(scene, place, t, size, true)
+}
+
+pub(crate) fn preview_sized(
+    scene: &Scene,
+    place: &Place,
+    t: f64,
+    size: (u32, u32),
+) -> Result<Pixmap, String> {
+    frame_with_media(scene, place, t, size, scene.motion_blur_preview)
+}
+
+fn frame_with_media(
+    scene: &Scene,
+    place: &Place,
+    t: f64,
+    size: (u32, u32),
+    with_motion: bool,
+) -> Result<Pixmap, String> {
     let renderer = Renderer::new(scene, place);
     let mut frames = Frames::new();
-    for shape in scene
-        .shapes
-        .iter()
-        .filter(|s| s.kind == "video" && s.visible(t, scene.duration))
-    {
+    let fps = motion_blur::DEFAULT_FPS;
+    let shutter = if with_motion {
+        motion_blur::exposure(scene, t, fps)
+    } else {
+        Vec::new()
+    };
+    let mut movies = Vec::new();
+    for shape in scene.shapes.iter().filter(|s| s.kind == "video") {
+        let sampled = shape.motion_blur && !shutter.is_empty();
+        let times = if sampled {
+            shutter.as_slice()
+        } else {
+            std::slice::from_ref(&t)
+        };
+        if !times
+            .iter()
+            .any(|&time| shape.visible(time, scene.duration))
+        {
+            continue;
+        }
         let Some(file) = renderer.video(&shape.id) else {
             continue;
         };
         let info = crate::media::probe(file)?;
-        let (width, height) = video_size(scene, shape, size, std::iter::once(t));
-        let (width, height) = limit_decode_size((width, height), info);
-        frames.insert(
-            shape.id.clone(),
-            crate::media::Frames::start(
-                file,
-                shape.media_time(t, info.duration),
-                30,
-                width,
-                height,
-            )?
-            .next()?,
-        );
+        let decode = limit_decode_size(video_size(scene, shape, size, times.iter().copied()), info);
+        if sampled {
+            movies.push((shape, (file, info.duration, decode), None));
+        } else {
+            frames.insert(
+                shape.id.clone(),
+                crate::media::Frames::start(
+                    file,
+                    shape.media_time(t, info.duration),
+                    fps,
+                    decode.0,
+                    decode.1,
+                )?
+                .next()?,
+            );
+        }
     }
-    renderer.frame(scene, t, size, &frames)
+    if shutter.is_empty() {
+        return renderer.draw(scene, t, size, true, &frames, None);
+    }
+    renderer.exposed_frame(scene, t, size, fps, &frames, |time| {
+        let mut pixels = SampleFrames::new();
+        for (shape, source, reader) in &mut movies {
+            if shape.visible(time, scene.duration) {
+                let frame = crate::media::ShutterReader::at(reader, *source, shape, time, fps)?;
+                pixels.insert(shape.id.clone(), frame);
+            }
+        }
+        Ok(Some(pixels))
+    })
 }
 
 /// The scene's size in whole pixels.

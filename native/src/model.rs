@@ -25,6 +25,10 @@ pub struct Scene {
     pub duration: f64,
     pub bg: String,
     pub shapes: Vec<Shape>,
+    #[serde(default)]
+    pub motion_blur: Option<crate::motion_blur::Settings>,
+    #[serde(default)]
+    pub motion_blur_preview: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -72,6 +76,10 @@ pub struct Shape {
     pub vector: Option<VectorLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_layout: Option<crate::text_animator::TextLayout>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<crate::effects::Effect>,
+    #[serde(default, skip_serializing_if = "crate::effects::is_false")]
+    pub motion_blur: bool,
     #[serde(flatten, serialize_with = "serialize_shape_extra")]
     pub extra: Map<String, Value>,
 }
@@ -97,6 +105,12 @@ impl Serialize for Scene {
         map.serialize_entry("duration", &self.duration)?;
         map.serialize_entry("bg", &self.bg)?;
         map.serialize_entry("shapes", &Layers(self))?;
+        if let Some(settings) = self.motion_blur {
+            map.serialize_entry("motionBlur", &settings)?;
+        }
+        if self.motion_blur_preview {
+            map.serialize_entry("motionBlurPreview", &true)?;
+        }
         for (name, value) in &self.extra {
             map.serialize_entry(name, value)?;
         }
@@ -116,10 +130,15 @@ impl Serialize for ShapeForSave<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let Self(shape, duration) = *self;
         let path_fallback;
-        let layer = if shape.kind == "path" {
+        let layer = if matches!(shape.kind.as_str(), "path" | "adjustment") {
             let mut fallback = shape.clone();
             fallback.kind = "svg".into();
             fallback.extra.insert("svgSource".into(), PATH_FALLBACK.into());
+            if shape.kind == "adjustment" {
+                fallback
+                    .extra
+                    .insert("nativeAdjustment".into(), true.into());
+            }
             path_fallback = fallback;
             &path_fallback
         } else {
@@ -151,6 +170,13 @@ impl<'de> Deserialize<'de> for Shape {
             && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
         {
             shape.kind = "path".into();
+            shape.extra.remove("svgSource");
+        } else if shape.kind == "svg"
+            && shape.extra.get("nativeAdjustment").and_then(Value::as_bool) == Some(true)
+            && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
+        {
+            shape.kind = "adjustment".into();
+            shape.extra.remove("nativeAdjustment");
             shape.extra.remove("svgSource");
         }
         if let Some(keys) = native_keys.filter(|keys| !keys.is_empty() || shape.rest_pose.is_some()) {
@@ -288,6 +314,8 @@ impl Scene {
             duration: 4.0,
             bg: "#f4f0e8".into(),
             shapes: Vec::new(),
+            motion_blur: None,
+            motion_blur_preview: false,
             extra: Map::new(),
         }
     }
@@ -379,6 +407,12 @@ impl Scene {
                     shape.name
                 ));
             }
+            if !crate::effects::prepare(&mut shape.effects, scene.duration) {
+                return Err(format!(
+                    "{}: this layer has invalid effect settings or keys.",
+                    shape.name
+                ));
+            }
             let mut mask_ids = HashSet::new();
             for mask in &mut shape.masks {
                 if !mask_ids.insert(mask.id) || !mask.prepare() {
@@ -396,8 +430,27 @@ impl Scene {
         {
             return Err("This is not a usable Forma version-one scene.".into());
         }
+        if scene.motion_blur.is_some_and(|settings| !settings.valid()) {
+            return Err("This project has invalid motion blur settings.".into());
+        }
         scene.prune_missing_mattes();
+        let adjustments: HashSet<_> = scene
+            .shapes
+            .iter()
+            .filter(|shape| shape.kind == "adjustment")
+            .map(|shape| shape.id.as_str())
+            .collect();
         for shape in &scene.shapes {
+            if shape
+                .track_matte
+                .as_ref()
+                .is_some_and(|matte| adjustments.contains(matte.source.as_str()))
+            {
+                return Err(format!(
+                    "{}: an adjustment layer cannot be used as a track matte.",
+                    shape.name
+                ));
+            }
             if shape
                 .track_matte
                 .as_ref()
@@ -418,6 +471,7 @@ impl Scene {
             "triangle" => ("Triangle", "#c3d77f"),
             "diamond" => ("Diamond", "#aaa0ce"),
             "path" => ("Path", "#aaa0ce"),
+            "adjustment" => ("Adjustment layer", "#aaa0ce"),
             _ => ("Rectangle", "#aaa0ce"),
         };
         self.shapes.push(Shape {
@@ -430,8 +484,16 @@ impl Scene {
                 t: 0.0,
                 x: self.width / 2.0,
                 y: self.height / 2.0,
-                w: 160.0,
-                h: 160.0,
+                w: if kind == "adjustment" {
+                    self.width
+                } else {
+                    160.0
+                },
+                h: if kind == "adjustment" {
+                    self.height
+                } else {
+                    160.0
+                },
                 r: 0.0,
                 o: 100.0,
                 ease: None,
@@ -456,6 +518,8 @@ impl Scene {
             track_matte: None,
             vector: None,
             text_layout: None,
+            effects: Vec::new(),
+            motion_blur: false,
             extra: Map::new(),
         });
         id
@@ -725,6 +789,7 @@ impl Scene {
                     .chain(shape.mask_times())
                     .chain(shape.vector_times())
                     .chain(shape.text_times())
+                    .chain(shape.effect_times())
                     .chain(shape.out_time)
                     .chain(
                         shape
@@ -1084,6 +1149,13 @@ impl Scene {
             .chain(shape.color_keys.iter_mut().map(|k| &mut k.t))
             .chain(
                 shape
+                    .effects
+                    .iter_mut()
+                    .flat_map(|effect| effect.tracks.values_mut())
+                    .flat_map(|track| track.keys.iter_mut().map(|key| &mut key.t)),
+            )
+            .chain(
+                shape
                     .vector
                     .iter_mut()
                     .flat_map(|v| v.keys.iter_mut().map(|k| &mut k.t)),
@@ -1318,10 +1390,11 @@ impl Scene {
             template.color_at(template.clip_start())
         };
         copy.color_keys.clear();
-        copy.freeze_masks(if same { end } else { template.clip_start() });
         let at = if same { end } else { template.clip_start() };
+        copy.freeze_masks(at);
         copy.freeze_vector(at);
         copy.freeze_text(at);
+        copy.freeze_effects(at);
         if !same {
             copy.base_rotation = source.base_rotation;
         }
@@ -1574,6 +1647,7 @@ impl Scene {
         ghost.freeze_masks(at);
         ghost.freeze_vector(at);
         ghost.freeze_text(at);
+        ghost.freeze_effects(at);
         ghost.rotation_clips.clear();
         ghost.parent = None;
         ghost.parent_space = crate::transform::matrix(frame.space);
@@ -1851,6 +1925,7 @@ impl Shape {
             .chain(self.mask_times())
             .chain(self.vector_times())
             .chain(self.text_times())
+            .chain(self.effect_times())
             .chain(motions(self).map(|(_, start, _)| start))
             .chain(self.rotation_clips.iter().map(|c| c.start_time))
             .chain(self.disappear.iter().map(|d| d.start_time))
@@ -1865,6 +1940,7 @@ impl Shape {
             .chain(self.mask_times())
             .chain(self.vector_times())
             .chain(self.text_times())
+            .chain(self.effect_times())
             .chain(motions(self).map(|(_, start, length)| start + length))
             .chain(
                 self.rotation_clips

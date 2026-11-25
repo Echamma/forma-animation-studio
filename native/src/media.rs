@@ -2,10 +2,11 @@
 //! process (nothing links against it), as in StreamCuts (`streamcuts/native/src/ffmpeg.rs`), and like StreamCuts this
 //! prefers a shared FFmpeg build when PATH has one: a static build takes about half a second just to start.
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tiny_skia::{IntSize, Pixmap};
 
 fn find(program: &str) -> PathBuf {
@@ -112,17 +113,19 @@ impl Frames {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
+        Self::start_at(path, &format!("{:.3}", from.max(0.0)), fps, width, height)
+    }
+
+    fn start_at(
+        path: &Path,
+        from: &str,
+        fps: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
         let size = IntSize::from_wh(width.max(1), height.max(1)).ok_or("Invalid video size")?;
         let mut child = command(ffmpeg())
-            .args([
-                "-v",
-                "error",
-                "-stream_loop",
-                "-1",
-                "-ss",
-                &format!("{:.3}", from.max(0.0)),
-                "-i",
-            ])
+            .args(["-v", "error", "-stream_loop", "-1", "-ss", from, "-i"])
             .arg(path)
             .args([
                 "-an",
@@ -164,6 +167,63 @@ impl Drop for Frames {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// The shutter windows of consecutive output frames can overlap. Keep the decoded
+/// pictures from that overlap until the next frame has finished sampling them.
+pub(crate) struct ShutterReader {
+    decoder: Frames,
+    start: i64,
+    recent: VecDeque<Arc<Pixmap>>,
+}
+
+impl ShutterReader {
+    pub fn step(clip_start: f64, time: f64, fps: u32) -> i64 {
+        ((time - clip_start).max(0.0) * f64::from(fps.max(60))).round() as i64
+    }
+
+    pub fn at(
+        reader: &mut Option<Self>,
+        source: (&Path, f64, (u32, u32)),
+        shape: &crate::model::Shape,
+        time: f64,
+        fps: u32,
+    ) -> Result<Arc<Pixmap>, String> {
+        let rate = fps.max(60);
+        let step = Self::step(shape.clip_start(), time, fps);
+        let (path, duration, (width, height)) = source;
+        if reader.as_ref().is_none_or(|current| {
+            step < current.start
+                || step.saturating_sub(current.start)
+                    > current.recent.len() as i64 + i64::from(rate)
+        }) {
+            let at = shape.clip_start() + step as f64 / f64::from(rate);
+            let offset = shape.media_time(at, duration);
+            // Rounding a seek up can discard the source frame at the shutter window's start.
+            let seek = format!("{:.6}", (offset - 0.000_001).max(0.0));
+            *reader = Some(Self {
+                decoder: Frames::start_at(path, &seek, rate, width, height)?,
+                start: step,
+                recent: VecDeque::new(),
+            });
+        }
+        let reader = reader
+            .as_mut()
+            .ok_or("Couldn't start the shutter video reader")?;
+        let capacity = (2 * u64::from(rate)).div_ceil(u64::from(fps.max(1))) as usize + 2;
+        while step.saturating_sub(reader.start) >= reader.recent.len() as i64 {
+            reader.recent.push_back(Arc::new(reader.decoder.next()?));
+            if reader.recent.len() > capacity {
+                reader.start += 1;
+                reader.recent.pop_front();
+            }
+        }
+        reader
+            .recent
+            .get((step - reader.start) as usize)
+            .cloned()
+            .ok_or_else(|| "The shutter video frame is unavailable".to_owned())
     }
 }
 
