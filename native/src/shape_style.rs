@@ -174,7 +174,7 @@ impl Default for Trim {
 
 impl Trim {
     pub fn full(self) -> bool {
-        self.end - self.start >= 100.0
+        (self.end - self.start).abs() >= 100.0
     }
 }
 

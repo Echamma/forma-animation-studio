@@ -388,7 +388,7 @@ fn summarized(scene: &Scene, id: &str) -> Value {
         .shapes
         .iter()
         .find(|s| s.id == id)
-        .map(|s| serde_json::to_value(s).unwrap_or_default())
+        .map(|s| serde_json::to_value(s.for_save(scene.duration)).unwrap_or_default())
         .unwrap_or_default();
     if let Some(map) = layer.as_object_mut() {
         omit_media(map, false);

@@ -1,3 +1,5 @@
+mod common;
+
 use canopy_ui::Place;
 use forma_native::keyframes::{Lane, LaneKey, Property};
 use forma_native::model::{Pose, Scene};
@@ -258,6 +260,34 @@ fn trim_is_empty_half_and_full_and_wraps_with_offset() {
 }
 
 #[test]
+fn reversed_trim_bounds_match_in_the_renderer_and_svg() {
+    let mut scene = scene();
+    add_path(&mut scene, &[[-0.5, 0.0], [0.5, 0.0]], false);
+    let mut reversed = scene.clone();
+    for (start, end) in [(10.0, 55.0), (0.0, 100.0)] {
+        for (scene, start, end) in [(&mut scene, start, end), (&mut reversed, end, start)] {
+            scene.shapes[0].vector.as_mut().unwrap().trim = Some(Trim {
+                start,
+                end,
+                offset: 270.0,
+                fill: false,
+            });
+        }
+        let image = draw(&scene, 0.0);
+        assert_eq!(draw(&reversed, 0.0).data(), image.data());
+        for export in [
+            animated_svg::still(&reversed, &place(), 0.0).unwrap(),
+            animated_svg::animated(&reversed, &place()).unwrap(),
+        ] {
+            let svg = render_svg(&export);
+            compare_svg(&image, &svg);
+            assert_eq!(rgb(&image, 90, 50), [255; 3]);
+            assert_eq!(rgb(&svg, 90, 50), [255; 3]);
+        }
+    }
+}
+
+#[test]
 fn trim_can_apply_to_the_fill() {
     let mut scene = scene();
     let vector = add_path(
@@ -483,6 +513,9 @@ fn animated_path_project() -> Scene {
 fn path_projects_round_trip_as_json_and_archives() {
     let scene = animated_path_project();
     let data = serde_json::to_vec(&scene).unwrap();
+    let project: serde_json::Value = serde_json::from_slice(&data).unwrap();
+    common::assert_electron_keys(&project);
+    assert_eq!(project["shapes"][0]["type"], "svg");
     assert_eq!(Scene::read(&data).unwrap(), scene);
 
     let file = std::env::temp_dir().join(format!("forma-shape-paths-{}.forma", std::process::id()));
@@ -493,9 +526,22 @@ fn path_projects_round_trip_as_json_and_archives() {
 }
 
 #[test]
+fn path_projects_saved_with_the_phase_three_key_fallback_still_open() {
+    let scene = animated_path_project();
+    let mut project = serde_json::to_value(&scene).unwrap();
+    let layer = project["shapes"][0].as_object_mut().unwrap();
+    let mut native = layer.remove("nativeKeyframes").unwrap();
+    layer.insert("vectorPoseKeys".into(), native["keys"].take());
+    let loaded = Scene::read(&serde_json::to_vec(&project).unwrap()).unwrap();
+    assert_eq!(loaded, scene);
+}
+
+#[test]
 #[ignore = "requires Node.js to run Electron Forma's validator"]
 fn the_existing_electron_validator_accepts_path_projects() {
-    let data = serde_json::to_vec(&animated_path_project()).unwrap();
+    let scene = animated_path_project();
+    let data = serde_json::to_vec(&scene).unwrap();
+    common::assert_electron_keys(&serde_json::from_slice(&data).unwrap());
     let mut validator = Command::new("node")
         .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
         .args(["--input-type=module", "-e", r#"
@@ -503,10 +549,14 @@ fn the_existing_electron_validator_accepts_path_projects() {
             import {valid, usableProject} from './src/model/validate.js';
             const project = JSON.parse(readFileSync(0, 'utf8'));
             if (!valid(project) || !usableProject(project) || project.shapes[0].type !== 'svg') process.exit(1);
+            process.stdout.write(JSON.stringify(project));
         "#])
-        .stdin(Stdio::piped()).spawn().expect("Node is required to run Electron's project validator");
+        .stdin(Stdio::piped()).stdout(Stdio::piped())
+        .spawn().expect("Node is required to run Electron's project validator");
     validator.stdin.take().unwrap().write_all(&data).unwrap();
-    assert!(validator.wait().unwrap().success());
+    let output = validator.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(Scene::read(&output.stdout).unwrap(), scene);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use crate::model::{Scene, Shape};
-use crate::paths::{MeasuredPath, PathData};
+use crate::paths::{MeasuredPath, PathData, ordered_trim_bounds};
 use crate::shape_style::{
     Cap, Gradient, Join, PaintMode, PaintTarget, VectorLayer, VectorProperty,
 };
@@ -316,12 +316,13 @@ fn trim_stroke(
     let mut visibility = Vec::with_capacity(trim.len());
     for (sample, trim) in timeline.samples.iter().zip(trim) {
         let trim = trim.unwrap_or_default();
+        let (start, end) = ordered_trim_bounds(trim.start, trim.end);
         let length = sample
             .path
             .outline(sample.size)
             .map_or(0.0, |path| MeasuredPath::new(&path).length()) as f32;
-        let visible = (trim.end - trim.start).clamp(0.0, 100.0) * length / 100.0;
-        let offset = (trim.start / 100.0 + trim.offset / 360.0) * length;
+        let visible = (end - start).clamp(0.0, 100.0) * length / 100.0;
+        let offset = (start / 100.0 + trim.offset / 360.0) * length;
         let dash = if trim.full() {
             length * 1.0001
         } else {

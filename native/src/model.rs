@@ -1,7 +1,8 @@
 //! Version-one Forma scenes, preserving fields the native editor does not handle yet on every save.
 
 use crate::compositing::{Blend, LayerMask, TrackMatte};
-use crate::keyframes::{Lane, Property};
+use crate::keyframes::{LINKED_NEUTRAL, Lane, Property};
+use crate::project_keys;
 use crate::shape_style::VectorLayer;
 use crate::transform::Anchor;
 use serde::ser::SerializeMap;
@@ -11,7 +12,7 @@ use std::collections::HashSet;
 
 pub(crate) const MAX_BLUR: f64 = 100.0;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Scene {
     pub version: u32,
@@ -74,50 +75,75 @@ pub struct Shape {
 }
 
 const PATH_FALLBACK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#;
-const VECTOR_POSE_KEYS: &str = "vectorPoseKeys";
+
+impl Serialize for Scene {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct Layers<'a>(&'a Scene);
+
+        impl Serialize for Layers<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_seq(self.0.shapes.iter().map(|shape| shape.for_save(self.0.duration)))
+            }
+        }
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("version", &self.version)?;
+        map.serialize_entry("projectId", &self.project_id)?;
+        map.serialize_entry("projectName", &self.project_name)?;
+        map.serialize_entry("width", &self.width)?;
+        map.serialize_entry("height", &self.height)?;
+        map.serialize_entry("duration", &self.duration)?;
+        map.serialize_entry("bg", &self.bg)?;
+        map.serialize_entry("shapes", &Layers(self))?;
+        for (name, value) in &self.extra {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
+pub(crate) struct ShapeForSave<'a>(&'a Shape, f64);
+
+impl Shape {
+    pub(crate) fn for_save(&self, duration: f64) -> ShapeForSave<'_> {
+        ShapeForSave(self, duration)
+    }
+}
+
+impl Serialize for ShapeForSave<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Self(shape, duration) = *self;
+        let path_fallback;
+        let layer = if shape.kind == "path" {
+            let mut fallback = shape.clone();
+            fallback.kind = "svg".into();
+            fallback.extra.insert("svgSource".into(), PATH_FALLBACK.into());
+            path_fallback = fallback;
+            &path_fallback
+        } else {
+            shape
+        };
+        if project_keys::electron_keys_valid(&shape.keys, duration) {
+            return Shape::serialize(layer, serializer);
+        }
+        let mut saved =
+            Shape::serialize(layer, serde_json::value::Serializer).map_err(serde::ser::Error::custom)?;
+        project_keys::bake(shape, duration, &mut saved).map_err(serde::ser::Error::custom)?;
+        saved.serialize(serializer)
+    }
+}
 
 impl Serialize for Shape {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let needs_pose_fallback = self.vector.is_some()
-            && (self.keys.is_empty()
-                || self.keys.len() > 1000
-                || self.keys.windows(2).any(|pair| pair[0].t == pair[1].t)
-                || self.keys.iter().any(|k| {
-                    [k.x, k.y, k.w, k.h, k.r].iter().any(|v| v.abs() > 10_000.0)
-                        || !(0.0..=100.0).contains(&k.o)
-                }));
-        if self.kind != "path" && !needs_pose_fallback {
-            return Shape::serialize(self, serializer);
-        }
-        let mut fallback = self.clone();
-        if self.kind == "path" {
-            fallback.kind = "svg".into();
-            fallback.extra.insert("svgSource".into(), PATH_FALLBACK.into());
-        }
-        if needs_pose_fallback {
-            let keys = serde_json::to_value(&self.keys).map_err(serde::ser::Error::custom)?;
-            fallback.extra.insert(VECTOR_POSE_KEYS.into(), keys);
-            let mut times: Vec<_> = self.keys.iter().map(|k| k.t).collect();
-            times.sort_by(f64::total_cmp);
-            times.dedup();
-            if times.is_empty() {
-                times.push(0.0);
-            }
-            fallback.keys = times.into_iter().take(1000).map(|t| {
-                let mut p = self.pose(t);
-                [p.x, p.y, p.r] = [p.x, p.y, p.r].map(|v| v.clamp(-10_000.0, 10_000.0));
-                [p.w, p.h] = [p.w, p.h].map(|v| v.clamp(1.0, 10_000.0));
-                p.o = p.o.clamp(0.0, 100.0);
-                Key::from_pose(t, p)
-            }).collect();
-        }
-        Shape::serialize(&fallback, serializer)
+        self.for_save(f64::MAX).serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Shape {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut shape = Shape::deserialize(deserializer)?;
+        let mut saved = Map::deserialize(deserializer)?;
+        let native_keys = project_keys::take_native_keys(&mut saved);
+        let mut shape = Shape::deserialize(Value::Object(saved)).map_err(serde::de::Error::custom)?;
         if shape.kind == "svg"
             && shape.vector.as_ref().is_some_and(|vector| vector.path.is_some())
             && shape.extra.get("svgSource").and_then(Value::as_str) == Some(PATH_FALLBACK)
@@ -125,8 +151,10 @@ impl<'de> Deserialize<'de> for Shape {
             shape.kind = "path".into();
             shape.extra.remove("svgSource");
         }
-        if shape.vector.is_some() && let Some(keys) = shape.extra.remove(VECTOR_POSE_KEYS) {
-            shape.keys = serde_json::from_value(keys).map_err(serde::de::Error::custom)?;
+        if let Some(keys) = native_keys.filter(|keys| !keys.is_empty() || shape.rest_pose.is_some()) {
+            shape.keys = keys;
+        } else if shape.keys.iter().any(|key| !key.t.is_finite() || key.w <= 0.0 || key.h <= 0.0) {
+            return Err(serde::de::Error::custom("A layer has invalid key times or dimensions."));
         }
         Ok(shape)
     }
@@ -352,13 +380,7 @@ impl Scene {
             || !scene.duration.is_finite()
             || scene.duration < 1.0
             || scene.shapes.len() > 500
-            || scene.shapes.iter().any(|shape| {
-                (shape.keys.is_empty() && shape.rest_pose.is_none())
-                    || shape
-                        .keys
-                        .iter()
-                        .any(|key| !key.t.is_finite() || key.w <= 0.0 || key.h <= 0.0)
-            })
+            || scene.shapes.iter().any(|shape| shape.keys.is_empty() && shape.rest_pose.is_none())
         {
             return Err("This is not a usable Forma version-one scene.".into());
         }
@@ -1882,12 +1904,15 @@ impl Shape {
     }
 
     pub fn pose(&self, t: f64) -> Pose {
+        let Some(first) = self.keys.first() else {
+            return self.rest_pose.unwrap_or(LINKED_NEUTRAL);
+        };
         if self.rest_pose.is_some() || self.keys.iter().any(|key| key.props.is_some()) {
             let keys = self.keys.iter().filter(|key| !key.linked_space);
             let rest = self
                 .rest_pose
                 .or_else(|| keys.clone().next().map(Pose::from))
-                .unwrap_or(crate::keyframes::LINKED_NEUTRAL);
+                .unwrap_or(LINKED_NEUTRAL);
             return self.property_pose(t, keys, rest);
         }
         let before = self
@@ -1895,7 +1920,7 @@ impl Shape {
             .iter()
             .rev()
             .find(|key| key.t <= t)
-            .unwrap_or(&self.keys[0]);
+            .unwrap_or(first);
         let after = self
             .keys
             .iter()

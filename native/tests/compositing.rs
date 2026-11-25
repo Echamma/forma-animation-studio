@@ -1,3 +1,5 @@
+mod common;
+
 use canopy_ui::Place;
 use forma_native::compositing::{
     Blend, LayerMask, MaskMode, MaskPoint, MaskPose, MaskProperty, MaskShape, MatteMode, TrackMatte,
@@ -404,6 +406,7 @@ fn with_saved_project(check: impl FnOnce(&std::path::Path, &Scene, &Place)) {
 #[test]
 fn a_project_round_trips_paths_handles_keys_blend_and_matte() {
     with_saved_project(|path, scene, place| {
+        common::assert_electron_keys(&serde_json::from_slice(&saved_project_json(path)).unwrap());
         let reopened = archive::unpack(path, place).unwrap();
         assert_eq!(&reopened, scene);
         assert!(reopened.shapes[1].masks.is_empty());
@@ -414,18 +417,20 @@ fn a_project_round_trips_paths_handles_keys_blend_and_matte() {
     });
 }
 
+fn saved_project_json(path: &std::path::Path) -> Vec<u8> {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    let mut json = Vec::new();
+    archive.by_name("project.json").unwrap().read_to_end(&mut json).unwrap();
+    json
+}
+
 #[test]
 #[ignore = "requires Node.js to run Electron Forma's validator"]
 fn electron_accepts_the_native_saved_project() {
     use std::process::{Command, Stdio};
     with_saved_project(|path, _, _| {
-        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
-        let mut json = Vec::new();
-        archive
-            .by_name("project.json")
-            .unwrap()
-            .read_to_end(&mut json)
-            .unwrap();
+        let json = saved_project_json(path);
+        common::assert_electron_keys(&serde_json::from_slice(&json).unwrap());
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap();

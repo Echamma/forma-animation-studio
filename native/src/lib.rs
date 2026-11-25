@@ -18,6 +18,7 @@ pub mod model;
 pub mod motion;
 pub mod paths;
 mod path_editor;
+mod project_keys;
 pub mod shape_style;
 mod shape_panel;
 pub mod render;

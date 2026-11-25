@@ -494,6 +494,7 @@ impl MeasuredPath {
 }
 
 pub(crate) fn trim_ranges(start: f32, end: f32, offset: f32) -> Vec<(f64, f64)> {
+    let (start, end) = ordered_trim_bounds(start, end);
     let span = f64::from((end - start).clamp(0.0, 100.0)) / 100.0;
     if span >= 1.0 {
         return vec![(0.0, 1.0)];
@@ -508,6 +509,10 @@ pub(crate) fn trim_ranges(start: f32, end: f32, offset: f32) -> Vec<(f64, f64)> 
     } else {
         vec![(from, to)]
     }
+}
+
+pub(crate) fn ordered_trim_bounds(start: f32, end: f32) -> (f32, f32) {
+    if start > end { (end, start) } else { (start, end) }
 }
 
 fn append_range(
