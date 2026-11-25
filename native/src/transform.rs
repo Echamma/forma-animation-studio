@@ -1,3 +1,4 @@
+use crate::keyframes::Property;
 use crate::model::{Pose, Scene, Shape, is_linked};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +39,36 @@ impl LayerFrame {
     pub fn box_transform(self) -> Transform {
         Transform::from_scale(self.pose.w, self.pose.h).post_concat(self.transform)
     }
+
+    pub(crate) fn scene_pose(self) -> Pose {
+        let mut pose = self.pose;
+        (pose.x, pose.y) = point(self.transform, 0.0, 0.0);
+        if !self.space.is_identity() {
+            let (sx, sy) = axis_scales(self.transform);
+            pose.w *= sx;
+            pose.h *= sy;
+            let angle = self.transform.ky.atan2(self.transform.sx).to_degrees();
+            let orientation = (self.space.ky - self.space.kx)
+                .atan2(self.space.sx + self.space.sy)
+                .to_degrees();
+            let reference = pose.r + orientation;
+            pose.r = reference + angle_delta(angle - reference);
+        }
+        pose
+    }
+}
+
+pub(crate) fn axis_scales(t: Transform) -> (f32, f32) {
+    (t.sx.hypot(t.ky), t.kx.hypot(t.sy))
+}
+
+/// The greatest stretch in any direction, independent of translation and rotation.
+pub(crate) fn max_scale(t: Transform) -> f32 {
+    ((t.sx + t.sy).hypot(t.ky - t.kx) + (t.sx - t.sy).hypot(t.ky + t.kx)) * 0.5
+}
+
+pub(crate) fn angle_delta(angle: f32) -> f32 {
+    (angle + 180.0).rem_euclid(360.0) - 180.0
 }
 
 pub fn point(transform: Transform, x: f32, y: f32) -> (f32, f32) {
@@ -130,17 +161,15 @@ impl Scene {
 
     /// A screen-space pose for callers that need an approximate box. Drawing uses the full affine frame.
     pub fn render_pose(&self, shape: &Shape, t: f64) -> Pose {
+        self.layer_frame(shape, t).scene_pose()
+    }
+
+    /// Canvas coordinates for the anchor, the lengths of the layer's edges and the angle of its x-axis.
+    pub(crate) fn inspector_pose(&self, shape: &Shape, t: f64) -> Pose {
         let frame = self.layer_frame(shape, t);
-        let mut pose = frame.pose;
-        if !frame.space.is_identity() || shape.anchor.is_some() {
-            (pose.x, pose.y) = point(frame.transform, 0.0, 0.0);
-        }
-        if !frame.space.is_identity() {
-            pose.w *= frame.transform.sx.hypot(frame.transform.ky);
-            pose.h *= frame.transform.kx.hypot(frame.transform.sy);
-            let angle = frame.transform.ky.atan2(frame.transform.sx).to_degrees();
-            pose.r += (angle - pose.r + 180.0).rem_euclid(360.0) - 180.0;
-        }
+        let mut pose = frame.scene_pose();
+        (pose.x, pose.y) = frame.anchor();
+        pose.o = self.editable_opacity(shape, t);
         pose
     }
 
@@ -264,11 +293,14 @@ impl Scene {
             .invert()
             .filter(Transform::is_finite)
             .ok_or("The parent is too small at the playhead.")?;
-        // Convert the coordinate space of every key and motion at once. Baking into x/y/angle/size
-        // would lose shear, and rewriting key times would change independently eased channels.
+        // Use a fixed space when attaching so the child stays in place at the playhead.
         let basis = old.post_concat(inverse);
-        self.shapes[child].parent_space = matrix(basis);
-        self.shapes[child].parent = id;
+        let shape = &mut self.shapes[child];
+        shape.parent = id;
+        shape.parent_space = matrix(basis);
+        if shape.parent.is_none() {
+            shape.bake_parent_space();
+        }
         Ok(())
     }
 
@@ -307,9 +339,165 @@ fn link_effect(target: &Shape, t: f64, frame: LayerFrame) -> Transform {
 }
 
 impl Shape {
+    pub(crate) fn bake_parent_space(&mut self) {
+        let Some(basis) = self.parent_space.map(from_matrix) else {
+            return;
+        };
+        // Legacy linked text derives its pose from an independent target. Its affine
+        // space cannot generally be moved into its keys while that link is live.
+        if is_linked(self) {
+            return;
+        }
+        let Some((sx, sy, rotation)) = self.bake_components(basis) else {
+            return;
+        };
+        self.map_positions(basis);
+        if let Some(pose) = &mut self.rest_pose {
+            (pose.w, pose.h, pose.r) = (pose.w * sx, pose.h * sy, pose.r + rotation);
+        }
+        for key in self.keys.iter_mut().filter(|key| !key.linked_space) {
+            (key.w, key.h, key.r) = (key.w * sx, key.h * sy, key.r + rotation);
+        }
+        self.map_motion_points(
+            |pose| {
+                map_number(pose, "w", |w| w * sx);
+                map_number(pose, "h", |h| h * sy);
+                map_number(pose, "r", |r| r + rotation);
+            },
+            |motion| {
+                if motion.get("face").and_then(Value::as_bool) == Some(true) {
+                    let offset = number(motion, "faceRotation").unwrap_or(0.0);
+                    motion["faceRotation"] = serde_json::json!(offset + rotation);
+                }
+            },
+        );
+        if let Some(blur) = self.extra.get_mut("blur") {
+            if let Some(value) = blur.as_f64() {
+                *blur = serde_json::json!(value * f64::from(max_scale(basis)));
+            }
+        }
+        self.parent_space = None;
+    }
+
+    fn bake_components(&self, basis: Transform) -> Option<(f32, f32, f32)> {
+        const EPSILON: f32 = 1e-5;
+        let decompose = |axes: Transform| {
+            let (sx, sy) = axis_scales(axes);
+            let dot = (axes.sx / sx) * (axes.kx / sy) + (axes.ky / sx) * (axes.sy / sy);
+            let det = axes.sx * axes.sy - axes.ky * axes.kx;
+            (dot.abs() <= EPSILON && det > 0.0)
+                .then(|| (sx, sy, axes.ky.atan2(axes.sx).to_degrees()))
+        };
+        let (sx, sy, rotation) = decompose(basis)?;
+        if (sx - sy).abs() <= EPSILON * sx.max(sy) {
+            return Some((sx, sy, rotation));
+        }
+        let angle = self.pose(0.0).r;
+        let same_axis = |r: f32| angle_delta(2.0 * (r - angle)).abs() <= EPSILON;
+        let mut rotation_keys = self
+            .keys
+            .iter()
+            .filter(|k| !k.linked_space && k.sets(Property::Rotation))
+            .peekable();
+        while let Some(key) = rotation_keys.next() {
+            if !same_axis(key.r)
+                || rotation_keys.peek().is_some_and(|next| {
+                    key.r != next.r && key.ease.as_deref().unwrap_or(&self.ease) != "hold"
+                })
+            {
+                return None;
+            }
+        }
+        if self
+            .rotation_clips
+            .iter()
+            .any(|c| c.duration > 0.0 && c.degrees != 0.0)
+            || crate::motion::motions(self).iter().any(|motion| {
+                !motion.linked_space
+                    && (motion.spin != 0.0
+                        || !same_axis(motion.start_pose.r)
+                        || motion
+                            .base_keys
+                            .iter()
+                            .any(|k| !k.linked_space && k.sets(Property::Rotation) && k.r != angle))
+            })
+        {
+            return None;
+        }
+        let own_rotation = angle + self.base_rotation;
+        let axes = Transform::from_rotate(own_rotation).post_concat(basis);
+        let (sx, sy, rotation) = decompose(axes)?;
+        Some((sx, sy, angle_delta(rotation - own_rotation)))
+    }
+
     pub(crate) fn resize_world_space(&mut self, sx: f32, sy: f32) {
-        if let Some(space) = self.parent_space {
-            self.parent_space = matrix(from_matrix(space).post_scale(sx, sy));
+        let Some(basis) = self.parent_space.map(from_matrix) else {
+            return;
+        };
+        let linear = Transform {
+            tx: 0.0,
+            ty: 0.0,
+            ..basis
+        };
+        // Move the anchors by the canvas ratios while retaining the basis of the artwork.
+        // Convert the canvas scale back into key coordinates to leave the linear basis intact.
+        if let Some(inverse) = linear.invert() {
+            self.map_positions(linear.post_scale(sx, sy).post_concat(inverse));
+        }
+        self.parent_space = matrix(Transform {
+            tx: basis.tx * sx,
+            ty: basis.ty * sy,
+            ..basis
+        });
+    }
+
+    fn map_positions(&mut self, transform: Transform) {
+        if let Some(pose) = &mut self.rest_pose {
+            (pose.x, pose.y) = point(transform, pose.x, pose.y);
+        }
+        for key in self.keys.iter_mut().filter(|key| !key.linked_space) {
+            (key.x, key.y) = point(transform, key.x, key.y);
+        }
+        self.map_motion_points(
+            |p| {
+                if let (Some(x), Some(y)) = (number(p, "x"), number(p, "y")) {
+                    let (x, y) = point(transform, x, y);
+                    p["x"] = serde_json::json!(x);
+                    p["y"] = serde_json::json!(y);
+                }
+            },
+            |_| {},
+        );
+    }
+
+    fn map_motion_points(
+        &mut self,
+        mut map: impl FnMut(&mut Value),
+        mut adjust_motion: impl FnMut(&mut Value),
+    ) {
+        for motion in self
+            .extra
+            .get_mut("motions")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .filter(|motion| !linked_space(motion))
+        {
+            adjust_motion(motion);
+            if let Some(start) = motion.get_mut("startPose") {
+                map(start);
+            }
+            for field in ["sourcePoints", "baseKeys"] {
+                for p in motion
+                    .get_mut(field)
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| !linked_space(p))
+                {
+                    map(p);
+                }
+            }
         }
     }
 
@@ -348,6 +536,20 @@ impl Shape {
                 }
             }
         }
+    }
+}
+
+fn linked_space(value: &Value) -> bool {
+    value.get("linkedSpace").and_then(Value::as_bool) == Some(true)
+}
+
+fn number(value: &Value, field: &str) -> Option<f32> {
+    value.get(field)?.as_f64().map(|v| v as f32)
+}
+
+fn map_number(value: &mut Value, field: &str, map: impl FnOnce(f32) -> f32) {
+    if let Some(v) = number(value, field) {
+        value[field] = serde_json::json!(map(v));
     }
 }
 
@@ -460,6 +662,166 @@ mod tests {
         assert_eq!(scene.delete_layers(&["parent".into()], 1.0), 1);
         assert!(scene.shapes[0].parent.is_none());
         assert_near(corner(&scene, 0), seen);
+    }
+
+    #[test]
+    fn clearing_follows_and_deleting_a_parent_bake_a_non_uniform_scale() {
+        for (delete, angle, size) in [(false, 0.0, (160.0, 40.0)), (true, 90.0, (80.0, 80.0))] {
+            let mut scene = scene();
+            scene.shapes[1].keys[0].r = angle;
+            scene.set_parent(1, Some(0), 0.0).unwrap();
+            scene.shapes[0].keys[0].w *= 2.0;
+            let before = scene.layer_frame(&scene.shapes[1], 0.0).box_transform();
+            let index = if delete {
+                scene.delete_layers(&["parent".into()], 0.0);
+                0
+            } else {
+                scene.set_parent(1, None, 0.0).unwrap();
+                1
+            };
+            let child = &scene.shapes[index];
+            assert!(child.parent.is_none() && child.parent_space.is_none());
+            let p = child.pose(0.0);
+            assert_near((p.w, p.h), size);
+            let after = scene.layer_frame(child, 0.0).box_transform();
+            for (x, y) in [(0.5, 0.5), (-0.5, 0.5), (0.5, -0.5)] {
+                assert_near(point(after, x, y), point(before, x, y));
+            }
+            scene.resize(600.0, 960.0);
+            let p = scene.shapes[index].pose(0.0);
+            assert_near((p.w, p.h), (size.0 * 0.625, size.1 * 0.625));
+        }
+    }
+
+    #[test]
+    fn detaching_a_rotated_and_uniformly_scaled_parent_bakes_rest_and_motion_data() {
+        use crate::motion::{self, Options, Point};
+
+        let mut scene = scene();
+        scene.set_anchor(1, Anchor { x: 0.2, y: 0.8 }, 0.0);
+        let start = scene.shapes[1].pose(0.0);
+        scene.shapes[1].rest_pose = Some(start);
+        scene.shapes[1].keys[0].props = Some(vec![Property::Position, Property::Rotation]);
+        scene.shapes[1].key_property(1.0, Property::Rotation, Pose { r: 18.0, ..start });
+        motion::draw(
+            &mut scene,
+            1,
+            "arrow",
+            start,
+            &[Point {
+                x: start.x + 60.0,
+                y: start.y + 20.0,
+            }],
+            0.0,
+            Options {
+                seconds: 2.0,
+                spin: 45.0,
+                face: true,
+                ..Default::default()
+            },
+            "move".into(),
+        )
+        .unwrap();
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        let key = &mut scene.shapes[0].keys[0];
+        (key.w, key.h, key.r) = (160.0, 80.0, 55.0);
+        let mut detached = scene.clone();
+        detached.set_parent(1, None, 0.0).unwrap();
+        let child = &detached.shapes[1];
+        assert!(child.parent_space.is_none());
+        let rest = child.rest_pose.unwrap();
+        assert_near((rest.w, rest.h), (160.0, 80.0));
+        let before = &motion::motions(&scene.shapes[1])[0];
+        let after = &motion::motions(child)[0];
+        let space = scene.layer_frame(&scene.shapes[1], 0.0).space;
+        for (a, b) in after.source_points.iter().zip(&before.source_points) {
+            assert_near((a.x, a.y), point(space, b.x, b.y));
+        }
+        assert_near(
+            (after.start_pose.x, after.start_pose.y),
+            point(space, before.start_pose.x, before.start_pose.y),
+        );
+        assert_near((after.base_keys[1].r, after.start_pose.r), (73.0, 55.0));
+        let compare = |a: &Scene, b: &Scene| {
+            for t in [0.0, 0.5, 1.0, 1.5, 2.0] {
+                let a = a.layer_frame(&a.shapes[1], t).box_transform();
+                let b = b.layer_frame(&b.shapes[1], t).box_transform();
+                for (x, y) in [(0.5, 0.5), (-0.5, 0.5), (0.5, -0.5)] {
+                    assert_near(point(a, x, y), point(b, x, y));
+                }
+            }
+        };
+        compare(&scene, &detached);
+        motion::remove(&mut scene, 1, "move");
+        motion::remove(&mut detached, 1, "move");
+        compare(&scene, &detached);
+    }
+
+    #[test]
+    fn resizing_a_detached_sheared_layer_moves_its_anchor_and_preserves_its_shape() {
+        let mut scene = scene();
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        scene.shapes[0].keys[0].w *= 2.0;
+        scene.shapes[0].keys[0].r = 35.0;
+        let pose = scene.shapes[1].pose(0.0);
+        scene.shapes[1].key_property(2.0, Property::Rotation, Pose { r: 180.0, ..pose });
+        scene.shapes[1].key_property(
+            2.0,
+            Property::Position,
+            Pose {
+                x: pose.x + 30.0,
+                ..pose
+            },
+        );
+        scene.set_parent(1, None, 1.0).unwrap();
+        assert!(scene.shapes[1].parent_space.is_some());
+        let old = scene.clone();
+        scene.resize(600.0, 960.0);
+        for t in [0.0, 0.5, 1.0, 2.0] {
+            let before = old.layer_frame(&old.shapes[1], t);
+            let after = scene.layer_frame(&scene.shapes[1], t);
+            let (x, y) = before.anchor();
+            assert_near(after.anchor(), (x * 0.625, y * 1.6));
+            for (x, y) in [(1.0, 0.0), (0.0, 1.0)] {
+                let (vx, vy) = vector(before.box_transform(), x, y);
+                assert_near(
+                    vector(after.box_transform(), x, y),
+                    (vx * 0.625, vy * 0.625),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inspector_edits_canvas_position_size_and_angle_through_a_parent() {
+        let mut scene = scene();
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        let key = &mut scene.shapes[0].keys[0];
+        (key.w, key.h, key.r) = (160.0, 40.0, 80.0);
+        scene.shapes[1].base_rotation = 15.0;
+        let initial = scene.inspector_pose(&scene.shapes[1], 1.0);
+        let wanted = Pose {
+            x: 310.0,
+            y: 200.0,
+            w: 1.0,
+            h: 95.0,
+            r: 455.0,
+            ..initial
+        };
+        scene.set_inspector_pose(
+            1,
+            1.0,
+            wanted,
+            &[Property::Position, Property::Size, Property::Rotation],
+        );
+        let seen = scene.inspector_pose(&scene.shapes[1], 1.0);
+        assert_near((seen.x, seen.y), (wanted.x, wanted.y));
+        assert_near((seen.w, seen.h), (wanted.w, wanted.h));
+        assert_near((seen.r, seen.o), (wanted.r, wanted.o));
+        scene.set_inspector_pose(1, 1.0, Pose { r: 25.0, ..seen }, &[Property::Rotation]);
+        let turned = scene.inspector_pose(&scene.shapes[1], 1.0);
+        assert_near((turned.w, turned.h), (seen.w, seen.h));
+        assert_near((turned.r, turned.o), (25.0, seen.o));
     }
 
     #[test]

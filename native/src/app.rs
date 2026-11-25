@@ -1316,7 +1316,7 @@ impl Forma {
         self.clip_fields(ui, index);
         let mut pose = self
             .scene
-            .editable_pose(&self.scene.shapes[index], self.time);
+            .inspector_pose(&self.scene.shapes[index], self.time);
         let shape = &mut self.scene.shapes[index];
         let mut changed = false;
         changed |= ui.text_edit_singleline(&mut shape.name).changed();
@@ -1444,6 +1444,7 @@ impl Forma {
         if ui
             .add(
                 egui::Slider::new(&mut blur, 0.0..=100.0)
+                    .clamping(egui::SliderClamping::Edits)
                     .step_by(1.0)
                     .text("Blur")
                     .suffix(" px"),
@@ -1466,6 +1467,11 @@ impl Forma {
         egui::CollapsingHeader::new("Position & size")
             .id_salt("forma-position")
             .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Measured on the canvas")
+                        .small()
+                        .color(color::INK_MUTED),
+                );
                 ui.checkbox(lock_ratio, "Lock size ratio");
                 for (label, value, range) in [
                     ("X", &mut pose.x, -4000.0..=4000.0),
@@ -1476,7 +1482,11 @@ impl Forma {
                     ("Opacity", &mut pose.o, 0.0..=100.0),
                 ] {
                     posed |= ui
-                        .add(egui::Slider::new(value, range).text(label))
+                        .add(
+                            egui::Slider::new(value, range)
+                                .text(label)
+                                .clamping(egui::SliderClamping::Edits),
+                        )
                         .changed();
                 }
                 Self::anchor_controls(ui, &mut anchor);
@@ -1527,12 +1537,19 @@ impl Forma {
             .into_iter()
             .filter(|p| p.values(old) != p.values(pose))
             .collect();
+        self.playing = false;
+        let at = model::hundredths(self.time);
+        self.time = if at <= self.scene.duration {
+            at
+        } else {
+            (self.scene.duration * 100.0).floor() / 100.0
+        };
         let mut layers: Vec<_> = self
             .selection()
             .into_iter()
             .filter(|&i| i != index)
             .map(|i| {
-                let mut other = self.scene.editable_pose(&self.scene.shapes[i], self.time);
+                let mut other = self.scene.inspector_pose(&self.scene.shapes[i], self.time);
                 for &property in &properties {
                     let values = if property == Property::Position {
                         [other.x + pose.x - old.x, other.y + pose.y - old.y]
@@ -1547,9 +1564,8 @@ impl Forma {
         layers.push((index, pose));
         layers.sort_by_key(|(i, _)| self.scene.ancestor_depth(*i));
         for (i, pose) in layers {
-            for &property in &properties {
-                self.scene.set_property_pose(i, self.time, pose, property);
-            }
+            self.scene
+                .set_inspector_pose(i, self.time, pose, &properties);
         }
     }
 

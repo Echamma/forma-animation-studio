@@ -465,10 +465,12 @@ impl Scene {
             if shape.parent.as_ref().is_some_and(|id| ids.contains(id)) {
                 continue;
             }
-            if shape.parent_space.is_some() {
+            let (sx, sy) = if shape.parent_space.is_some() {
                 shape.resize_world_space(sx, sy);
-                continue;
-            }
+                (1.0, 1.0)
+            } else {
+                (sx, sy)
+            };
             if let Some(pose) = &mut shape.rest_pose {
                 (pose.x, pose.y, pose.w, pose.h) =
                     (pose.x * sx, pose.y * sy, pose.w * scale, pose.h * scale);
@@ -668,17 +670,67 @@ impl Scene {
         let frame = self.layer_frame(shape, t);
         let mut pose = frame.pose;
         (pose.x, pose.y) = frame.anchor();
-        let own = shape.pose(t);
+        if self.linked_target(shape).is_none() {
+            pose.r = shape.pose(t).r;
+        }
+        pose.o = self.editable_opacity(shape, t);
+        pose
+    }
+
+    pub(crate) fn editable_opacity(&self, shape: &Shape, t: f64) -> f32 {
         if let Some(target) = self.linked_target(shape) {
-            pose.o = (target.pose(t).o
+            (target.pose(t).o
                 * value_f32(&shape.extra, "opacityFactor", 1.0)
                 * (shape.lane_pose(t).o / 100.0))
-                .clamp(0.0, 100.0);
+                .clamp(0.0, 100.0)
         } else {
-            pose.r = own.r;
-            pose.o = own.o;
+            shape.pose(t).o
         }
-        pose
+    }
+
+    pub(crate) fn set_inspector_pose(
+        &mut self,
+        index: usize,
+        t: f64,
+        mut pose: Pose,
+        properties: &[Property],
+    ) {
+        use crate::transform::{angle_delta, axis_scales, vector};
+        use tiny_skia::Transform;
+
+        let shape = &self.shapes[index];
+        let frame = self.layer_frame(shape, t);
+        let mut properties = properties.to_vec();
+        let mut angle = frame.pose.r;
+        let rotating = properties.contains(&Property::Rotation);
+        if rotating {
+            let Some(inverse) = frame.space.invert() else {
+                return;
+            };
+            let radians = pose.r.to_radians();
+            let (x, y) = vector(inverse, radians.cos(), radians.sin());
+            // Invert the direction through the affine frame and keep the requested number of turns.
+            let expected = angle + (pose.r - frame.scene_pose().r);
+            angle = expected + angle_delta(y.atan2(x).to_degrees() - expected);
+            pose.r = if self.linked_target(shape).is_some() {
+                angle
+            } else {
+                angle - shape.base_rotation - shape.rotation_at(t)
+            };
+        }
+        if rotating || properties.contains(&Property::Size) {
+            let axes = Transform::from_rotate(angle).post_concat(frame.space);
+            let (sx, sy) = axis_scales(axes);
+            let (w, h) = (pose.w / sx, pose.h / sy);
+            if properties.contains(&Property::Size) {
+                (pose.w, pose.h) = (w, h);
+            } else if (w - frame.pose.w).abs().max((h - frame.pose.h).abs()) > 0.0001 {
+                // Under non-uniform scale, turning changes the on-screen edge lengths.
+                (pose.w, pose.h) = (w, h);
+                properties.push(Property::Size);
+            }
+        }
+        self.set_pose_inner(index, t, pose, &properties, true);
     }
 
     /// Sets the editable pose of the layer at `index`: linked text keeps it as offsets from what it's linked to
@@ -1216,6 +1268,9 @@ impl Scene {
             shape.extra.remove("linkBase");
             if let Some(motions) = shape.extra.get_mut("motions").and_then(Value::as_array_mut) {
                 motions.retain(|m| m.get("linkedSpace").and_then(Value::as_bool) != Some(true));
+            }
+            if shape.parent.is_none() {
+                shape.bake_parent_space();
             }
         }
         let before = self.shapes.len();

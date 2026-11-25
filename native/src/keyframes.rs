@@ -123,6 +123,11 @@ impl Key {
     }
 
     fn set_value(&mut self, property: Property, values: [f32; 2]) {
+        if property == Property::Size && values.iter().all(|v| v.is_finite() && *v > 0.0) {
+            // A subpixel layer can still be several canvas pixels wide under a scaled parent.
+            [self.w, self.h] = values;
+            return;
+        }
         let mut p = Pose::from(&*self);
         property.set(&mut p, values);
         (self.x, self.y, self.w, self.h, self.r, self.o) = (p.x, p.y, p.w, p.h, p.r, p.o);
@@ -162,7 +167,8 @@ impl LaneKey {
             Self::Pose(property, key) => {
                 let mut values = property.values(Pose::from(&*key));
                 if *property == Property::Size && lock_ratio {
-                    values[1 - channel] *= value.max(1.0) / values[channel];
+                    values[1 - channel] =
+                        (values[1 - channel] * value.max(1.0) / values[channel]).max(1.0);
                 }
                 values[channel] = value;
                 key.set_value(*property, values);
@@ -440,7 +446,7 @@ impl Shape {
             || !delta.is_finite()
             || selected.iter().any(|key| {
                 let to = key.time() + delta;
-                to < 0.0
+                (to < 0.0 && !same_time(to, 0.0))
                     || others.iter().any(|other| {
                         same_time(other.time(), to)
                             && !times.iter().any(|&t| same_time(t, other.time()))
@@ -460,7 +466,7 @@ impl Shape {
             self.remove_lane_key(lane, key.time());
         }
         for key in selected {
-            self.put_lane_key(key.time() + delta, key);
+            self.put_lane_key((key.time() + delta).max(0.0), key);
         }
         self.rest_pose = rest;
         self.linked_rest = linked_rest;

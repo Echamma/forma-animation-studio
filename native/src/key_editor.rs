@@ -1,4 +1,4 @@
-use crate::keyframes::{EASINGS, Lane, LaneKey, same_time};
+use crate::keyframes::{EASINGS, Lane, LaneKey, Property, same_time};
 use crate::model::{Scene, Shape, ease_at, hundredths};
 use canopy_ui::{Accent, color, font};
 use egui::{Align2, Color32, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
@@ -91,9 +91,9 @@ struct KeyDrag {
     source: Pick,
     origin: Pos2,
     plot: Plot,
-    channel: Option<usize>,
+    graph_key: Option<(usize, LaneKey)>,
     picks: Vec<Pick>,
-    shapes: Vec<(usize, Shape)>,
+    delta: f64,
 }
 
 struct HandleDrag {
@@ -727,13 +727,13 @@ impl KeyEditor {
                 if !self.picked(track, hit.time) {
                     self.select(track, hit.time, extend(ui), false);
                 }
-                let shapes = scene
-                    .shapes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| self.selected.iter().any(|p| p.track.layer == s.id))
-                    .map(|(i, s)| (i, s.clone()))
-                    .collect();
+                let graph_key = if graph {
+                    track_shape(scene, track)
+                        .and_then(|s| s.lane_key(track.lane, hit.time))
+                        .map(|key| (hit.channel, key))
+                } else {
+                    None
+                };
                 self.drag = Some(Drag::Keys(KeyDrag {
                     source: Pick {
                         track: track.clone(),
@@ -741,9 +741,9 @@ impl KeyEditor {
                     },
                     origin,
                     plot,
-                    channel: graph.then_some(hit.channel),
+                    graph_key,
                     picks: self.selected.clone(),
-                    shapes,
+                    delta: 0.0,
                 }));
                 selected_layer = true;
             } else {
@@ -818,6 +818,13 @@ impl KeyEditor {
         let Some(mut drag) = self.drag.take() else {
             return;
         };
+        if let Drag::Keys(drag) = &drag {
+            let mut source = drag.source.clone();
+            source.time += drag.delta;
+            if key_at(scene, &source).is_none() {
+                return;
+            }
+        }
         let (down, released, pointer, free) = ui.input(|i| {
             (
                 i.pointer.primary_down(),
@@ -968,17 +975,18 @@ impl KeyEditor {
 
 impl KeyDrag {
     fn apply(
-        &self,
+        &mut self,
         scene: &mut Scene,
         pointer: Pos2,
         playhead: f64,
         free: bool,
         lock_ratio: bool,
     ) -> Option<Vec<Pick>> {
+        self.picks.retain(|p| key_at(scene, p).is_some());
         let first = self
             .picks
             .iter()
-            .map(|p| p.time)
+            .map(|p| p.time - self.delta)
             .fold(f64::INFINITY, f64::min);
         let t = self.source.time;
         let view = self.plot.view;
@@ -992,9 +1000,16 @@ impl KeyDrag {
             hundredths(t + delta) - t
         };
         delta = delta.max(-first);
+        let step = delta - self.delta;
 
-        let mut shapes = self.shapes.clone();
-        for (_, shape) in &mut shapes {
+        // Stage changes against the live layers. A collision in one lane rejects the whole move.
+        let mut changed = Vec::new();
+        for live in scene
+            .shapes
+            .iter()
+            .filter(|s| self.picks.iter().any(|p| p.track.layer == s.id))
+        {
+            let mut shape = live.clone();
             for lane in Lane::ALL {
                 let times: Vec<_> = self
                     .picks
@@ -1002,31 +1017,53 @@ impl KeyDrag {
                     .filter(|p| p.track.layer == shape.id && p.track.lane == lane)
                     .map(|p| p.time)
                     .collect();
-                if !times.is_empty() && !shape.retime_lane_keys(lane, &times, delta) {
+                if !times.is_empty() && !shape.retime_lane_keys(lane, &times, step) {
                     return None;
                 }
             }
-            if let Some(channel) = self.channel.filter(|_| shape.id == self.source.track.layer) {
+            if let Some((channel, original)) = self
+                .graph_key
+                .as_ref()
+                .filter(|_| shape.id == self.source.track.layer)
+            {
+                let channel = *channel;
                 let lane = self.source.track.lane;
                 let time = t + delta;
                 let mut key = shape.lane_key(lane, time)?;
-                let value = key.value(channel) + self.plot.value(pointer.y)
+                let value = original.value(channel) + self.plot.value(pointer.y)
                     - self.plot.value(self.origin.y);
-                if value != key.value(channel) {
-                    key.set_value(channel, value, lock_ratio);
+                let size_lane = lane == Lane::Pose(Property::Size);
+                let mut desired = original.clone();
+                if value != original.value(channel) {
+                    let value = if size_lane { value.max(1.0) } else { value };
+                    desired.set_value(channel, value, lock_ratio);
+                }
+                let size_locked = lock_ratio && size_lane;
+                if key.value(channel) != desired.value(channel)
+                    || (size_locked && key.value(1 - channel) != desired.value(1 - channel))
+                {
+                    key.set_value(channel, desired.value(channel), false);
+                    if size_locked {
+                        key.set_value(1 - channel, desired.value(1 - channel), false);
+                    }
                     shape.put_lane_key(time, key);
                 }
             }
+            if shape != *live {
+                changed.push(shape);
+            }
         }
-        let mut picks = self.picks.clone();
-        for pick in &mut picks {
-            pick.time += delta;
+        for pick in &mut self.picks {
+            pick.time += step;
             scene.duration = scene.duration.max(pick.time);
         }
-        for (index, shape) in shapes {
-            scene.shapes[index] = shape;
+        for shape in changed {
+            if let Some(live) = scene.shapes.iter_mut().find(|s| s.id == shape.id) {
+                *live = shape;
+            }
         }
-        Some(picks)
+        self.delta = delta;
+        Some(self.picks.clone())
     }
 }
 
@@ -1095,8 +1132,83 @@ fn easing_label(kind: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyframes::Property;
     use egui::{Context, Event, Modifiers, PointerButton, RawInput};
+
+    #[test]
+    fn key_drag_survives_layer_list_changes_and_stops_when_its_source_is_deleted() {
+        let ctx = Context::default();
+        let mut scene = Scene::empty("live-key-drag".into());
+        for id in ["before", "source", "other", "removed"] {
+            scene.add_shape(id.into(), "rect");
+        }
+        let lane = Lane::Pose(Property::Position);
+        let pick = |layer: &str| Pick {
+            track: Track {
+                layer: layer.into(),
+                lane,
+            },
+            time: 0.0,
+        };
+        let area = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 100.0));
+        let plot = Plot {
+            rect: area,
+            view: TimeView {
+                start: 0.0,
+                span: 4.0,
+            },
+            values: 0.0..=100.0,
+        };
+        let mut editor = KeyEditor {
+            drag: Some(Drag::Keys(KeyDrag {
+                source: pick("source"),
+                origin: pos2(0.0, 50.0),
+                plot,
+                graph_key: None,
+                picks: vec![pick("source"), pick("other"), pick("removed")],
+                delta: 0.0,
+            })),
+            ..Default::default()
+        };
+        let button = Event::PointerButton {
+            pos: pos2(50.0, 50.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        };
+        let mut frame = |scene: &mut Scene, events| {
+            ctx.run_ui(
+                RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    editor.begin_frame(scene);
+                    editor.finish_frame(ui, scene, area, 0.0, false);
+                },
+            )
+            .textures_delta
+            .clear();
+        };
+        frame(&mut scene, vec![button]);
+        scene.delete_layers(&["before".into(), "removed".into()], 0.0);
+        scene.add_shape("added".into(), "circle");
+        scene.shapes.swap(0, 2);
+        scene.shapes[1].name = "Renamed during the drag".into();
+        let added = scene.shapes[0].clone();
+        frame(&mut scene, vec![Event::PointerMoved(pos2(100.0, 50.0))]);
+        assert_eq!(scene.shapes[0], added);
+        assert_eq!(scene.shapes[1].name, "Renamed during the drag");
+        for id in ["source", "other"] {
+            let shape = track_shape(&scene, &pick(id).track).unwrap();
+            assert!(shape.lane_key(lane, 1.0).is_some());
+            assert!(shape.lane_key(lane, 0.5).is_none());
+        }
+        scene.delete_layers(&["source".into()], 0.0);
+        frame(&mut scene, vec![Event::PointerMoved(pos2(150.0, 50.0))]);
+        assert!(editor.drag.is_none());
+        assert!(scene.shapes[1].lane_key(lane, 1.0).is_some());
+        assert!(scene.shapes[1].lane_key(lane, 1.5).is_none());
+    }
 
     #[test]
     fn box_select_drag_copy_paste_and_delete_work_across_lanes() {

@@ -26,7 +26,6 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
     for shape in &scene.shapes {
         let p = scene.local_pose(shape, 0.0);
         let mut styling = format!(r#"<g fill="{}""#, attr(&shape.color_at(0.0)));
-        styling.push_str(&blur_filter(shape, p, &mut defs));
         let mut chain = vec![shape];
         while let Some(parent) = chain.last().and_then(|s| {
             s.parent
@@ -51,9 +50,11 @@ pub fn animated(scene: &Scene, place: &Place) -> Result<String, String> {
         let geometry = geometry(shape, place)?;
         let nested = chain.len() > 1 || shape.parent_space.is_some();
         if !nested {
+            styling.push_str(&blur_filter(shape, p, &mut defs));
             layers.push_str(&animate_group(scene, shape, styling, &geometry, true));
             continue;
         }
+        styling.push_str(&canvas_blur_filter(scene, shape, 0.0, &chain, &mut defs));
         let mut content = animate_group(scene, shape, "<g".into(), &geometry, true);
         for (i, layer) in chain.iter().enumerate() {
             if i != 0 {
@@ -170,13 +171,14 @@ pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
         let frame = scene.layer_frame(shape, t);
         let p = frame.pose;
         let mut group = format!(r#"<g fill="{}""#, attr(&shape.color_at(t)));
-        group.push_str(&blur_filter(shape, p, &mut defs));
         if frame.space.is_identity() && shape.anchor.is_none() {
+            group.push_str(&blur_filter(shape, p, &mut defs));
             write!(group, r#" transform="translate({} {})"><g transform="rotate({})"><g transform="scale({} {})" opacity="{}">"#,
                 p.x, p.y, p.r, p.w, p.h, p.o / 100.0).unwrap();
             group.push_str(&geometry(shape, place)?);
             group.push_str("</g></g></g>");
         } else {
+            group.push_str(&canvas_blur_filter(scene, shape, t, &[], &mut defs));
             let ts = frame.box_transform();
             let matrix = svg_matrix([ts.sx, ts.ky, ts.kx, ts.sy, ts.tx, ts.ty]);
             write!(
@@ -203,12 +205,7 @@ pub fn still(scene: &Scene, place: &Place, t: f64) -> Result<String, String> {
 
 /// A blurred layer's filter, added to `defs`; the attribute that puts it on the layer's group (empty for no blur).
 fn blur_filter(shape: &Shape, p: Pose, defs: &mut String) -> String {
-    let blur = shape
-        .extra
-        .get("blur")
-        .and_then(|v| v.as_f64())
-        .filter(|v| v.is_finite())
-        .map_or(0.0, |v| v.clamp(0.0, 100.0));
+    let blur = f64::from(crate::render::blur(shape));
     if blur <= 0.0 {
         return String::new();
     }
@@ -218,6 +215,75 @@ fn blur_filter(shape: &Shape, p: Pose, defs: &mut String) -> String {
     let id = attr(&format!("blur-{}", shape.id));
     write!(defs, r#"<filter id="{id}" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}"><feGaussianBlur stdDeviation="{blur}"/></filter>"#,
         -width / 2.0 - margin, -height / 2.0 - margin, width + margin * 2.0, height + margin * 2.0).unwrap();
+    format!(r#" filter="url(#{id})""#)
+}
+
+/// Nested layers are filtered in canvas coordinates, with the same radius as the raster renderer.
+fn canvas_blur_filter(
+    scene: &Scene,
+    shape: &Shape,
+    at: f64,
+    chain: &[&Shape],
+    defs: &mut String,
+) -> String {
+    let blur = crate::render::blur(shape);
+    if blur <= 0.0 {
+        return String::new();
+    }
+    let radius = |t| blur * crate::transform::max_scale(scene.layer_frame(shape, t).space);
+    let first = radius(at);
+    let mut samples = vec![(at, first)];
+    if chain.iter().skip(1).any(|layer| {
+        layer.keys.len() > 1 || !layer.rotation_clips.is_empty() || link(scene, layer).is_some()
+    }) {
+        let duration = scene.duration;
+        let count = (duration * 60.0).ceil().clamp(1.0, 12000.0) as u32;
+        let mut times: Vec<_> = (1..=count)
+            .map(|i| duration * f64::from(i) / f64::from(count))
+            .collect();
+        for layer in chain.iter().skip(1) {
+            times.extend(
+                event_times(scene, layer, &mut vec![layer.id.clone()])
+                    .into_iter()
+                    .filter(|time| *time > 0.0 && *time <= duration),
+            );
+        }
+        times.sort_by(f64::total_cmp);
+        times.dedup();
+        for t in times {
+            let (before, current) = (radius(t - EPSILON), radius(t));
+            if (before - current).abs() > JUMP {
+                samples.push((t, before));
+            }
+            samples.push((t, current));
+        }
+    }
+    let largest = samples
+        .iter()
+        .map(|(_, sigma)| *sigma)
+        .fold(first, f32::max);
+    let margin = largest * 3.0 + 4.0;
+    let id = attr(&format!("blur-{}", shape.id));
+    write!(defs, r#"<filter id="{id}" filterUnits="userSpaceOnUse" x="{}" y="{}" width="{}" height="{}"><feGaussianBlur stdDeviation="{first}""#,
+        -margin, -margin, scene.width + 2.0 * margin, scene.height + 2.0 * margin).unwrap();
+    if samples
+        .iter()
+        .any(|(_, sigma)| (*sigma - first).abs() > 0.001)
+    {
+        let times = samples
+            .iter()
+            .map(|(t, _)| fixed(t / scene.duration, 6))
+            .collect::<Vec<_>>();
+        let radii = samples
+            .iter()
+            .map(|(_, sigma)| fixed(f64::from(*sigma), 3))
+            .collect::<Vec<_>>();
+        write!(defs, r#"><animate attributeName="stdDeviation" dur="{}s" repeatCount="indefinite" calcMode="linear" keyTimes="{}" values="{}"/></feGaussianBlur>"#,
+            scene.duration, times.join(";"), radii.join(";")).unwrap();
+    } else {
+        defs.push_str("/>");
+    }
+    defs.push_str("</filter>");
     format!(r#" filter="url(#{id})""#)
 }
 
@@ -530,6 +596,42 @@ mod tests {
         let svg = animated(&scene, &place()).unwrap();
         assert!(svg.contains("Fish &amp; &lt;chips&gt;"));
         assert!(svg.contains(r#"<feGaussianBlur stdDeviation="4"/>"#));
+        assert!(crate::svg::parse(&svg).is_ok());
+    }
+
+    #[test]
+    fn svg_blur_follows_animated_parent_scale() {
+        let mut scene = Scene::empty("svg-blur".into());
+        scene.add_shape("parent".into(), "rect");
+        scene.add_shape("child".into(), "circle");
+        scene.shapes[1].extra.insert("blur".into(), 8.into());
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        let parent = &mut scene.shapes[0];
+        let pose = parent.pose(0.0);
+        parent.edit_pose(
+            1.0,
+            Pose {
+                w: 2.0 * pose.w,
+                h: 2.0 * pose.h,
+                ..pose
+            },
+        );
+
+        let svg = animated(&scene, &place()).unwrap();
+        let doc = roxmltree::Document::parse(&svg).unwrap();
+        let blur = doc
+            .descendants()
+            .find(|n| n.has_tag_name("feGaussianBlur"))
+            .unwrap();
+        assert_eq!(blur.attribute("stdDeviation"), Some("8"));
+        let motion = blur.first_element_child().unwrap();
+        assert_eq!(motion.attribute("attributeName"), Some("stdDeviation"));
+        assert_eq!(
+            motion.attribute("values").unwrap().rsplit(';').next(),
+            Some("16")
+        );
+        let svg = still(&scene, &place(), 1.0).unwrap();
+        assert!(svg.contains(r#"<feGaussianBlur stdDeviation="16"/>"#));
         assert!(crate::svg::parse(&svg).is_ok());
     }
 

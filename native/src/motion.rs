@@ -185,6 +185,11 @@ fn apply(shape: &mut Shape, m: &Motion, scene_duration: f64) {
             .map(|(_, p)| *p)
             .collect()
     };
+    let face_rotation = m
+        .extra
+        .get("faceRotation")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0) as f32;
     for (i, p) in samples.iter().enumerate().skip(1) {
         let f = i as f32 / (samples.len() - 1) as f32;
         let (next, previous) = (
@@ -198,10 +203,16 @@ fn apply(shape: &mut Shape, m: &Motion, scene_duration: f64) {
             ..m.start_pose
         };
         if m.face {
-            pose.r = (next.y - previous.y)
+            let heading = (next.y - previous.y)
                 .atan2(next.x - previous.x)
-                .to_degrees()
-                + m.spin * f;
+                .to_degrees();
+            // Keep the heading's original wrap point after baking a parent rotation.
+            let heading = if face_rotation == 0.0 {
+                heading
+            } else {
+                face_rotation + crate::transform::angle_delta(heading - face_rotation)
+            };
+            pose.r = heading + m.spin * f;
         }
         shape.keys.push(key(
             ((m.start_time + span * f as f64) * 100.0).round() / 100.0,

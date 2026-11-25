@@ -272,7 +272,7 @@ impl Renderer {
             let Some(ink) = self.ink(shape, frame, &shape.color_at(t), view, frames) else {
                 continue;
             };
-            let blur = blur(shape) * scale;
+            let blur = blur(shape) * crate::transform::max_scale(frame.space) * scale;
             if blur <= 0.0 {
                 ink.paint(canvas, Transform::identity());
                 continue;
@@ -389,14 +389,14 @@ fn shape_outline(kind: &str, w: f32, h: f32) -> Option<Outline> {
     path.finish()
 }
 
-/// A layer's blur in pixels, as Electron Forma reads it.
-fn blur(shape: &Shape) -> f32 {
+/// A layer's blur in its own pixels.
+pub(crate) fn blur(shape: &Shape) -> f32 {
     shape
         .extra
         .get("blur")
         .and_then(|v| v.as_f64())
         .filter(|v| v.is_finite())
-        .map_or(0.0, |v| v.clamp(0.0, 100.0) as f32)
+        .map_or(0.0, |v| v.max(0.0) as f32)
 }
 
 /// Gaussian blur with standard deviation `sigma` (what CSS `blur()` means), as three box blurs each way, the
@@ -529,12 +529,19 @@ pub fn frame_sized(
         let Some(file) = renderer.video(&shape.id) else {
             continue;
         };
-        let duration = crate::media::probe(file)?.duration;
-        let (width, height) = video_size(shape, 1.0);
+        let info = crate::media::probe(file)?;
+        let (width, height) = video_size(scene, shape, size, std::iter::once(t));
+        let (width, height) = limit_decode_size((width, height), info);
         frames.insert(
             shape.id.clone(),
-            crate::media::Frames::start(file, shape.media_time(t, duration), 30, width, height)?
-                .next()?,
+            crate::media::Frames::start(
+                file,
+                shape.media_time(t, info.duration),
+                30,
+                width,
+                height,
+            )?
+            .next()?,
         );
     }
     renderer.frame(scene, t, size, &frames)
@@ -545,16 +552,38 @@ pub fn scene_size(scene: &Scene) -> (u32, u32) {
     (scene.width.round() as u32, scene.height.round() as u32)
 }
 
-/// The size to decode a video layer's frames at for an export `scale` times the scene's size: its largest size.
-pub fn video_size(shape: &Shape, scale: f32) -> (u32, u32) {
-    let rest = shape
-        .rest_pose
-        .map_or((2.0f32, 2.0f32), |p| (p.w.max(2.0), p.h.max(2.0)));
-    let (w, h) = shape
-        .keys
-        .iter()
-        .fold(rest, |(w, h), key| (w.max(key.w), h.max(key.h)));
-    ((w * scale).round() as u32, (h * scale).round() as u32)
+/// Pick a fixed decode size large enough for every requested frame, including the entire Follows chain.
+pub fn video_size(
+    scene: &Scene,
+    shape: &Shape,
+    output_size: (u32, u32),
+    times: impl Iterator<Item = f64>,
+) -> (u32, u32) {
+    let view = Transform::from_scale(
+        output_size.0 as f32 / scene.width,
+        output_size.1 as f32 / scene.height,
+    );
+    let (width, height) = times
+        .filter(|&t| shape.visible(t, scene.duration))
+        .map(|t| {
+            let frame = scene.layer_frame(shape, t);
+            crate::transform::axis_scales(frame.box_transform().post_concat(view))
+        })
+        .fold((2.0f32, 2.0f32), |(w, h), (x, y)| (w.max(x), h.max(y)));
+    (width.round() as u32, height.round() as u32)
+}
+
+pub(crate) fn limit_decode_size(
+    (width, height): (u32, u32),
+    source: crate::media::Info,
+) -> (u32, u32) {
+    // FFmpeg can autorotate the video before scaling. Use the long edge for both axes.
+    let max = source.width.max(source.height);
+    if max == 0 {
+        (width, height)
+    } else {
+        (width.min(max), height.min(max))
+    }
 }
 
 pub fn save_png(scene: &Scene, place: &Place, t: f64, output: &Path) -> Result<(), String> {
@@ -586,6 +615,7 @@ fn rgb(hex: &str) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Pose;
 
     fn place(root: std::path::PathBuf) -> Place {
         Place {
@@ -716,6 +746,63 @@ mod tests {
                 darkness(x)
             );
         }
+    }
+
+    #[test]
+    fn a_scaled_child_blurs_like_the_equivalent_canvas_size_and_radius() {
+        let mut scene = Scene::empty("parent-blur".into());
+        scene.add_shape("parent".into(), "rect");
+        scene.add_shape("child".into(), "circle");
+        scene.shapes[0].keys[0].o = 0.0;
+        scene.shapes[1].extra.insert("blur".into(), 8.into());
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        let parent = &mut scene.shapes[0].keys[0];
+        parent.w *= 2.0;
+        parent.h *= 2.0;
+        let place = place(std::env::temp_dir());
+        let parented = frame(&scene, &place, 0.0).unwrap();
+        scene.shapes[1].parent = None;
+        scene.shapes[1].parent_space = None;
+        let child = &mut scene.shapes[1];
+        child.keys[0].w *= 2.0;
+        child.keys[0].h *= 2.0;
+        child.extra.insert("blur".into(), 16.into());
+        let direct = frame(&scene, &place, 0.0).unwrap();
+        assert_eq!(parented.data(), direct.data());
+    }
+
+    #[test]
+    fn video_decode_uses_the_largest_visible_frame_across_animated_ancestors() {
+        let mut scene = Scene::empty("video-decode".into());
+        for (id, kind) in [("root", "rect"), ("parent", "rect"), ("child", "video")] {
+            scene.add_shape(id.into(), kind);
+        }
+        let child = &mut scene.shapes[2];
+        (child.keys[0].w, child.keys[0].h) = (80.0, 40.0);
+        child.in_time = Some(0.5);
+        scene.set_parent(1, Some(0), 0.0).unwrap();
+        scene.set_parent(2, Some(1), 0.0).unwrap();
+        let root = &mut scene.shapes[0];
+        let rest = root.pose(0.0);
+        root.edit_pose(
+            1.0,
+            Pose {
+                w: rest.w * 2.0,
+                ..rest
+            },
+        );
+        root.edit_pose(2.0, rest);
+        scene.shapes[1].keys[0].h *= 3.0;
+        let size = (1920, 1200);
+        let child = &scene.shapes[2];
+        assert_eq!(
+            video_size(&scene, child, size, [0.5, 1.0, 2.0].into_iter()),
+            (320, 240)
+        );
+        assert_eq!(
+            video_size(&scene, child, size, std::iter::once(2.0)),
+            (160, 240)
+        );
     }
 
     #[test]

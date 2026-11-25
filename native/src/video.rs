@@ -220,18 +220,27 @@ fn render_video(
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let (frames, size) = (settings.frames(scene), settings.size(scene));
-    let mut videos: HashMap<String, (&Path, Info)> = HashMap::new();
+    let mut videos: HashMap<String, (&Path, Info, (u32, u32))> = HashMap::new();
     for shape in scene.shapes.iter().filter(|s| s.kind == "video") {
         let file = renderer
             .video(&shape.id)
             .ok_or_else(|| format!("{}: the video file is missing", shape.name))?;
-        videos.insert(shape.id.clone(), (file, media::probe(file)?));
+        let info = media::probe(file)?;
+        let times = (0..frames)
+            .take_while(|_| !cancel.load(Ordering::Relaxed))
+            .map(|index| index as f64 / f64::from(settings.fps));
+        let decode_size =
+            render::limit_decode_size(render::video_size(scene, shape, size, times), info);
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Export stopped".into());
+        }
+        videos.insert(shape.id.clone(), (file, info, decode_size));
     }
     let sounds: Vec<Sound> = scene
         .shapes
         .iter()
         .filter_map(|shape| {
-            let (file, info) = videos.get(&shape.id).filter(|(_, info)| info.sound)?;
+            let (file, info, _) = videos.get(&shape.id).filter(|(_, info, _)| info.sound)?;
             let (start, end) = (
                 shape.in_time.unwrap_or(0.0),
                 shape.out_time.unwrap_or(scene.duration).min(scene.duration),
@@ -268,9 +277,8 @@ fn render_video(
         readers.retain(|id, _| showing.iter().any(|s| &s.id == id));
         let mut current = render::Frames::new();
         for shape in showing {
-            let (file, info) = videos[&shape.id];
+            let (file, info, (width, height)) = videos[&shape.id];
             if !readers.contains_key(&shape.id) {
-                let (width, height) = render::video_size(shape, settings.scale as f32);
                 readers.insert(
                     shape.id.clone(),
                     media::Frames::start(
