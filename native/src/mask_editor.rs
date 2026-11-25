@@ -619,6 +619,7 @@ fn matte_panel(ui: &mut Ui, scene: &mut Scene, index: usize) {
     let previous = source;
     egui::ComboBox::from_id_salt("matte-source")
         .width(ui.available_width())
+        .height(280.0)
         .selected_text(name)
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut source, None, "None");
@@ -675,6 +676,7 @@ fn choose<T: Copy + PartialEq, S: Into<egui::WidgetText>>(
     let old = *value;
     egui::ComboBox::from_id_salt(id)
         .width(ui.available_width())
+        .height(280.0)
         .selected_text(label(*value))
         .show_ui(ui, |ui| {
             for &choice in choices {

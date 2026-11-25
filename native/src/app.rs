@@ -82,10 +82,47 @@ enum Tab {
 }
 
 /// What the drawer beside the tool rail shows (Electron's Add and Layers drawer).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Drawer {
     Add,
     Layers,
+}
+
+const RAIL_WIDTH: f32 = 88.0;
+const DRAWER_WIDTH: f32 = 220.0;
+const MIN_DRAWER_WIDTH: f32 = 165.0;
+const MIN_CANVAS_WIDTH: f32 = 320.0;
+const COMPACT_CANVAS_WIDTH: f32 = 220.0;
+const COMPACT_INSPECTOR_WIDTH: f32 = 212.0;
+const PANEL_GAP: f32 = 5.0;
+const LAYER_PICK_HINT: &str = "Shift-click selects a range. Ctrl-click toggles a layer.";
+
+fn inspector_width(width: f32) -> f32 {
+    if width < 1150.0 { 250.0 } else { 310.0 }
+}
+
+fn can_show_drawer_and_inspector(width: f32) -> bool {
+    width >= RAIL_WIDTH + DRAWER_WIDTH + MIN_CANVAS_WIDTH + inspector_width(width) + 3.0 * PANEL_GAP
+}
+
+fn drawer_width(width: f32) -> Option<f32> {
+    let width = (width - RAIL_WIDTH - MIN_CANVAS_WIDTH - 2.0 * PANEL_GAP).min(DRAWER_WIDTH);
+    (width >= MIN_DRAWER_WIDTH).then_some(width)
+}
+
+fn modifies_layer_selection(modifiers: egui::Modifiers) -> bool {
+    modifiers.shift || modifiers.ctrl || modifiers.mac_cmd
+}
+
+fn layer_click_modifiers(ui: &Ui, response: &egui::Response) -> egui::Modifiers {
+    ui.input(|input| {
+        input.events.iter().rev().find_map(|event| match event {
+            egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed: false, modifiers,
+            } if response.interact_rect.contains(*pos) => Some(*modifiers),
+            _ => None,
+        }).unwrap_or(input.modifiers)
+    })
 }
 
 /// Electron's clip menu and shortcuts.
@@ -407,6 +444,7 @@ pub struct Forma {
     lock_ratio: bool,
     /// The canvas bar's scene button asked for Scene settings.
     open_scene: bool,
+    inspector_open: bool,
     videos: Videos,
     sound: Sound,
     undo: Vec<Scene>,
@@ -520,6 +558,7 @@ impl Forma {
             pan: Vec2::ZERO,
             lock_ratio: true,
             open_scene: false,
+            inspector_open: true,
             videos: Videos::default(),
             sound: Sound::default(),
             undo: Vec::new(),
@@ -580,6 +619,12 @@ impl Forma {
             self.multi_selected = id.clone().into_iter().collect();
             self.selected = id;
         } else if let Some(id) = id {
+            if let Some(current) = &self.selected
+                && !self.multi_selected.contains(current)
+            {
+                self.multi_selected.clear();
+                self.multi_selected.push(current.clone());
+            }
             if let Some(index) = self
                 .multi_selected
                 .iter()
@@ -593,6 +638,30 @@ impl Forma {
                 self.multi_selected.push(id.clone());
                 self.selected = Some(id);
             }
+        }
+    }
+
+    fn pick_layer(&mut self, id: Option<String>, modifiers: egui::Modifiers) {
+        if modifiers.ctrl || modifiers.mac_cmd {
+            self.select_layer(id, true);
+        } else if modifiers.shift
+            && let Some((anchor, target)) = self.selected.as_ref().zip(id.as_ref())
+            && let Some(a) = self.scene.shapes.iter().position(|shape| &shape.id == anchor)
+            && let Some(b) = self.scene.shapes.iter().position(|shape| &shape.id == target)
+        {
+            self.key_editor.clear_selection();
+            self.multi_selected = self.scene.shapes[a.min(b)..=a.max(b)]
+                .iter().map(|shape| shape.id.clone()).collect();
+            self.selected = id;
+        } else {
+            self.select_layer(id, false);
+        }
+    }
+
+    fn show_inspector(&mut self) {
+        self.inspector_open = true;
+        if !can_show_drawer_and_inspector(self.pane.width()) {
+            self.drawer = None;
         }
     }
 
@@ -901,13 +970,14 @@ impl Forma {
         ui.vertical_centered(|ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             let drawer = self.drawer;
+            let drawer_fits = drawer_width(self.pane.width()).is_some();
             if rail_button(
                 ui,
                 RailMark::Symbol(Icon::Plus),
                 "Add",
-                "Add a shape, text, or picture",
+                if drawer_fits { "Add a shape, text, or picture" } else { "Widen the Forma pane to open Add" },
                 drawer == Some(Drawer::Add),
-                true,
+                drawer_fits,
             )
             .clicked()
             {
@@ -921,9 +991,9 @@ impl Forma {
                 ui,
                 RailMark::Symbol(Icon::Sidebar),
                 "Layers",
-                "View and reorder all layers",
+                if drawer_fits { "View and reorder all layers" } else { "Widen the Forma pane to open Layers" },
                 drawer == Some(Drawer::Layers),
-                true,
+                drawer_fits,
             )
             .clicked()
             {
@@ -1030,7 +1100,23 @@ impl Forma {
             )
             .clicked()
             {
-                self.tab = Tab::Scene;
+                self.open_scene = true;
+            }
+            let inspector_visible = self.inspector_open
+                && (self.drawer.is_none() || can_show_drawer_and_inspector(self.pane.width()));
+            if rail_button(
+                ui,
+                RailMark::Symbol(Icon::Settings),
+                "Inspector",
+                if inspector_visible { "Hide layer, animation, and scene settings" } else { "Show layer, animation, and scene settings" },
+                inspector_visible,
+                true,
+            ).clicked() {
+                if inspector_visible {
+                    self.inspector_open = false;
+                } else {
+                    self.show_inspector();
+                }
             }
         });
     }
@@ -1064,14 +1150,11 @@ impl Forma {
 
     /// The drawer beside the rail: Add (shapes, text, files, stop-motion) or Layers (the list), as tabs.
     fn drawer(&mut self, ui: &mut Ui) {
-        if !self
-            .selected
-            .as_ref()
-            .is_some_and(|id| self.multi_selected.contains(id))
-        {
-            self.multi_selected.clear();
-        }
         ui.horizontal(|ui| {
+            if ui.available_width() < 180.0 {
+                ui.spacing_mut().button_padding.x = 5.0;
+                ui.spacing_mut().item_spacing.x = 4.0;
+            }
             for (which, label) in [(Drawer::Add, "Add"), (Drawer::Layers, "Layers")] {
                 let on = self.drawer == Some(which);
                 let text = egui::RichText::new(label).font(if on {
@@ -1189,19 +1272,25 @@ impl Forma {
     }
 
     fn drawer_layers(&mut self, ui: &mut Ui) {
-        let several = self.targets().len() > 1;
+        let count = self.targets().len();
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().button_padding.x = 6.0;
             if ui
-                .add_enabled(self.selected.is_some(), egui::Button::new("Duplicate"))
+                .add_enabled(count > 0, egui::Button::new("Duplicate"))
                 .on_hover_text("Ctrl+D")
                 .clicked()
             {
                 self.clip_action(ClipAction::Duplicate);
             }
-            let label = if several { "Delete all picked" } else { "Delete" };
+            let hint = if count > 1 {
+                format!("Delete {count} selected layers (Delete)")
+            } else {
+                "Delete the selected layer (Delete)".to_owned()
+            };
             if ui
-                .add_enabled(self.selected.is_some(), egui::Button::new(label))
-                .on_hover_text("Delete")
+                .add_enabled(count > 0, egui::Button::new("Delete"))
+                .on_hover_text(hint)
                 .clicked()
             {
                 self.clip_action(ClipAction::Delete);
@@ -1210,9 +1299,13 @@ impl Forma {
         let hint = if self.scene.shapes.is_empty() {
             "No layers yet: add one from Add."
         } else {
-            "Shift-click picks several; drag one to reorder."
+            LAYER_PICK_HINT
         };
-        if self.selected.is_some() && quiet_button(ui, "Precompose", None).clicked() {
+        if ui
+            .add_enabled_ui(count > 0, |ui| quiet_button(ui, "Precompose", None))
+            .inner
+            .clicked()
+        {
             self.precompose_selection();
         }
         ui.label(egui::RichText::new(hint).color(color::INK_MUTED));
@@ -1230,12 +1323,13 @@ impl Forma {
                     .sense(Sense::click_and_drag())
                     .truncate(),
                 )
-                .on_hover_text(&shape.name);
-            if response.double_clicked() {
-                open = Some(shape.id.clone());
-            }
+                .on_hover_text(format!("{}\n{LAYER_PICK_HINT}\nDrag to reorder.", shape.name));
             if response.clicked() {
-                clicked = Some(shape.id.clone());
+                let modifiers = layer_click_modifiers(ui, &response);
+                if response.double_clicked() && !modifies_layer_selection(modifiers) {
+                    open = Some(shape.id.clone());
+                }
+                clicked = Some((shape.id.clone(), modifiers));
             }
             if response.drag_started() {
                 self.layer_drag = Some(shape.id.clone());
@@ -1257,8 +1351,8 @@ impl Forma {
                 );
             }
         }
-        if let Some(id) = clicked {
-            self.select_layer(Some(id), ui.input(|i| i.modifiers.shift));
+        if let Some((id, modifiers)) = clicked {
+            self.pick_layer(Some(id), modifiers);
         }
         if let Some(id) = open {
             self.queue_composition(&id);
@@ -1637,18 +1731,7 @@ impl Forma {
     /// The inspector, in Electron's three tabs: Layer (how it looks, when it shows, where it is), Animate (easing and
     /// every animation) and Scene (canvas size, background, length).
     fn inspector(&mut self, ui: &mut Ui) {
-        if std::mem::take(&mut self.open_scene) {
-            self.tab = Tab::Scene;
-        }
-        // Picking a move or a spin on the timeline brings up its settings.
-        let picked = (self.selected_motion.clone(), self.selected_spin.clone());
-        if picked != self.last_picked {
-            if picked.0.is_some() || picked.1.is_some() {
-                self.tab = Tab::Animate;
-            }
-            self.last_picked = picked;
-        }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (tab, label) in [
                 (Tab::Layer, "Layer"),
                 (Tab::Animate, "Animate"),
@@ -2848,6 +2931,8 @@ impl Forma {
                 egui::ComboBox::from_id_salt("forma-reappear-clip")
                     .selected_text(text)
                     .width(200.0)
+                    .height(280.0)
+                    .truncate()
                     .show_ui(ui, |ui| {
                         for (shape, clip, label, end) in &clips {
                             // It has to end after the fade out finishes (Electron refuses one that doesn't).
@@ -2858,7 +2943,8 @@ impl Forma {
                                     egui::Button::selectable(
                                         false,
                                         format!("{label} · ends {end:.2} s"),
-                                    ),
+                                    )
+                                    .wrap(),
                                 )
                                 .clicked()
                             {
@@ -3142,6 +3228,8 @@ impl Forma {
 
     fn canvas(&mut self, ui: &mut Ui) {
         let viewport = ui.max_rect();
+        #[cfg(test)]
+        crate::panel_widgets::record_rect(ui, "canvas", viewport);
         self.vector_tools.sync(self.selected.as_deref(), self.time);
         self.canvas_view(ui);
         self.canvas_bar(ui, viewport);
@@ -3286,7 +3374,7 @@ impl Forma {
         let back = |ui: &Ui, slot: egui::layers::ShapeIdx, rect: Rect| {
             ui.painter().set(slot, egui::epaint::RectShape::filled(rect.expand(2.0), 8, Color32::from_rgba_unmultiplied(24, 22, 16, 235)));
         };
-        ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
+        let _controls = ui.scope_builder(UiBuilder::new().max_rect(bar), |ui| {
             ui.horizontal(|ui| {
                 let (w, h) = (self.scene.width, self.scene.height);
                 let shape = if w < h {
@@ -3310,8 +3398,10 @@ impl Forma {
                 if self.scene.shapes.iter().any(Shape::is_3d) || self.camera_tool {
                     let camera = ui
                         .add(
-                            egui::Button::selectable(self.camera_tool, "Camera")
-                                .min_size(vec2(56.0, 32.0)),
+                            egui::Button::selectable(
+                                self.camera_tool,
+                                if bar.width() < 270.0 { "3D" } else { "Camera" },
+                            ).min_size(vec2(0.0, 32.0)),
                         )
                         .on_hover_text(
                             "Drag to orbit the camera. Shift-drag or middle-drag to pan.",
@@ -3368,6 +3458,8 @@ impl Forma {
                 });
             });
         });
+        #[cfg(test)]
+        crate::panel_widgets::record_rect(ui, "canvas-bar", _controls.response.rect);
     }
 
     fn canvas_view(&mut self, ui: &mut Ui) {
@@ -3377,9 +3469,9 @@ impl Forma {
         let fit = self
             .scene
             .width
-            .min((viewport.width() - 24.0).max(200.0) * 0.92)
+            .min((viewport.width() - 24.0).max(1.0) * 0.92)
             .min(
-                (viewport.height() - 24.0).max(180.0) * 0.92 * self.scene.width / self.scene.height,
+                (viewport.height() - 24.0).max(1.0) * 0.92 * self.scene.width / self.scene.height,
             )
             / self.scene.width;
         // Scroll to zoom, the zoom buttons, middle-drag to pan.
@@ -4063,7 +4155,10 @@ impl Forma {
         let menu_target = response
             .interact_pointer_pos()
             .and_then(|p| topmost(&self.scene, self.time, p, self.renderer.as_ref()));
-        if response.double_clicked() && let Some(index) = menu_target {
+        if response.double_clicked()
+            && !modifies_layer_selection(layer_click_modifiers(ui, &response))
+            && let Some(index) = menu_target
+        {
             let id = self.scene.shapes[index].id.clone();
             self.queue_composition(&id);
         }
@@ -4151,13 +4246,11 @@ impl Forma {
                 } else {
                     let hit = topmost(&self.scene, self.time, p, self.renderer.as_ref())
                         .map(|i| self.scene.shapes[i].id.clone());
-                    let extend = ui.input(|i| i.modifiers.shift);
-                    if extend && response.clicked() {
-                        self.select_layer(hit, true);
+                    if response.clicked() {
+                        self.pick_layer(hit, layer_click_modifiers(ui, &response));
                     } else if !hit
                         .as_ref()
                         .is_some_and(|id| self.multi_selected.contains(id))
-                        || response.clicked()
                     {
                         self.select_layer(hit, false);
                     }
@@ -4428,44 +4521,70 @@ impl Forma {
     }
 
     fn workspace(&mut self, ui: &mut Ui, rect: Rect) {
-        let rail = Rect::from_min_size(rect.min, vec2(88.0, rect.height()));
-        let inspector_w = if rect.width() < 1150.0 { 250.0 } else { 310.0 };
-        let right = Rect::from_min_max(pos2(rect.right() - inspector_w, rect.top()), rect.max);
-        let drawer = Rect::from_min_size(
-            pos2(rail.right() + 5.0, rect.top()),
-            vec2(220.0, rect.height()),
-        );
-        let can_dock = right.left() - drawer.right() >= 530.0;
+        let rail = Rect::from_min_size(rect.min, vec2(RAIL_WIDTH.min(rect.width()), rect.height()));
+        let can_show_both = can_show_drawer_and_inspector(rect.width());
         if !self.drawer_decided {
             self.drawer_decided = true;
-            self.drawer = can_dock.then_some(Drawer::Add);
+            self.drawer = (rect.width() >= 1150.0 && can_show_both).then_some(Drawer::Add);
         }
-        let docked = can_dock && self.drawer.is_some();
-        let left = if docked { drawer.right() } else { rail.right() };
-        let center = Rect::from_min_max(
-            pos2(left + 5.0, rect.top()),
-            pos2(right.left() - 5.0, rect.bottom()),
-        );
-        let (canvas, timeline) = self.split_workspace(ui, center);
-
-        for panel in [rail, right] {
-            ui.painter().add(pane_frame(Mood::Ember).paint(panel));
+        let drawer_width = drawer_width(rect.width());
+        if drawer_width.is_none() {
+            self.drawer = None;
         }
+        // A timeline move or spin opens Animate even when the drawer hid the inspector.
+        let picked = (self.selected_motion.clone(), self.selected_spin.clone());
+        if picked != self.last_picked {
+            if picked.0.is_some() || picked.1.is_some() {
+                self.tab = Tab::Animate;
+                self.show_inspector();
+            }
+            self.last_picked = picked;
+        }
+        ui.painter().add(pane_frame(Mood::Ember).paint(rail));
         ui.scope_builder(
             UiBuilder::new().id_salt("rail").max_rect(rail.shrink(8.0)),
             |ui| {
                 crate::panel_widgets::scroll("tools", ui, |ui| self.rail(ui));
             },
         );
-        ui.scope_builder(
-            UiBuilder::new()
-                .id_salt("inspector")
-                .max_rect(right.shrink(12.0)),
-            |ui| {
-                ui.set_clip_rect(ui.clip_rect().intersect(right));
-                self.inspector(ui);
-            },
-        );
+        if std::mem::take(&mut self.open_scene) {
+            self.tab = Tab::Scene;
+            self.show_inspector();
+        }
+        let drawer = drawer_width.filter(|_| self.drawer.is_some()).map(|width| {
+            Rect::from_min_size(
+                pos2(rail.right() + PANEL_GAP, rect.top()),
+                vec2(width, rect.height()),
+            )
+        });
+        let left = drawer.map_or(rail.right(), |drawer| drawer.right()) + PANEL_GAP;
+        let available = rect.right() - left;
+        let inspector = (self.inspector_open
+            && (drawer.is_none() || can_show_both)
+            && available >= COMPACT_INSPECTOR_WIDTH + COMPACT_CANVAS_WIDTH + PANEL_GAP)
+        .then(|| {
+            let width = inspector_width(rect.width()).min(available - COMPACT_CANVAS_WIDTH - PANEL_GAP);
+            Rect::from_min_max(pos2(rect.right() - width, rect.top()), rect.max)
+        });
+        let right = inspector.map_or(rect.right(), |panel| panel.left() - PANEL_GAP);
+        let center = Rect::from_min_max(pos2(left.min(right), rect.top()), pos2(right, rect.bottom()));
+        let (canvas, timeline) = self.split_workspace(ui, center);
+        #[cfg(test)]
+        {
+            crate::panel_widgets::record_rect(ui, "drawer", drawer.unwrap_or(Rect::NOTHING));
+            crate::panel_widgets::record_rect(ui, "timeline", timeline);
+        }
+
+        if let Some(panel) = inspector {
+            ui.painter().add(pane_frame(Mood::Ember).paint(panel));
+            ui.scope_builder(
+                UiBuilder::new().id_salt("inspector").max_rect(panel.shrink(12.0)),
+                |ui| {
+                    ui.set_clip_rect(ui.clip_rect().intersect(panel));
+                    self.inspector(ui);
+                },
+            );
+        }
         ui.scope_builder(UiBuilder::new().id_salt("canvas").max_rect(canvas), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(canvas));
             self.canvas(ui)
@@ -4479,29 +4598,17 @@ impl Forma {
             |ui| self.timeline(ui, reveal_mask.as_ref()),
         );
 
-        if docked {
+        if let Some(drawer) = drawer {
             ui.painter().add(pane_frame(Mood::Ember).paint(drawer));
             ui.scope_builder(
                 UiBuilder::new()
                     .id_salt("drawer")
                     .max_rect(drawer.shrink(10.0)),
                 |ui| {
+                    ui.set_clip_rect(ui.clip_rect().intersect(drawer));
                     self.drawer(ui);
                 },
             );
-        } else if self.drawer.is_some() {
-            // The floating drawer owns its hit region above the canvas and timeline.
-            egui::Area::new(ui.scope_id().with("forma-drawer-float"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(drawer.min)
-                .constrain_to(rect)
-                .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.set_width(drawer.width() - 16.0);
-                        ui.set_height((drawer.height() - 16.0).max(0.0));
-                        self.drawer(ui);
-                    });
-                });
         }
     }
 
@@ -4583,9 +4690,20 @@ impl Forma {
     }
 
     /// The timeline toolbar stays visible while the tracks scroll.
-    fn transport(&mut self, ui: &mut Ui) {
+    fn transport(&mut self, ui: &mut Ui, compact: bool, timecode: &str) {
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+            let tight = ui.available_width() < 360.0;
+            let toggle = |ui: &mut Ui, label, selected| {
+                if compact {
+                    ui.add(egui::Button::selectable(selected, label).min_size(vec2(0.0, 32.0)))
+                } else {
+                    pill(ui, label, None, selected)
+                }
+            };
+            if compact {
+                ui.spacing_mut().item_spacing.x = if tight { 2.0 } else { 4.0 };
+                ui.spacing_mut().button_padding.x = if tight { 3.0 } else { 6.0 };
+            }
             if icon_button(ui, Icon::SkipBack, "Back to start (Home)", false).clicked() {
                 self.playing = false;
                 self.preview_end = None;
@@ -4601,36 +4719,56 @@ impl Forma {
                 self.preview_end = None;
                 self.last_tick = Instant::now();
             }
-            if pill(ui, "Loop", None, self.loop_playback)
+            if toggle(ui, "Loop", self.loop_playback)
                 .on_hover_text("Loop playback")
                 .clicked()
             {
                 self.loop_playback = !self.loop_playback;
             }
-            ui.label(
-                egui::RichText::new(format!("{:.2} / {:.2} s", self.time, self.scene.duration))
-                    .font(font::ui(13.0))
-                    .color(color::INK_SOFT),
-            );
-            let quality_label = if self.playing_at_half { "Half (auto)" } else { self.quality.label() };
-            egui::ComboBox::from_id_salt("forma-preview-quality")
-                .selected_text(quality_label)
+            if !compact {
+                ui.label(
+                    egui::RichText::new(timecode)
+                        .font(font::ui(13.0))
+                        .color(color::INK_SOFT),
+                );
+            }
+            let quality_label = match (self.playing_at_half, compact) {
+                (true, true) => "Half",
+                (true, false) => "Half (auto)",
+                _ => self.quality.label(),
+            };
+            let mut quality = egui::ComboBox::from_id_salt("forma-preview-quality")
+                .selected_text(quality_label);
+            if compact {
+                quality = quality.width(48.0);
+            }
+            let quality_hint = if self.playing_at_half {
+                "Preview quality switched to Half automatically during playback."
+            } else {
+                "Preview quality. Full switches to Half during playback if rendering exceeds 33 ms."
+            };
+            quality
                 .show_ui(ui, |ui| {
                     for quality in crate::preview_cache::Quality::ALL {
-                        if ui.selectable_value(&mut self.quality, quality, quality.label()).clicked() {
+                        if ui
+                            .selectable_value(&mut self.quality, quality, quality.label())
+                            .clicked()
+                        {
                             self.playing_at_half = false;
                         }
                     }
-                }).response.on_hover_text("Preview quality. Full switches to Half during playback if rendering exceeds 33 ms.");
-            if ui.available_width() > 370.0 {
+                })
+                .response
+                .on_hover_text(quality_hint);
+            if !compact && ui.available_width() > 370.0 {
                 let used = 100 * self.frame_cache.bytes() / crate::preview_cache::FRAME_BYTES;
                 ui.label(egui::RichText::new(format!("{:.0} ms · RAM {used}%", self.frame_time_ms))
                     .font(font::ui(11.0)).color(color::INK_MUTED))
                     .on_hover_text("Last frame render time and playback cache fill");
             }
             self.key_editor.toolbar(ui, &mut self.scene, self.selected.as_deref());
-            if pill(ui, "Onion skin", None, self.onion_skin)
-                .on_hover_text("While editing a clip, faintly show the clip before it on the same track")
+            if toggle(ui, if tight { "Onion" } else { "Onion skin" }, self.onion_skin)
+                .on_hover_text("Onion skin: faintly show the previous clip on the same track")
                 .clicked()
             {
                 self.onion_skin = !self.onion_skin;
@@ -4642,15 +4780,20 @@ impl Forma {
         let full = ui.max_rect();
         ui.painter().add(pane_frame(Mood::Ember).paint(full));
         ui.set_clip_rect(ui.clip_rect().intersect(full));
+        let transport = full.shrink(8.0);
+        let compact = transport.width() < 520.0;
+        let timecode = format!("{:.2} / {:.2} s", self.time, self.scene.duration);
         let bar = ui
             .scope_builder(
                 UiBuilder::new()
                     .id_salt("transport")
-                    .max_rect(full.shrink(8.0)),
-                |ui| self.transport(ui),
+                    .max_rect(transport),
+                |ui| self.transport(ui, compact, &timecode),
             )
             .response
             .rect;
+        #[cfg(test)]
+        crate::panel_widgets::record_rect(ui, "transport", bar);
         let ruler_top = (bar.bottom() + 4.0).min(full.bottom());
         let rect = Rect::from_min_max(pos2(full.left(), ruler_top), full.max);
         self.key_editor.begin_frame(&self.scene);
@@ -4697,6 +4840,21 @@ impl Forma {
             }
         }
         let ruler = Rect::from_min_max(plot.min, pos2(plot.right(), rect.top() + 25.0));
+        if compact {
+            let timecode_rect = Rect::from_min_max(
+                rect.min,
+                pos2(plot.left().min(rect.right()), ruler.bottom()),
+            );
+            ui.painter()
+                .with_clip_rect(ui.clip_rect().intersect(timecode_rect))
+                .text(
+                    pos2(timecode_rect.left() + 8.0, timecode_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    timecode,
+                    font::ui(13.0),
+                    color::INK_SOFT,
+                );
+        }
         let response = ui.interact(ruler, ui.scope_id().with("ruler"), Sense::click_and_drag());
         if let (true, Some(p)) = (
             response.clicked() || response.dragged(),
@@ -4885,6 +5043,12 @@ impl Forma {
                     line.min + vec2(36.0, 0.0),
                     pos2(line.left() + LABEL_WIDTH - 8.0, line.bottom()),
                 );
+                if clips.iter().any(|&i| {
+                    let id = &self.scene.shapes[i].id;
+                    self.multi_selected.contains(id) || self.selected.as_ref() == Some(id)
+                }) {
+                    ui.painter().rect_filled(label_rect, 4.0, color::SELECT_FILL);
+                }
                 label(
                     &ui.painter().with_clip_rect(label_rect),
                     name,
@@ -4897,12 +5061,13 @@ impl Forma {
                         ui.scope_id().with(("track", &id)),
                         Sense::click(),
                     )
-                    .on_hover_text(name);
-                if head.double_clicked() {
-                    self.queue_composition(&id);
-                }
+                    .on_hover_text(format!("{name}\n{LAYER_PICK_HINT}"));
                 if head.clicked() {
-                    self.select_clip(pick);
+                    let modifiers = layer_click_modifiers(ui, &head);
+                    if head.double_clicked() && !modifies_layer_selection(modifiers) {
+                        self.queue_composition(&id);
+                    }
+                    self.pick_clip(pick, modifiers);
                 }
                 for &index in clips {
                     self.clip_bar(ui, index, line, x, width, view);
@@ -5175,7 +5340,8 @@ impl Forma {
             pos2(x(start), line.top() + 3.0),
             pos2(x(end).max(x(start) + 3.0), line.bottom() - 3.0),
         );
-        let selected = self.selected.as_deref() == Some(&shape.id);
+        let selected = self.selected.as_deref() == Some(&shape.id)
+            || self.multi_selected.contains(&shape.id);
         // Canopy's colors: the selected clip in sun, the rest in moss.
         ui.painter().rect_filled(
             span,
@@ -5208,7 +5374,7 @@ impl Forma {
             paint_clip_label(ui, span, text, ink);
         }
         let tip = format!(
-            "{}: visible {start:.2}–{end:.2} s. Drag to move, drag an edge to trim.",
+            "{}: visible {start:.2}–{end:.2} s. Drag to move, drag an edge to trim.\n{LAYER_PICK_HINT}",
             shape.name
         );
         let id = shape.id.clone();
@@ -5220,9 +5386,6 @@ impl Forma {
                 Sense::click_and_drag(),
             )
             .on_hover_text(tip);
-        if opens_composition && response.double_clicked() {
-            self.queue_composition(&id);
-        }
         if let Some(p) = response.hover_pos() {
             let edge = (p.x - span.left()).abs() <= 6.0 || (p.x - span.right()).abs() <= 6.0;
             ui.ctx().set_cursor_icon(if edge {
@@ -5240,8 +5403,14 @@ impl Forma {
             width,
             (view.contains(start), view.contains(end)),
         );
-        if response.clicked() || response.secondary_clicked() {
-            self.select_clip(index);
+        if response.clicked() {
+            let modifiers = layer_click_modifiers(ui, &response);
+            if opens_composition && response.double_clicked() && !modifies_layer_selection(modifiers) {
+                self.queue_composition(&id);
+            }
+            self.pick_clip(index, modifiers);
+        } else if response.secondary_clicked() {
+            self.focus_clip(index);
         }
         response.context_menu(|ui| {
             self.follows_picker(ui, index, true);
@@ -5263,7 +5432,7 @@ impl Forma {
                     .add_enabled(enabled, egui::Button::new(label).shortcut_text(keys))
                     .clicked()
                 {
-                    self.select_clip(index);
+                    self.focus_clip(index);
                     self.pending_clip = Some((id.clone(), action));
                     ui.close();
                 }
@@ -5436,9 +5605,27 @@ impl Forma {
 
     /// Selects a clip and brings the playhead into it (Electron's `selectClip`).
     fn select_clip(&mut self, index: usize) {
-        self.key_editor.clear_selection();
+        self.pick_clip(index, egui::Modifiers::NONE);
+    }
+
+    fn pick_clip(&mut self, index: usize, modifiers: egui::Modifiers) {
+        self.pick_layer(Some(self.scene.shapes[index].id.clone()), modifiers);
+        self.seek_clip(index);
+    }
+
+    fn focus_clip(&mut self, index: usize) {
+        let id = self.scene.shapes[index].id.clone();
+        if self.multi_selected.contains(&id) {
+            self.key_editor.clear_selection();
+            self.selected = Some(id);
+            self.seek_clip(index);
+        } else {
+            self.select_clip(index);
+        }
+    }
+
+    fn seek_clip(&mut self, index: usize) {
         let shape = &self.scene.shapes[index];
-        self.selected = Some(shape.id.clone());
         self.playing = false;
         if !shape.visible(self.time, self.scene.duration) {
             self.time = shape.clip_start();
@@ -5481,8 +5668,7 @@ impl Forma {
                 shape: self.scene.shapes[index].clone(),
                 duration: self.scene.duration,
             });
-            self.selected = Some(self.scene.shapes[index].id.clone());
-            self.playing = false;
+            self.focus_clip(index);
         }
         let Some(drag) = self
             .timeline_drag
@@ -6433,6 +6619,7 @@ impl Forma {
 
 impl CanopyApp for Forma {
     fn ui(&mut self, ui: &mut Ui, host: &mut dyn Host) {
+        let popup_was_open = egui::Popup::is_any_open(ui.ctx());
         self.pane = ui.max_rect();
         if !self.pending_poses.is_empty() {
             // As Electron's importPoses: the pictures come in, then line up as poses from the start.
@@ -6492,8 +6679,8 @@ impl CanopyApp for Forma {
         self.automation(ui.ctx(), host);
         // With a dialog up, the editor's keys wait (Delete would otherwise remove a layer behind the Export dialog).
         let dialog = self.show_projects || self.show_compositions || self.show_help || self.show_export || self.svg_edit.is_some();
-        self.vector_keyboard = host.focused() && !dialog && !ui.ctx().text_edit_focused();
-        if host.focused() && !dialog {
+        self.vector_keyboard = host.focused() && !dialog && !popup_was_open && !ui.ctx().text_edit_focused();
+        if host.focused() && !dialog && !popup_was_open {
             let undo = ui.input(|i| {
                 i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift
             });
@@ -6793,6 +6980,7 @@ fn pane_dialog<R>(
     id: egui::Id,
     content: impl FnOnce(&mut Ui) -> R,
 ) -> PaneModal<R> {
+    let popup_was_open = egui::Popup::is_any_open(ctx);
     let pane = if pane.is_positive() {
         pane
     } else {
@@ -6809,7 +6997,7 @@ fn pane_dialog<R>(
         })
         .inner;
     let inner = egui::Area::new(id)
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .sense(Sense::hover())
         .pivot(Align2::CENTER_CENTER)
         .fixed_pos(pane.center())
@@ -6825,7 +7013,11 @@ fn pane_dialog<R>(
                 .inner
         })
         .inner;
-    let close = backdrop.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    // Keep the dialog above its backdrop while reserving Foreground for popups.
+    // A click can otherwise raise both the dialog and its popup in the same pass.
+    ctx.set_sublayer(backdrop.layer_id, egui::LayerId::new(egui::Order::Middle, id));
+    let close = backdrop.clicked()
+        || (!popup_was_open && ctx.input(|i| i.key_pressed(egui::Key::Escape)));
     PaneModal { inner, close }
 }
 

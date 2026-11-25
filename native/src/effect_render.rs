@@ -1,7 +1,7 @@
 use crate::effects::{Kind, Parameter::*, Sample};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use tiny_skia::{IntRect, Pixmap, Rect};
+use tiny_skia::{IntRect, Pixmap, Rect, Transform};
 
 const CACHE_LIMIT: usize = 64 * 1024 * 1024;
 const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
@@ -14,6 +14,71 @@ pub(crate) struct Region {
     pub area: IntRect,
     pub bounds: Rect,
     pub scale: f32,
+    pub edges: Option<EdgeBounds>,
+    pub projection_clip: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EdgeBounds {
+    bounds: Rect,
+    to_frame: Transform,
+    to_local: Transform,
+}
+
+impl EdgeBounds {
+    pub(crate) fn new(bounds: Rect, to_frame: Transform) -> Option<Self> {
+        Some(Self {
+            bounds,
+            to_frame,
+            to_local: to_frame.invert()?,
+        })
+    }
+
+    fn nearest_edge(self, region: Region, index: usize) -> Option<usize> {
+        let (x, y) = region.point(index);
+        let ox = region.area.x() as f32;
+        let oy = region.area.y() as f32;
+        let (u, v) = crate::transform::point(self.to_frame, x + ox + 0.5, y + oy + 0.5);
+        let rect = self.bounds;
+        let rotated = self.to_frame.kx != 0.0 || self.to_frame.ky != 0.0;
+        // A local pixel near a rotated frame edge can straddle the clear side of the
+        // capture. Find a sample whose center still lies inside after rounding to a texel.
+        let guard = if rotated { 0.5 } else { 0.0 };
+        if (rect.left() + guard..rect.right() - guard).contains(&u)
+            && (rect.top() + guard..rect.bottom() - guard).contains(&v)
+        {
+            return None;
+        }
+        let footprint = |a: f32, b: f32| {
+            if rotated {
+                (a.abs() + b.abs()) * 0.5
+            } else {
+                0.0
+            }
+        };
+        let clamp = |v: f32, start: f32, end: f32, footprint: f32| {
+            let inset = ((end - start) * 0.5).min(0.5 + footprint);
+            v.max(start + inset).min(end - inset)
+        };
+        let (x, y) = crate::transform::point(
+            self.to_local,
+            clamp(
+                u,
+                rect.left(),
+                rect.right(),
+                footprint(self.to_frame.sx, self.to_frame.kx),
+            ),
+            clamp(
+                v,
+                rect.top(),
+                rect.bottom(),
+                footprint(self.to_frame.ky, self.to_frame.sy),
+            ),
+        );
+        let w = region.area.width() as usize;
+        let h = region.area.height() as usize;
+        Some((((y - oy).floor() as usize).min(h - 1)) * w + ((x - ox).floor() as usize).min(w - 1))
+    }
 }
 
 impl Region {
@@ -57,8 +122,13 @@ impl Cache {
             return layer.output.clone();
         }
         let mut output = input.clone();
-        for effect in &stack {
-            apply(&mut output, effect, region);
+        let last_neighbor = region.projection_clip.and_then(|_| {
+            stack
+                .iter()
+                .rposition(|effect| effect.kind.samples_neighbors())
+        });
+        for (index, effect) in stack.iter().enumerate() {
+            apply(&mut output, effect, region, Some(index) == last_neighbor);
         }
         let bytes = input.data().len() * 2;
         if bytes <= CACHE_LIMIT {
@@ -103,6 +173,7 @@ pub(crate) fn margin(stack: &[Sample], scale: f32, bounds: Rect) -> f32 {
             let n = |p| effect.get(p) * scale;
             match effect.kind {
                 Kind::GaussianBlur | Kind::OuterGlow | Kind::Glow => n(Radius) * 3.0,
+                Kind::InnerGlow if effect.repeat_edges => n(Radius) * 3.0,
                 Kind::Outline => n(Radius),
                 Kind::DropShadow => n(Distance) + n(Softness) * 3.0,
                 Kind::DirectionalBlur | Kind::ChromaticAberration => n(Distance),
@@ -116,7 +187,32 @@ pub(crate) fn margin(stack: &[Sample], scale: f32, bounds: Rect) -> f32 {
         .sum()
 }
 
-fn apply(pixmap: &mut Pixmap, effect: &Sample, region: Region) {
+fn apply(pixmap: &mut Pixmap, effect: &Sample, region: Region, keep_padding: bool) {
+    if effect.repeat_edges
+        && let Some(edges) = region.edges
+    {
+        // Filtering sees the extended image. Restore exterior pixels for any later
+        // sampler, or clip the padded result in canvas space after reprojection.
+        let original = pixmap.clone();
+        for_pixels(pixmap.data_mut(), |index, pixel| {
+            if let Some(edge) = edges.nearest_edge(region, index) {
+                pixel.copy_from_slice(&original.data()[edge * 4..][..4]);
+            }
+        });
+        apply_pixels(pixmap, effect, region);
+        if !keep_padding {
+            for_pixels(pixmap.data_mut(), |index, pixel| {
+                if edges.nearest_edge(region, index).is_some() {
+                    pixel.copy_from_slice(&original.data()[index * 4..][..4]);
+                }
+            });
+        }
+    } else {
+        apply_pixels(pixmap, effect, region);
+    }
+}
+
+fn apply_pixels(pixmap: &mut Pixmap, effect: &Sample, region: Region) {
     let n = |p| effect.get(p) * region.scale;
     match effect.kind {
         Kind::GaussianBlur => gaussian(pixmap, n(Radius)),
@@ -326,6 +422,7 @@ struct Source<'a> {
     width: i32,
     height: i32,
     bytes: &'a [u8],
+    repeat_edges: bool,
 }
 
 impl<'a> Source<'a> {
@@ -334,10 +431,20 @@ impl<'a> Source<'a> {
             width: pixmap.width() as i32,
             height: pixmap.height() as i32,
             bytes: pixmap.data(),
+            repeat_edges: false,
         }
     }
 
-    fn pixel(&self, x: i32, y: i32) -> Pixel {
+    fn repeating(mut self, repeat_edges: bool) -> Self {
+        self.repeat_edges = repeat_edges;
+        self
+    }
+
+    fn pixel(&self, mut x: i32, mut y: i32) -> Pixel {
+        if self.repeat_edges {
+            x = x.clamp(0, self.width - 1);
+            y = y.clamp(0, self.height - 1);
+        }
         if x < 0 || y < 0 || x >= self.width || y >= self.height {
             return [0; 4];
         }
@@ -369,7 +476,7 @@ impl<'a> Source<'a> {
 
 fn resample(pixmap: &mut Pixmap, effect: &Sample, region: Region) {
     let input = pixmap.clone();
-    let source = Source::new(&input);
+    let source = Source::new(&input).repeating(effect.repeat_edges);
     let (sin, cos) = effect.get(Angle).to_radians().sin_cos();
     let distance = effect.get(Distance) * region.scale;
     let (ox, oy) = (cos * distance, sin * distance);
@@ -553,7 +660,7 @@ fn light(pixmap: &mut Pixmap, effect: &Sample, region: Region) {
     } else {
         gaussian(&mut alpha, sigma * region.scale);
     }
-    let alpha = Source::new(&alpha);
+    let alpha = Source::new(&alpha).repeating(effect.repeat_edges);
     let strength = if effect.kind == Kind::Glow {
         effect.get(Intensity)
     } else {
@@ -691,6 +798,8 @@ mod tests {
             area: IntRect::from_xywh(0, 0, 64, 64).unwrap(),
             bounds: Rect::from_xywh(0.0, 0.0, 64.0, 64.0).unwrap(),
             scale: 1.0,
+            edges: None,
+            projection_clip: None,
         }
     }
 
@@ -723,7 +832,7 @@ mod tests {
         let mut image = image.clone();
         let effect = effect.sample(0.0, "linear");
         if effect.active() {
-            apply(&mut image, &effect, area());
+            apply(&mut image, &effect, area(), false);
         }
         image
     }

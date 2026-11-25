@@ -2,7 +2,7 @@
 //! Exports and the editor's preview both draw through it, so what the editor shows is what gets exported.
 
 use crate::compositing::{Blend, MatteLinks};
-use crate::effect_render::{self, Region};
+use crate::effect_render::{self, EdgeBounds, Region};
 use crate::effects::Sample;
 use crate::mask_render::{LayerPixels, MaskCache};
 use crate::model::{MAX_BLUR, Scene, Shape};
@@ -1439,6 +1439,11 @@ impl<'a> RenderFrame<'a> {
         if effects.is_empty() {
             return;
         }
+        let repeats_at_projection = effects
+            .iter()
+            .rev()
+            .find(|effect| effect.kind.samples_neighbors())
+            .is_some_and(|effect| effect.repeat_edges);
         let Some((local, region)) = FILTER_QUALITY.into_iter().find_map(|quality| {
             let local = LocalPixels::new(frame, self.view, self.size, quality)?;
             let bounds = Rect::from_xywh(
@@ -1447,7 +1452,18 @@ impl<'a> RenderFrame<'a> {
                 frame.pose.w * local.scale,
                 frame.pose.h * local.scale,
             )?;
-            let region = local.region(bounds, &effects, 0.0)?;
+            let mut region = local.region(bounds, &effects, 0.0)?;
+            if effects.iter().any(|effect| effect.repeat_edges) {
+                let frame = Rect::from_xywh(0.0, 0.0, self.scene.width, self.scene.height)?;
+                let visible = Rect::from_xywh(0.0, 0.0, self.size.0 as f32, self.size.1 as f32)?;
+                let frame = transformed(frame, self.view).and_then(|frame| frame.intersect(&visible));
+                region.edges = frame.and_then(|frame| EdgeBounds::new(frame, local.to_view));
+                // Keep the final filter's padding through reprojection, which can sample
+                // on both sides of a rotated edge. Limit replacement in canvas coordinates.
+                if repeats_at_projection {
+                    region.projection_clip = frame;
+                }
+            }
             fits_filter(region.area).then_some((local, region))
         }) else {
             return;
@@ -1501,7 +1517,7 @@ impl<'a> RenderFrame<'a> {
         if shape.blend() != Blend::Normal {
             blend_adjustment(canvas, &mut filtered, shape.blend());
         }
-        replace_region(canvas, &filtered, &coverage);
+        replace_region(canvas, &filtered, &coverage, region.projection_clip);
     }
 
     fn layer_blur(&self, shape: &Shape, frame: LayerFrame) -> f32 {
@@ -1620,6 +1636,8 @@ impl LocalPixels {
             area,
             bounds,
             scale: self.scale,
+            edges: EdgeBounds::new(bounds, Transform::identity()),
+            projection_clip: None,
         })
     }
 
@@ -1704,17 +1722,35 @@ fn blend_adjustment(canvas: &Pixmap, filtered: &mut LayerPixels, blend: Blend) {
     filtered.pixmap = backdrop;
 }
 
-fn replace_region(canvas: &mut Pixmap, filtered: &LayerPixels, coverage: &LayerPixels) {
+fn replace_region(
+    canvas: &mut Pixmap,
+    filtered: &LayerPixels,
+    coverage: &LayerPixels,
+    clip: Option<Rect>,
+) {
     use rayon::prelude::*;
     let width = canvas.width() as usize * 4;
-    let start = filtered.area.x() as usize * 4;
-    let top = filtered.area.y() as usize;
-    let stride = filtered.area.width() as usize * 4;
+    let area = filtered.area;
+    let start = area.x() as usize * 4;
+    let top = area.y() as usize;
+    let stride = area.width() as usize * 4;
+    let (left, right, first_row, end_row) =
+        clip.map_or((0, stride, 0, area.height() as usize), |clip| {
+            let local = |value: f32, offset: i32, length: u32| {
+                (value.round() - offset as f32).clamp(0.0, length as f32) as usize
+            };
+            (
+                local(clip.left(), area.x(), area.width()) * 4,
+                local(clip.right(), area.x(), area.width()) * 4,
+                local(clip.top(), area.y(), area.height()),
+                local(clip.bottom(), area.y(), area.height()),
+            )
+        });
     let blend = |((row, changed), mask): ((&mut [u8], &[u8]), &[u8])| {
-        for ((dst, src), a) in row[start..start + stride]
+        for ((dst, src), a) in row[start + left..start + right]
             .chunks_exact_mut(4)
-            .zip(changed.chunks_exact(4))
-            .zip(mask.chunks_exact(4))
+            .zip(changed[left..right].chunks_exact(4))
+            .zip(mask[left..right].chunks_exact(4))
         {
             let a = u16::from(a[3]);
             for (dst, src) in dst.iter_mut().zip(src) {
@@ -1727,11 +1763,15 @@ fn replace_region(canvas: &mut Pixmap, filtered: &LayerPixels, coverage: &LayerP
         rows.chunks_exact_mut(width)
             .zip(filtered.pixmap.data().chunks_exact(stride))
             .zip(coverage.pixmap.data().chunks_exact(stride))
+            .skip(first_row)
+            .take(end_row - first_row)
             .for_each(blend);
     } else {
         rows.par_chunks_mut(width)
             .zip(filtered.pixmap.data().par_chunks(stride))
             .zip(coverage.pixmap.data().par_chunks(stride))
+            .skip(first_row)
+            .take(end_row - first_row)
             .for_each(blend);
     }
 }

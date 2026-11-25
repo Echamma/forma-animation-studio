@@ -110,6 +110,137 @@ fn continued_pose_freezes_effects_and_keeps_their_pixels_after_reopening() {
 }
 
 #[test]
+fn adding_speed_keys_restarts_a_frozen_wave_from_its_captured_phase() {
+    let mut scene = animated_effect_scene();
+    let at = 0.8;
+    let next = scene
+        .continue_after(0, None, at, "Next".into(), "Track".into())
+        .unwrap();
+    let renderer = Renderer::new(&scene, &place());
+    let expected = frame(&renderer, &scene, 1.0);
+    let shape = &mut scene.shapes[next];
+    let speed = Lane::Effect(1, Parameter::Speed);
+    shape.add_lane_key(speed, 1.0);
+    shape.add_lane_key(speed, 1.5);
+    shape
+        .effect_mut(1)
+        .unwrap()
+        .edit(Parameter::Speed, 1.0, [1.0, 0.0, 0.0]);
+    shape
+        .effect_mut(1)
+        .unwrap()
+        .edit(Parameter::Speed, 1.5, [2.0, 0.0, 0.0]);
+    assert_eq!(frame(&renderer, &scene, 0.9).data(), expected.data());
+    assert_eq!(frame(&renderer, &scene, 1.0).data(), expected.data());
+    let animated = frame(&renderer, &scene, 1.25);
+    assert_ne!(animated.data(), expected.data());
+    let reopened = Scene::read(&serde_json::to_vec(&scene).unwrap()).unwrap();
+    assert_eq!(frame(&renderer, &reopened, 1.25).data(), animated.data());
+}
+
+#[test]
+fn adjustment_effects_repeat_the_artboard_edges_in_preview_and_export() {
+    let mut scene = scene();
+    scene.bg = "#f4ead8".into();
+    let index = rect(&mut scene, "Full-frame grade", "#ffffff", 128.0, 128.0);
+    scene.shapes[index].kind = "adjustment".into();
+    let renderer = Renderer::new(&scene, &place());
+    let cream = [244, 234, 216];
+    for kind in [
+        Kind::GaussianBlur,
+        Kind::DirectionalBlur,
+        Kind::ZoomBlur,
+        Kind::ChromaticAberration,
+        Kind::WaveWarp,
+    ] {
+        scene.shapes[index].effects = vec![Effect::new(1, kind)];
+        let exported = frame(&renderer, &scene, 0.0);
+        let preview = renderer
+            .view(
+                &scene,
+                0.0,
+                ((-13.0, -19.0), 1.0, (180, 180)),
+                false,
+                &Frames::new(),
+            )
+            .unwrap();
+        for (x, y) in [(0, 0), (127, 0), (0, 64), (127, 127)] {
+            assert_eq!(rgb(&exported, x, y), cream, "{kind:?} at {x},{y}");
+            assert_eq!(exported.pixel(x, y).unwrap().alpha(), 255, "{kind:?}");
+            assert_eq!(
+                rgb(&preview, x + 13, y + 19),
+                cream,
+                "{kind:?} at {x},{y} in preview"
+            );
+        }
+        assert_eq!(
+            preview.pixel(12, 19).unwrap().alpha(),
+            0,
+            "{kind:?} spilled onto pasteboard"
+        );
+    }
+
+    scene.shapes[index].effects = vec![Effect::new(1, Kind::GaussianBlur)];
+    let still = animated_svg::still(&scene, &place(), 0.0).unwrap();
+    let tree = svg::parse(&still).unwrap();
+    let svg = svg::rasterize(&tree, 128, 128).unwrap();
+    assert_eq!(rgb(&svg, 0, 0), cream);
+    assert_eq!(svg.pixel(0, 0).unwrap().alpha(), 255);
+    scene.shapes[index].effects[0].repeat_edge_pixels = Some(false);
+    let feathered = frame(&renderer, &scene, 0.0);
+    assert!(feathered.pixel(0, 0).unwrap().alpha() < 240);
+
+    let adjustment = &mut scene.shapes[index];
+    adjustment.effects[0].repeat_edge_pixels = None;
+    adjustment.keys[0].w = 200.0;
+    adjustment.keys[0].h = 200.0;
+    adjustment.keys[0].r = 25.0;
+    let rotated = frame(&renderer, &scene, 0.0);
+    for (x, y) in [(0, 0), (127, 0), (0, 64), (127, 127)] {
+        let pixel = rotated.pixel(x, y).unwrap();
+        assert!(pixel.alpha() >= 250, "rotated fringe at {x},{y}: {pixel:?}");
+    }
+}
+
+#[test]
+fn full_frame_layer_can_repeat_edges_while_ordinary_shapes_feather_by_default() {
+    use base64::Engine;
+
+    let mut scene = scene();
+    scene.transparent_background = true;
+    let index = rect(&mut scene, "Full frame", "#f4ead8", 128.0, 128.0);
+    let mut pixels = Pixmap::new(8, 8).unwrap();
+    pixels.fill(tiny_skia::Color::from_rgba8(244, 234, 216, 255));
+    let png = base64::engine::general_purpose::STANDARD.encode(pixels.encode_png().unwrap());
+    scene.shapes[index].kind = "image".into();
+    scene.shapes[index].extra.insert(
+        "assetData".into(),
+        format!("data:image/png;base64,{png}").into(),
+    );
+    scene.shapes[index].effects = vec![Effect::new(1, Kind::GaussianBlur)];
+    let renderer = Renderer::new(&scene, &place());
+    assert!(frame(&renderer, &scene, 0.0).pixel(0, 0).unwrap().alpha() < 240);
+    scene.shapes[index].effects[0].repeat_edge_pixels = Some(true);
+    let repeated = frame(&renderer, &scene, 0.0);
+    assert_eq!(rgb(&repeated, 0, 0), [244, 234, 216]);
+    assert_eq!(repeated.pixel(0, 0).unwrap().alpha(), 255);
+    let error = animated_svg::animated(&scene, &place()).unwrap_err();
+    assert!(error.contains("Full frame") && error.contains("Repeat edge pixels"));
+    let error = forma_native::lottie::export(&scene).unwrap_err();
+    assert!(error.contains("Full frame") && error.contains("Repeat edge pixels"));
+
+    scene.shapes[index].kind = "rect".into();
+    scene.shapes[index].keys[0].w = 40.0;
+    scene.shapes[index].keys[0].h = 40.0;
+    scene.shapes[index].effects[0].repeat_edge_pixels = None;
+    let halo = frame(&renderer, &scene, 0.0);
+    assert!((1..255).contains(&halo.pixel(43, 64).unwrap().alpha()));
+    scene.shapes[index].effects[0].repeat_edge_pixels = Some(true);
+    let bounded = frame(&renderer, &scene, 0.0);
+    assert_eq!(bounded.pixel(43, 64).unwrap().alpha(), 0);
+}
+
+#[test]
 fn onion_skin_freezes_effects_at_the_previous_clip_end() {
     let mut scene = animated_effect_scene();
     let end = 0.8;
@@ -457,12 +588,26 @@ fn phase_five_projects_round_trip_and_pass_electrons_actual_validator() {
         .enumerate()
         .map(|(i, &kind)| Effect::new(i as u64, kind))
         .collect();
+    scene.shapes[i].effects[0].repeat_edge_pixels = Some(true);
     scene.shapes[i].add_lane_key(Lane::Effect(9, Parameter::WhiteColor), 0.5);
     scene.add_shape("grade".into(), "adjustment");
     scene.shapes[1].effects.push(Effect::new(1, Kind::Tint));
+    let mut blur = Effect::new(2, Kind::DirectionalBlur);
+    blur.repeat_edge_pixels = Some(false);
+    scene.shapes[1].effects.push(blur);
     let bytes = serde_json::to_vec(&scene).unwrap();
     assert_eq!(Scene::read(&bytes).unwrap(), scene);
-    let project = serde_json::from_slice(&bytes).unwrap();
+    let project: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(project["shapes"][0]["effects"][0]["repeatEdgePixels"], true);
+    assert!(
+        project["shapes"][0]["effects"][1]
+            .get("repeatEdgePixels")
+            .is_none()
+    );
+    assert_eq!(
+        project["shapes"][1]["effects"][1]["repeatEdgePixels"],
+        false
+    );
     common::assert_electron_keys(&project);
     let mut node = Command::new("node")
         .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())

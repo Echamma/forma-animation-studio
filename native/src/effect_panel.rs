@@ -20,6 +20,13 @@ enum Edit {
     Delete(u64),
 }
 
+#[derive(Clone, Default)]
+struct EffectSearch {
+    text: String,
+    selected: usize,
+    shown: bool,
+}
+
 pub(crate) fn layer(ui: &mut Ui, shape: &mut Shape, time: f64, lanes_shown: bool) -> bool {
     ui.push_id(&shape.id.clone(), |ui| {
         crate::panel_widgets::section(ui, CollapsingHeader::new("Effects"), |ui| {
@@ -54,69 +61,125 @@ pub(crate) fn layer(ui: &mut Ui, shape: &mut Shape, time: f64, lanes_shown: bool
 fn add_menu(ui: &mut Ui, shape: &mut Shape) -> bool {
     let id = ui.scope_id().with("effect-search");
     let mut search = ui
-        .data_mut(|data| data.get_temp::<String>(id))
+        .data(|data| data.get_temp::<EffectSearch>(id))
         .unwrap_or_default();
-    let mut picked = None;
     let config = egui::containers::menu::MenuConfig::new()
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-    egui::containers::menu::MenuButton::new("Add effect…")
+    let (button, menu) = egui::containers::menu::MenuButton::new("Add effect…")
         .config(config)
-        .ui(ui, |ui| {
-            ui.set_min_width(210.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut search)
-                    .hint_text("Search effects")
-                    .desired_width(205.0),
-            );
-            let query = search.trim().to_lowercase();
-            egui::ScrollArea::vertical()
-                .max_height(320.0)
-                .show(ui, |ui| {
-                    let mut group = "";
-                    for &kind in Kind::ALL {
-                        if !kind.label().to_lowercase().contains(&query)
-                            && !kind.group().to_lowercase().contains(&query)
-                            && !(kind == Kind::ZoomBlur && "radial".contains(&query))
-                        {
-                            continue;
-                        }
-                        if group != kind.group() {
-                            group = kind.group();
-                            canopy_ui::section_label(ui, group);
-                        }
-                        if ui
-                            .add_sized([ui.available_width(), 32.0], Button::new(kind.label()))
-                            .clicked()
-                        {
-                            picked = Some(kind);
-                            ui.close();
-                        }
-                    }
-                    if group.is_empty() {
-                        ui.label(RichText::new("No matching effects").color(color::INK_MUTED));
-                    }
-                });
-        });
+        .ui(ui, |ui| search_effects(ui, &mut search));
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&button));
+    let picked = menu.and_then(|menu| menu.inner);
     if let Some(kind) = picked {
         shape
             .effects
             .push(Effect::new(shape.next_effect_id(), kind));
-        search.clear();
     }
-    ui.data_mut(|data| data.insert_temp(id, search));
+    ui.data_mut(|data| {
+        if open {
+            data.insert_temp(id, search);
+        } else {
+            data.remove::<EffectSearch>(id);
+        }
+    });
     picked.is_some()
+}
+
+fn search_effects(ui: &mut Ui, search: &mut EffectSearch) -> Option<Kind> {
+    use egui::{Key, Modifiers};
+    ui.set_min_width(210.0);
+    let id = ui.make_persistent_id("effect-query");
+    if !search.shown && !ui.is_sizing_pass() {
+        ui.memory_mut(|memory| memory.request_focus(id));
+        search.shown = true;
+    }
+    let (up, down, enter) = if ui.memory(|memory| memory.has_focus(id)) {
+        ui.input_mut(|input| {
+            (
+                input.consume_key(Modifiers::NONE, Key::ArrowUp),
+                input.consume_key(Modifiers::NONE, Key::ArrowDown),
+                input.consume_key(Modifiers::NONE, Key::Enter),
+            )
+        })
+    } else {
+        (false, false, false)
+    };
+    if up || down {
+        ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+    }
+    let changed = ui
+        .add(
+            egui::TextEdit::singleline(&mut search.text)
+                .id(id)
+                .hint_text("Search effects")
+                .desired_width(205.0),
+        )
+        .changed();
+    let query = search.text.trim().to_lowercase();
+    let choices: Vec<_> = Kind::ALL
+        .iter()
+        .copied()
+        .filter(|&kind| {
+            kind.label().to_lowercase().contains(&query)
+                || kind.group().to_lowercase().contains(&query)
+                || (kind == Kind::ZoomBlur && "radial".contains(&query))
+        })
+        .collect();
+    if choices.is_empty() {
+        ui.label(RichText::new("No matching effects").color(color::INK_MUTED));
+        return None;
+    }
+    if changed {
+        search.selected = 0;
+    }
+    let last = choices.len() - 1;
+    search.selected = search.selected.min(last);
+    if down {
+        search.selected = (search.selected + 1).min(last);
+    }
+    if up {
+        search.selected = search.selected.saturating_sub(1);
+    }
+    let mut picked = enter.then_some(choices[search.selected]);
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .show(ui, |ui| {
+            let mut group = "";
+            for (index, kind) in choices.into_iter().enumerate() {
+                if group != kind.group() {
+                    group = kind.group();
+                    canopy_ui::section_label(ui, group);
+                }
+                let selected = index == search.selected;
+                let row = ui.add_sized(
+                    [ui.available_width(), 32.0],
+                    Button::selectable(selected, kind.label()),
+                );
+                if selected && (changed || up || down) {
+                    row.scroll_to_me(Some(egui::Align::Center));
+                }
+                if row.clicked() {
+                    picked = Some(kind);
+                }
+            }
+        });
+    if picked.is_some() {
+        ui.close();
+    }
+    picked
 }
 
 fn draw_stack(ui: &mut Ui, shape: &mut Shape, time: f64) -> Vec<Edit> {
     let mut actions = Vec::new();
     let count = shape.effects.len();
+    let adjustment = shape.kind == "adjustment";
     for (index, effect) in shape.effects.iter_mut().enumerate() {
         ui.push_id(effect.id, |ui| {
             let folded = crate::panel_widgets::section(
                 ui,
                 CollapsingHeader::new(effect.kind.label()),
                 |ui| {
-                    controls(ui, effect, &shape.ease, time);
+                    controls(ui, effect, &shape.ease, time, adjustment);
                 },
             );
             let header = ui
@@ -186,7 +249,7 @@ fn draw_stack(ui: &mut Ui, shape: &mut Shape, time: f64) -> Vec<Edit> {
     actions
 }
 
-fn controls(ui: &mut Ui, effect: &mut Effect, ease: &str, time: f64) {
+fn controls(ui: &mut Ui, effect: &mut Effect, ease: &str, time: f64, adjustment: bool) {
     if effect.kind == Kind::GradientRamp {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut effect.radial, false, "Linear");
@@ -231,6 +294,16 @@ fn controls(ui: &mut Ui, effect: &mut Effect, ease: &str, time: f64) {
         }
         if response.changed() {
             effect.edit(parameter, time, value);
+        }
+    }
+    if effect.kind.samples_neighbors() {
+        let mut repeat = effect.repeats_edges(adjustment);
+        if ui
+            .checkbox(&mut repeat, "Repeat edge pixels")
+            .on_hover_text("Use the nearest edge color when this effect samples outside the image.")
+            .changed()
+        {
+            effect.repeat_edge_pixels = (repeat != adjustment).then_some(repeat);
         }
     }
 }

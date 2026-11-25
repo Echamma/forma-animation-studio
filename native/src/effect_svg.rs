@@ -17,6 +17,13 @@ pub(crate) fn validate(scene: &Scene, shape: &Shape) -> Result<(), String> {
         ));
     }
     for effect in shape.effects.iter().filter(|effect| effect.enabled) {
+        if effect.repeats_edges(false) {
+            return Err(format!(
+                "{}: animated SVG can't export Repeat edge pixels on {}.",
+                shape.name,
+                effect.kind.label()
+            ));
+        }
         let sample = effect.sample(0.0, &shape.ease);
         if !matches!(
             effect.kind,

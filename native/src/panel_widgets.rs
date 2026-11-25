@@ -13,8 +13,14 @@ pub(crate) fn combo(
     ui.label(label);
     ComboBox::from_id_salt(id)
         .width(ui.available_width())
+        .height(280.0)
         .truncate()
         .selected_text(selected)
+}
+
+#[cfg(test)]
+pub(crate) fn record_rect(ui: &Ui, name: &'static str, rect: egui::Rect) {
+    ui.data_mut(|data| data.insert_temp(egui::Id::unique(("workspace bounds", name)), rect));
 }
 
 pub(crate) fn scroll<R>(id: impl AsIdSalt, ui: &mut Ui, content: impl FnOnce(&mut Ui) -> R) -> R {

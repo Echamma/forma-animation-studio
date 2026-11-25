@@ -104,6 +104,11 @@ pub fn unsupported(scene: &Scene) -> Vec<String> {
             if shape.effects.iter().any(|effect| effect.enabled) {
                 features.push("effects");
             }
+            if shape.effects.iter().any(|effect| {
+                effect.enabled && effect.repeats_edges(shape.kind == "adjustment")
+            }) {
+                features.push("Repeat edge pixels");
+            }
             if shape.motion_blur && source.motion_blur.is_some() {
                 features.push("motion blur");
             }

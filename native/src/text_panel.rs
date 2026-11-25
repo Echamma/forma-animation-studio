@@ -66,7 +66,7 @@ pub(crate) fn layout(
             "Font",
             family.as_deref().unwrap_or(BUNDLED_FAMILY),
         )
-        .height(280.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             let id = ui.scope_id().with("font-filter");
             let mut search: String = ui.data_mut(|data| data.get_temp(id)).unwrap_or_default();
@@ -97,6 +97,7 @@ pub(crate) fn layout(
             }
             if picked.is_some() {
                 ui.data_mut(|data| data.remove::<String>(id));
+                ui.close();
             }
         });
         if let Some(picked) = picked

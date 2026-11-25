@@ -307,6 +307,14 @@ impl KeyEditor {
         self.expression_open.insert(track);
     }
 
+    #[cfg(test)]
+    pub(crate) fn visible_key_point_for_test(&self, id: &str, lane: Lane, time: f64) -> Option<Pos2> {
+        self.frame_points.iter().find_map(|(pick, point)| {
+            (pick.track.layer == id && pick.track.lane == lane && same_time(pick.time, time))
+                .then_some(*point)
+        })
+    }
+
     pub fn row_height(&self, id: &str, lane: Lane) -> f32 {
         let is_track = |t: &Track| t.layer == id && t.lane == lane;
         let keys = if self.graph && self.graph_tracks.iter().any(is_track) {

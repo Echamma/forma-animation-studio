@@ -178,6 +178,8 @@ pub struct Effect {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub radial: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_edge_pixels: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tracks: BTreeMap<Parameter, ValueTrack>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,6 +201,7 @@ impl Effect {
             kind,
             enabled: true,
             radial: false,
+            repeat_edge_pixels: None,
             tracks: BTreeMap::new(),
             frozen_wave_phase: None,
         }
@@ -210,6 +213,10 @@ impl Effect {
             .iter()
             .copied()
             .find(|control| control.parameter == parameter)
+    }
+
+    pub(crate) fn repeats_edges(&self, adjustment: bool) -> bool {
+        self.kind.samples_neighbors() && self.repeat_edge_pixels.unwrap_or(adjustment)
     }
 
     pub fn values(&self, parameter: Parameter, time: f64, ease: &str) -> [f32; 3] {
@@ -267,6 +274,7 @@ impl Effect {
         let mut sample = Sample {
             kind: self.kind,
             radial: self.radial,
+            repeat_edges: self.repeats_edges(false),
             phase: 0.0,
             values: [[0.0; 3]; Parameter::COUNT],
         };
@@ -291,10 +299,19 @@ impl Effect {
     }
 
     fn wave_phase(&self, time: f64, ease: &str) -> f32 {
-        self.frozen_wave_phase.unwrap_or_else(|| {
-            let phase = self.wave_cycles(time, ease).rem_euclid(1.0) as f32;
-            if phase.is_finite() { phase } else { 0.0 }
-        })
+        let cycles = if let Some(frozen) = self.frozen_wave_phase {
+            let first = self.tracks.get(&Speed).and_then(|track| track.keys.first());
+            // A frozen pose stays still until its first new speed key. That key starts
+            // from the captured phase so adding animation never jumps at the key.
+            let resumed = first.filter(|key| time > key.t).map_or(0.0, |key| {
+                self.wave_cycles(time, ease) - self.wave_cycles(key.t, ease)
+            });
+            f64::from(frozen) + resumed
+        } else {
+            self.wave_cycles(time, ease)
+        };
+        let phase = cycles.rem_euclid(1.0) as f32;
+        if phase.is_finite() { phase } else { 0.0 }
     }
 
     fn wave_cycles(&self, time: f64, ease: &str) -> f64 {
@@ -354,6 +371,7 @@ impl Effect {
 pub(crate) struct Sample {
     pub kind: Kind,
     pub radial: bool,
+    pub repeat_edges: bool,
     pub phase: f32,
     values: [[f32; 3]; Parameter::COUNT],
 }
@@ -432,9 +450,35 @@ impl Shape {
         self.effects
             .iter()
             .filter(|effect| effect.enabled)
-            .map(|effect| effect.sample(time, &self.ease))
+            .map(|effect| {
+                let mut sample = effect.sample(time, &self.ease);
+                sample.repeat_edges = effect.repeats_edges(self.kind == "adjustment");
+                sample
+            })
             .filter(Sample::active)
             .collect()
+    }
+}
+
+impl Kind {
+    pub(crate) fn samples_neighbors(self) -> bool {
+        matches!(
+            self,
+            Self::GaussianBlur
+                | Self::DirectionalBlur
+                | Self::ZoomBlur
+                | Self::DropShadow
+                | Self::OuterGlow
+                | Self::InnerGlow
+                | Self::Glow
+                | Self::Outline
+                | Self::ChromaticAberration
+                | Self::Pixelate
+                | Self::WaveWarp
+                | Self::TurbulentDisplace
+                | Self::Bulge
+                | Self::Twirl
+        )
     }
 }
 
